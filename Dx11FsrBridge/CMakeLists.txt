@@ -10,7 +10,8 @@ configure_file(
     "${CMAKE_CURRENT_BINARY_DIR}/Version.h"
     @ONLY)
 
-option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation exports" ON)
+option(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL "Build the standard FSR2 translation draw path" ON)
+option(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM "Build the Gen-1 GetProcAddress shim (redirect OptiScaler's 6 ffxFsr2* lookups into the bridge)" ON)
 option(DX11FSRBRIDGE_RELEASE_RUNTIME "Build the release runtime" ON)
 option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machine test" OFF)
 # 统一测试开关（2026-09-19 审核报告）。
@@ -73,6 +74,19 @@ add_library(Dx11FsrBridge SHARED
     Ffx12Backend.cpp
     Fsr2InputDump.cpp
 )
+
+# Gen-1 GetProcAddress shim（feat/restore-shim 分支恢复）。
+# 把 Fsr2TranslationLayer 编回 DLL，让桥导出 6 个标准 ffxFsr2* 符号 +
+# Detours-hook KERNELBASE!GetProcAddress，拦截 OptiScaler 的 DX11 FSR2
+# exe 扫描（HookFSR2Dx11ExeInputs），把原神静态链接的 FSR2 调用经标准
+# 接口喂进 OptiScaler 的 DLSS detour 链。详见 OPTISCALER_COMPATIBILITY.md。
+if(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
+    target_sources(Dx11FsrBridge PRIVATE Fsr2TranslationLayer.cpp)
+    # /DEF 需要绝对路径，否则链接器在工作目录找不到 .def。
+    set_target_properties(Dx11FsrBridge PROPERTIES
+        LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/Fsr2TranslationLayer.def\"")
+    target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM=1)
+endif()
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）
 # 不再编译进 DLL；OptiScaler 以新 ffx12 链路为基底接入。
