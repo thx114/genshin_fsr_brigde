@@ -16,7 +16,11 @@
 #include "Ffx12Backend.h"
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
-// 旧方案（On12 引导 / FSR2 翻译层）已移除，不再编译。
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
+#include "Fsr2TranslationLayer.h"
+#endif
+// 旧方案（On12 引导）已移除，不再编译；Fsr2TranslationLayer（Gen-1 GetProcAddress shim）
+// 已在 feat/restore-shim 分支恢复，由 DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM 控制。
 
 #include <algorithm>
 #include <array>
@@ -196,8 +200,8 @@ struct Config
     std::uint32_t pixel_shader_trace_limit = 512;
     std::uint64_t target_pixel_shader_hash = 0x78057A29AF6C2D99ull;
     std::uint32_t pixel_shader_replacement_mode = 0;
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    bool enable_fsr2_get_proc_address_shim = false;
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL) || defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
+    bool enable_fsr2_get_proc_address_shim = true;
     std::uint32_t fsr2_translation_mode = 0;
     bool fsr2_fast_state_tracking = false;
     bool fsr2_mode2_on_demand_state = true;
@@ -3830,7 +3834,7 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 0, config_path.c_str()) != 0;
     // FSR2 输入纹理转储（诊断，默认关）。放在无条件区，避免被下面的 #if 吞掉。
     fsr2dump::configure(config_path.c_str());
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL) || defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
     g_config.enable_fsr2_get_proc_address_shim =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
     g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
@@ -11153,6 +11157,104 @@ bool try_fsr2_translation_draw(
                     fsr2dump::on_dispatch(context, dump_desc, !dump_dx11on12);
                 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
+                // Gen-1 GetProcAddress shim 路径：把 draw 层抓到的纹理经标准 ffxFsr2*
+                // 接口喂给 OptiScaler 的 DLSS detour（而非桥自己的 FFX12/FSR4）。
+                // 纹理形态适配：FrameInput 持 ID3D11Texture2D*，Fsr2TranslationFrame 要
+                // ID3D11ShaderResourceView*，这里临时建 SRV，dispatch 后释放。
+                bool shim_dispatched = false;
+                if (g_config.enable_fsr2_get_proc_address_shim && color_tex && depth_tex && motion_tex && output_tex)
+                {
+                    ID3D11Device *shim_device = nullptr;
+                    context->GetDevice(&shim_device);
+                    if (shim_device != nullptr)
+                    {
+                        auto make_srv = [&](ID3D11Texture2D *tex) -> ID3D11ShaderResourceView* {
+                            if (tex == nullptr) return nullptr;
+                            ID3D11ShaderResourceView *srv = nullptr;
+                            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+                            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                            srv_desc.Texture2D.MipLevels = 1;
+                            srv_desc.Format = DXGI_FORMAT_UNKNOWN; // 从纹理继承
+                            if (FAILED(shim_device->CreateShaderResourceView(tex, &srv_desc, &srv)))
+                                srv = nullptr;
+                            return srv;
+                        };
+
+                        Fsr2TranslationFrame frame;
+                        frame.context = context;
+                        frame.color = make_srv(color_tex);
+                        frame.depth = make_srv(depth_tex);
+                        frame.motion = make_srv(motion_tex);
+                        frame.flags = nullptr; // Gen-2 不单独抓 flags 纹理
+                        frame.exposure = nullptr; // auto-exposure
+                        frame.output = output_tex;
+                        frame.render_width = sdk_in.render_w;
+                        frame.render_height = sdk_in.render_h;
+                        frame.output_width = sdk_in.display_w;
+                        frame.output_height = sdk_in.display_h;
+                        frame.jitter_x = sdk_in.jitter_x;
+                        frame.jitter_y = sdk_in.jitter_y;
+                        frame.motion_vectors_jittered = g_config.fsr2_motion_vectors_jittered;
+                        frame.positive_motion_vector_scale = g_config.fsr2_positive_motion_vector_scale;
+                        frame.use_reactive_mask = sdk_in.use_reactive_mask;
+                        frame.use_transparency_mask = sdk_in.use_transparency_mask;
+                        frame.enable_sharpening = sdk_in.enable_sharpening;
+                        frame.sharpness = sdk_in.sharpness;
+                        frame.hdr10_pq_color = false;
+                        frame.use_direct_linear_color = true;
+                        frame.reset = sdk_in.reset;
+                        frame.gpu_timestamp_after_prepare = nullptr;
+
+                        g_internal_bridge_dispatch = true;
+                        Fsr2TranslationOutcome outcome;
+                        {
+                            ScopedContextVtableBypass context_vtable_bypass(context);
+                            outcome = dispatch_fsr2_translation(frame);
+                        }
+                        g_internal_bridge_dispatch = false;
+
+                        if (frame.color) frame.color->Release();
+                        if (frame.depth) frame.depth->Release();
+                        if (frame.motion) frame.motion->Release();
+
+                        if (outcome.succeeded)
+                        {
+                            shim_dispatched = true;
+                            st->last_gen = call_gen;
+                            st->last_dispatched_frame = call_params.frame_index;
+                            st->last_dispatched_frame_gen = call_gen;
+                            st->reset_next = false;
+                            if (!il2cpp_callsite::consume_render_token_for(match_inst, call_gen))
+                            {
+                                LOG_DEBUG(blog::cat::upscale, "fsr2_shim_token_consume_miss inst=" +
+                                    hex64(match_inst & 0xFFFFFFFFull) + " gen=" + std::to_string(call_gen));
+                            }
+                            const std::uint64_t dcount =
+                                sdk234_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (dcount <= 8 || dcount % 1024 == 0)
+                            {
+                                LOG_INFO(blog::cat::upscale, "fsr2_shim_result rc=DISPATCH_OK gen=" +
+                                    std::to_string(call_gen) + " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+                                    " frame=" + std::to_string(call_params.frame_index) +
+                                    " render=" + std::to_string(sdk_in.render_w) + "x" + std::to_string(sdk_in.render_h) +
+                                    " output=" + std::to_string(sdk_in.display_w) + "x" + std::to_string(sdk_in.display_h) +
+                                    " hook=" + std::to_string(outcome.hook_entry_detected ? 1 : 0));
+                            }
+                        }
+                        else
+                        {
+                            LOG_WARN(blog::cat::upscale, "fsr2_shim_dispatch_failed gen=" +
+                                std::to_string(call_gen) + " err=" + outcome.error +
+                                " code=" + std::to_string(outcome.error_code) +
+                                " hook=" + std::to_string(outcome.hook_entry_detected ? 1 : 0) +
+                                " ctx_created=" + std::to_string(outcome.context_created ? 1 : 0));
+                        }
+                    }
+                    if (shim_device) shim_device->Release();
+                }
+                if (!shim_dispatched)
+#endif
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
                 {
                     // 仅成功输出后才消费 generation；失败不得让下一次重试拿到旧 history。
@@ -13540,6 +13642,22 @@ void initialize()
     install_create_hooks_for_loaded_modules();
     install_loader_hooks_for_loaded_modules();
     install_hdr_environment_probe_for_loaded_modules();
+
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
+    // Gen-1 GetProcAddress shim：Detours-hook KERNELBASE!GetProcAddress，
+    // 拦截 OptiScaler 对主 exe 的 6 次 GetProcAddress("ffxFsr2*") 查询，
+    // 返回桥的翻译桩地址。OptiScaler DetourAttach 这些桩后，桥在 draw 层
+    // dispatch_fsr2_translation 时调标准 ffxFsr2* 接口 → 落入 OptiScaler
+    // detour → DLSS。必须在 OptiScaler.dll 加载前装好（桥先注入，时序满足）。
+    if (g_config.enable_fsr2_get_proc_address_shim)
+    {
+        std::string shim_error;
+        if (install_fsr2_get_proc_address_shim(shim_error))
+            LOG_INFO(blog::cat::hook, "fsr2_get_proc_address_shim_ready exports=6");
+        else
+            LOG_ERROR(blog::cat::hook, "fsr2_get_proc_address_shim_failed error=" + shim_error);
+    }
+#endif
 }
 
 void initialize_once()
