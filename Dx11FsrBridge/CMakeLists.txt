@@ -32,6 +32,11 @@ option(DX11FSRBRIDGE_BUILD_FAMILY_TEST "Build the Fsr2FamilyTakeover state-machi
 #   - `GpuRouteTest`                —— 已在文件内标注 OBSOLETE
 # 这些留待需要时按 FFX SDK staging 接入；先保证"能无外部依赖编译"的两个进 CI。
 option(DX11FSRBRIDGE_BUILD_TESTS "Build the SDK-free unit tests (il2cpp callsite, ffx12 backend)" OFF)
+# Final-scene handoff to OptiScaler (route B for Genshin FG)。
+# 编译 final-scene 边界探测 + OptiScalerSubmitFinalSceneD3D11 调用路径。
+# 关闭时整段探测/快照/optifg-input 代码不编译（交换链 hook 决策也不读这三个 flag）。
+# 默认 OFF：仅 dev/实验构建开启；正式版保持精简。
+option(DX11FSRBRIDGE_FINAL_SCENE_PROBE "Build the final-scene handoff path (OptiScalerSubmitFinalSceneD3D11)" OFF)
 
 # The bridge deliberately uses the deployed ffx-api runtime provider.  The
 # static open-SDK host was tested in-game and produced a black output, while
@@ -86,6 +91,10 @@ if(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
     set_target_properties(Dx11FsrBridge PROPERTIES
         LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/Fsr2TranslationLayer.def\"")
     target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM=1)
+endif()
+
+if(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_FINAL_SCENE_PROBE=1)
 endif()
 
 # 旧方案已彻底移除：Fsr2TranslationLayer（旧翻译层）与 Dx11On12Swapchain（On12 引导）

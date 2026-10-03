@@ -40,6 +40,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <unordered_map>
@@ -156,6 +157,12 @@ struct Config
     std::uint32_t final_scene_snapshot_interval_frames = 240;
     bool final_scene_optifg_input = false;
     int dlssg_dxgi_workaround = -1;
+    // FG 共存实验（2026-09-27）：原神走 Dx11wDx12SC + DLSSG 时，桥的 DXGI factory/swapchain
+    // hook 层与 OptiScaler WrappedIDXGISwapChain4 + Streamline slHookGetBuffer 三方抢 swapchain，
+    // 导致 slHookGetBuffer proxyBuffer=NULL → FG inactive → D3D12 device removed。
+    // 设 1 完全禁用桥的 DXGI factory/swapchain hook（保留 GetProcAddress shim + il2cpp hook +
+    // D3D11 device hook），让 OptiScaler+Streamline 独占 swapchain，复刻崩铁成功路径。
+    bool disable_dxgi_hooks = false;
     // Exposes HDR10 capability to the game while keeping the physical output
     // on the SDR color space. This is an isolated experimental path.
     bool hdr_swapchain_spoof = false;
@@ -266,10 +273,12 @@ struct Config
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
 #endif
-    // 抖动生成模式。**默认 3**（2026-09-18 由 4 改为 3）：
-    //   游戏 jitter 为 [0,1) 的 Halton 相位；FSR2 的 jitterOffset 期望**零中心**亚像素偏移。
-    //   模式 4 = -(norm×width)      → 值域 [-1,0]，**恒定带 -0.5px 偏置**、从不跨零；
-    //   模式 3 = -(norm×width)+0.5  → 值域 [-0.5,+0.5]，零中心（= v1.2.3 的公式）。
+    // 抖动生成模式。**默认 3**（2026-09-27 单位修正）：
+    //   游戏 jitter 为 [0,1) 的 Halton 相位；jitterOffset 期望**零中心**亚像素偏移 (±0.5)。
+    //   ⚠️ phase 是归一化相位，**不是像素**——不能乘 render 尺寸。
+    //   模式 3 = 0.5 − phase       → 值域 (−0.5, 0.5]，零中心亚像素（正确，= 注释意图）。
+    //   （旧实现 −(phase×render_w)+0.5 把相位乘宽度，经 DLSS clamp 退化成恒定 −0.5 →
+    //    时域 AA 失效，>0.6 档花屏。mode 0/1/4 仍保留旧的 ×render_w 形式作 A/B 对照。）
     // 证据（2026-09-18 issue）：DLSS M/L（第二代 transformer）对重投影相位敏感，
     //   模式 4 下累积朝错误方向 → 规则网格状黑线；改模式 3 即恢复正常。
     //   其他上采样模型对半像素偏置较宽容，故长期未被发现 —— 但偏置是**普遍存在**的。
@@ -3793,6 +3802,8 @@ void load_config()
     g_logging_enabled.store(true, std::memory_order_relaxed);
     g_config.dlssg_dxgi_workaround =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
+    g_config.disable_dxgi_hooks =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DisableDxgiHooks", 0, config_path.c_str()) != 0;
     g_config.hdr_swapchain_spoof =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainSpoof", 0, config_path.c_str()) != 0;
     g_config.hdr_swapchain_force =
@@ -4227,6 +4238,12 @@ void load_config()
     g_config.show_osd = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ShowOSD", 0, config_path.c_str()) != 0;
     g_config.ffx12_feature_fallback =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FeatureFallback", 1, config_path.c_str()) != 0;
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+    // 路线 B（原神 FG）：final-scene draw 探测后把 backbuffer 交给 OptiScaler 的
+    // OptiScalerSubmitFinalSceneD3D11，让 FG 从稳定 color 帧插值（绕开 Dx11wDx12SC）。
+    g_config.final_scene_optifg_input =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"FinalSceneOptifgInput", 0, config_path.c_str()) != 0;
+#endif
     g_config.assume_phase_order = GetPrivateProfileIntW(L"Dx11FsrBridge", L"AssumePhaseOrder", 0, config_path.c_str()) != 0;
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     g_config.enable_similarity_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableSimilarityProbe", 0, config_path.c_str()) != 0;
@@ -5702,32 +5719,82 @@ void update_final_scene_probe_backbuffers(IDXGISwapChain *swapchain)
     }
 
     std::lock_guard lock(g_final_scene_probe_mutex);
+    const std::size_t prev_count = g_final_scene_probe_backbuffers.size();
     g_final_scene_probe_backbuffers = std::move(backbuffers);
+    // 首次填充时记一次，确认 Present hook 的 backbuffer 枚举执行了
+    if (prev_count == 0 && !g_final_scene_probe_backbuffers.empty())
+    {
+        std::string keys;
+        for (auto k : g_final_scene_probe_backbuffers)
+            keys += hex64(k) + " ";
+        LOG_INFO(blog::cat::probe, "final_scene_backbuffers_filled count=" +
+            std::to_string(g_final_scene_probe_backbuffers.size()) + " keys=" + keys);
+    }
 }
 
 bool matches_final_scene_boundary(
+    ID3D11DeviceContext *context,
     UINT element_count,
     bool indexed,
     std::uint64_t &frame_index,
     bool apply_snapshot_interval)
 {
     if ((!g_config.final_scene_snapshot && !g_config.final_scene_optifg_input) || !indexed ||
-        element_count != 3 || g_internal_bridge_dispatch)
+        g_internal_bridge_dispatch)
         return false;
 
+    // final-scene 合成是全屏三角形/quad：原神旧版 3 element（单三角形），7.1 实测 6 element（双三角形 quad）。
+    // 放宽到 {3,6} 让 feature_matches（backbuffer + 尺寸==viewport）做实质判定，不靠顶点数硬卡。
+    if (element_count != 3 && element_count != 6)
+        return false;
+
+    // **实时读 context 状态（build6 修正）**：
+    // Release mode2 的 on_demand_state 优化让 OMSetRenderTargets / RSSetViewports /
+    // PSSetShader 等 hook **提前 return 不填 g_state**——final-scene 合成 draw 不是 FSR2 draw，
+    // 不触发按需读取，故 g_state.rtvs[0]/viewport/current_ps_hash 全为 0（build6 探针证实）。
+    // 这里直接从 context 取 OMGetRenderTargets / RSGetViewports / PSGetShader / VSGetShader，
+    // 不依赖被 on-demand 禁用的 g_state。final-scene 判定本就是冷路径（每帧至多一次）。
     ResourceInfo target {};
     std::uint64_t pixel_shader_hash = 0;
     std::uint64_t vertex_shader_hash = 0;
     std::uint32_t viewport_width = 0;
     std::uint32_t viewport_height = 0;
     {
+        // frame_index 仍从 g_state 取（帧计数不由 on-demand 关闭）。
         std::lock_guard lock(g_state_mutex);
-        target = g_state.rtvs[0];
-        pixel_shader_hash = g_state.current_ps_hash;
-        vertex_shader_hash = g_state.current_vs_hash;
-        viewport_width = g_state.viewport_width;
-        viewport_height = g_state.viewport_height;
         frame_index = g_state.frame_index + 1;
+    }
+    ID3D11RenderTargetView *rtv = nullptr;
+    ID3D11DepthStencilView *dsv = nullptr;
+    context->OMGetRenderTargets(1, &rtv, &dsv);
+    if (rtv)
+    {
+        read_resource_info(rtv, L"final_scene_rtv", target);
+        rtv->Release();
+    }
+    if (dsv)
+        dsv->Release();
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] {};
+    UINT vp_count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    context->RSGetViewports(&vp_count, viewports);
+    if (vp_count != 0)
+    {
+        viewport_width = static_cast<std::uint32_t>(viewports[0].Width);
+        viewport_height = static_cast<std::uint32_t>(viewports[0].Height);
+    }
+    ID3D11PixelShader *ps = nullptr;
+    context->PSGetShader(&ps, nullptr, nullptr);
+    if (ps)
+    {
+        pixel_shader_hash = lookup_pixel_shader_info(ps).hash;
+        ps->Release();
+    }
+    ID3D11VertexShader *vs = nullptr;
+    context->VSGetShader(&vs, nullptr, nullptr);
+    if (vs)
+    {
+        vertex_shader_hash = lookup_vertex_shader_info(vs).hash;
+        vs->Release();
     }
 
     constexpr std::uint64_t k_final_scene_ps = 0x773B7BD7A2C6971Full;
@@ -5736,6 +5803,26 @@ bool matches_final_scene_boundary(
     {
         std::lock_guard lock(g_final_scene_probe_mutex);
         is_backbuffer = g_final_scene_probe_backbuffers.contains(target.resource_key);
+        // 无前置过滤的逐 element_count 一次性探针（build6）：
+        // build5 的 mismatch 日志被 target_key!=0 过滤遮蔽——若 final-scene draw 读 RTV 时
+        // target_key==0（OM 未绑 / 已解绑），既不 match 也不记 mismatch，整段静默。
+        // 这里对每个 element_count 只记一次，无条件打印 target_key/is_bb/尺寸，定位真实形态。
+        static std::mutex seen_mtx;
+        static std::unordered_set<UINT> seen_element_counts;
+        std::lock_guard sl(seen_mtx);
+        if (!apply_snapshot_interval && !seen_element_counts.count(element_count))
+        {
+            seen_element_counts.insert(element_count);
+            std::string bb_keys;
+            for (auto k : g_final_scene_probe_backbuffers)
+                bb_keys += hex64(k) + " ";
+            LOG_INFO(blog::cat::probe, "final_scene_probe_seen ec=" + std::to_string(element_count) +
+                " target_key=" + hex64(target.resource_key) +
+                " is_bb=" + std::to_string(is_backbuffer ? 1 : 0) +
+                " target=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
+                " viewport=" + std::to_string(viewport_width) + "x" + std::to_string(viewport_height) +
+                " bb=[" + bb_keys + "] ps=" + hex64(pixel_shader_hash));
+        }
     }
 
     // 特征识别（版本无关）：final scene = 已知 backbuffer 资源 + 输出尺寸==viewport。
@@ -5750,6 +5837,25 @@ bool matches_final_scene_boundary(
                 frame_index % g_config.final_scene_snapshot_interval_frames == 0));
     if (!matches)
     {
+        // 路线 B 诊断：有绑 RTV（target_key!=0）且尺寸非零但匹配失败时，打印一次各项状态，
+        // 定位是 is_backbuffer / 尺寸==viewport 哪项不符。加 element_count 确认 6-element draw 命中情况。
+        static std::atomic_bool logged_feature_mismatch { false };
+        if (!apply_snapshot_interval && target.resource_key != 0 &&
+            !logged_feature_mismatch.exchange(true, std::memory_order_relaxed))
+        {
+            std::string bb_keys;
+            {
+                std::lock_guard lock2(g_final_scene_probe_mutex);
+                for (auto k : g_final_scene_probe_backbuffers)
+                    bb_keys += hex64(k) + " ";
+            }
+            LOG_INFO(blog::cat::probe, "final_scene_mismatch element_count=" + std::to_string(element_count) +
+                " target_key=" + hex64(target.resource_key) +
+                " backbuffers=[" + bb_keys + "] is_bb=" + std::to_string(is_backbuffer ? 1 : 0) +
+                " target=" + std::to_string(target.width) + "x" + std::to_string(target.height) +
+                " viewport=" + std::to_string(viewport_width) + "x" + std::to_string(viewport_height) +
+                " ps=" + hex64(pixel_shader_hash) + " vs=" + hex64(vertex_shader_hash));
+        }
         // The OptiFG handoff is opt-in; emit one diagnostic only when the known scene shader is observed.
         static std::atomic_bool logged_expected_shader_mismatch { false };
         if (!apply_snapshot_interval && pixel_shader_hash == k_final_scene_ps &&
@@ -11016,6 +11122,11 @@ bool try_fsr2_translation_draw(
                     case 2: // 原样归一化（≈0，等效关 jitter）
                         break;
                     case 3: // −norm×render + 0.5（模式 0 的 X/Y 翻转，翻译层 Fsr2JitterMode=3 风格）
+                        // ⚠️ 2026-09-27 实测：jitter source（il2cpp +0x24）恒定 ~0.4996（非 Halton 相位）。
+                        //   旧式 −(phase×render_w)+0.5 → 经 DLSS clamp 退化恒定 −0.5；
+                        //   改 0.5−phase → ~0.0。两者都让 DLSS 几乎无时域 jitter，但 −0.5 时 0.6 档正常、
+                        //   ~0.0 时花屏 → jitter offset 本身参与 DLSS 几何重投影，与 MV 耦合。
+                        //   先回退旧式确认 0.6 恢复，jitter source 语义另查（cb0 staging 三候选槽）。
                         sdk_in.jitter_x = -(use_jx * static_cast<float>(sdk_in.render_w)) + 0.5f;
                         sdk_in.jitter_y = -(use_jy * static_cast<float>(sdk_in.render_h)) + 0.5f;
                         break;
@@ -11034,6 +11145,19 @@ bool try_fsr2_translation_draw(
                 }
                 st->prev_jx = jit_src_x;
                 st->prev_jy = jit_src_y;
+                // 2026-09-27 jitter 语义诊断：il2cpp +0x24 恒定 ~0.4996（非 Halton），
+                // 记录原始值/范围/逐帧变化 + cb0 fallback 是否触发，定位真正的 Halton 相位源。
+                static std::atomic_uint64_t jit_diag_count { 0 };
+                if (jit_diag_count.fetch_add(1, std::memory_order_relaxed) < 40)
+                {
+                    LOG_INFO(blog::cat::upscale, "jit_diag src=" + std::string(jit_src_name) +
+                        " raw=(" + std::to_string(jit_src_x) + "," + std::to_string(jit_src_y) + ")" +
+                        " use=(" + std::to_string(use_jx) + "," + std::to_string(use_jy) + ")" +
+                        " out=(" + std::to_string(sdk_in.jitter_x) + "," + std::to_string(sdk_in.jitter_y) + ")" +
+                        " render=" + std::to_string(sdk_in.render_w) + "x" + std::to_string(sdk_in.render_h) +
+                        " mode=" + std::to_string(g_config.ffx12_jitter_mode) +
+                        " delay=" + std::to_string(g_config.ffx12_jitter_delay ? 1 : 0));
+                }
                 // OptiScaler 输出定向修复——XeSS/DLSS 的 jitter 需 ≤±0.5
                 // （xessD3D12Execute 报 Invalid Argument：jitterOffset 超界）。仅 XeSS/DLSS
                 // 激活时把像素 jitter 夹紧到 ±0.5（子像素），FSR 输出保持原样（互不干扰）。
@@ -11169,23 +11293,132 @@ bool try_fsr2_translation_draw(
                     context->GetDevice(&shim_device);
                     if (shim_device != nullptr)
                     {
-                        auto make_srv = [&](ID3D11Texture2D *tex) -> ID3D11ShaderResourceView* {
+                        // make_srv：UNKNOWN 失败（typeless/committed 深度格式）时按纹理 desc
+                        // 映射成具体 SRV 格式重试。Gen-1 shim 的 Fsr2TranslationFrame 要 SRV，
+                        // 而 depth 在 10801 被换成 DSV 纹理——深度纹理多为 typeless，UNKNOWN 建 SRV 会失败。
+                        auto make_srv = [&](ID3D11Texture2D *tex, const char *tag) -> ID3D11ShaderResourceView* {
                             if (tex == nullptr) return nullptr;
-                            ID3D11ShaderResourceView *srv = nullptr;
-                            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
-                            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                            srv_desc.Texture2D.MipLevels = 1;
-                            srv_desc.Format = DXGI_FORMAT_UNKNOWN; // 从纹理继承
-                            if (FAILED(shim_device->CreateShaderResourceView(tex, &srv_desc, &srv)))
-                                srv = nullptr;
-                            return srv;
+                            auto try_create = [&](DXGI_FORMAT fmt) -> std::pair<ID3D11ShaderResourceView*, HRESULT> {
+                                ID3D11ShaderResourceView *srv = nullptr;
+                                D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+                                srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                                srv_desc.Texture2D.MipLevels = 1;
+                                srv_desc.Format = fmt;
+                                const HRESULT hr = shim_device->CreateShaderResourceView(tex, &srv_desc, &srv);
+                                if (FAILED(hr)) { if (srv) { srv->Release(); srv = nullptr; } }
+                                return { srv, hr };
+                            };
+                            auto [srv, hr] = try_create(DXGI_FORMAT_UNKNOWN); // 先继承纹理格式
+                            if (srv != nullptr)
+                                return srv; // 继承格式成功——直接返回，不走诊断
+                            // typeless/committed 深度：按 desc 映射具体 SRV 格式重试
+                            D3D11_TEXTURE2D_DESC td{};
+                            tex->GetDesc(&td);
+                            DXGI_FORMAT mapped = DXGI_FORMAT_UNKNOWN;
+                            switch (td.Format)
+                            {
+                                case DXGI_FORMAT_R24G8_TYPELESS:       mapped = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+                                case DXGI_FORMAT_R32G8X24_TYPELESS:    mapped = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break; // 深度模板 typeless（7.1 实测 depth=fmt19）
+                                case DXGI_FORMAT_R32_TYPELESS:         mapped = DXGI_FORMAT_R32_FLOAT; break;
+                                case DXGI_FORMAT_R16_TYPELESS:         mapped = DXGI_FORMAT_R16_FLOAT; break;
+                                case DXGI_FORMAT_R8_TYPELESS:          mapped = DXGI_FORMAT_R8_UNORM; break;
+                                case DXGI_FORMAT_R16G16_TYPELESS:      mapped = DXGI_FORMAT_R16G16_FLOAT; break;
+                                case DXGI_FORMAT_R32G32_TYPELESS:      mapped = DXGI_FORMAT_R32G32_FLOAT; break;
+                                case DXGI_FORMAT_R16G16B16A16_TYPELESS: mapped = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+                                case DXGI_FORMAT_R32G32B32A32_TYPELESS: mapped = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+                                case DXGI_FORMAT_R10G10B10A2_TYPELESS: mapped = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+                                case DXGI_FORMAT_R8G8B8A8_TYPELESS:    mapped = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+                                // committed 深度模板：D3D11 不允许直接建 SRV，必须用 typeless 视图格式
+                                case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: mapped = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+                                case DXGI_FORMAT_D24_UNORM_S8_UINT:    mapped = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+                                case DXGI_FORMAT_D16_UNORM:            mapped = DXGI_FORMAT_R16_UNORM; break;
+                                case DXGI_FORMAT_D32_FLOAT:            mapped = DXGI_FORMAT_R32_FLOAT; break;
+                                // BC typeless → +1 (UNORM) 约定
+                                case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC2_TYPELESS:
+                                case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC4_TYPELESS:
+                                case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC6H_TYPELESS:
+                                case DXGI_FORMAT_BC7_TYPELESS:
+                                    mapped = static_cast<DXGI_FORMAT>(static_cast<UINT>(td.Format) + 1); break;
+                                default: break;
+                            }
+                            if (mapped != DXGI_FORMAT_UNKNOWN)
+                            {
+                                auto [srv2, hr2] = try_create(mapped);
+                                if (srv2 != nullptr)
+                                    return srv2; // 映射后成功——不记日志
+                                hr = hr2; // 映射后仍失败——记 hr2
+                            }
+                            // 到此才是真失败：映射后仍建不出 SRV
+                            static std::atomic_uint64_t s_srv_fail_log { 0 };
+                            const std::uint64_t n = s_srv_fail_log.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (n <= 16)
+                            {
+                                LOG_WARN(blog::cat::upscale, "fsr2_shim_srv_failed tag=" + std::string(tag) +
+                                    " texfmt=" + std::to_string(static_cast<unsigned>(td.Format)) +
+                                    " mapped=" + std::to_string(static_cast<unsigned>(mapped)) +
+                                    " hr=" + hex64(static_cast<std::uint64_t>(hr)) +
+                                    " size=" + std::to_string(td.Width) + "x" + std::to_string(td.Height));
+                            }
+                            return nullptr;
                         };
+
+                        // 诊断：在 dispatch 点 dump 真实绑定的 8 SRV + 4 RTV 格式/尺寸 + draw_info 槽位选择。
+                        // 目的：定位"color=BC1/motion=BC3/depth=D32_S8 槽位抓错"根因——
+                        // 确认是 fixed_slot_identify 抓错 draw，还是 dispatch 与 identify 之间 PS 绑定漂移。
+                        static std::atomic_uint64_t s_dispatch_dump { 0 };
+                        if (s_dispatch_dump.fetch_add(1, std::memory_order_relaxed) < 8)
+                        {
+                            ID3D11ShaderResourceView *dump_srvs[8] {};
+                            context->PSGetShaderResources(0, 8, dump_srvs);
+                            ID3D11RenderTargetView *dump_rtvs[4] {};
+                            context->OMGetRenderTargets(4, dump_rtvs, nullptr);
+                            std::ostringstream d;
+                            d << "fsr2_shim_dispatch_dump slots(color=" << draw_info->color_srv_slot
+                              << " depth=" << draw_info->depth_srv_slot
+                              << " motion=" << draw_info->motion_srv_slot
+                              << " out_rtv=" << draw_info->output_rtv_slot
+                              << ") render=" << sdk_in.render_w << "x" << sdk_in.render_h
+                              << " out=" << sdk_in.display_w << "x" << sdk_in.display_h
+                              << " srvs=";
+                            for (int i = 0; i < 8; ++i)
+                            {
+                                if (dump_srvs[i])
+                                {
+                                    ID3D11Resource *r = nullptr;
+                                    dump_srvs[i]->GetResource(&r);
+                                    ID3D11Texture2D *t = nullptr;
+                                    if (r) { r->QueryInterface(IID_PPV_ARGS(&t)); r->Release(); }
+                                    if (t) { D3D11_TEXTURE2D_DESC td{}; t->GetDesc(&td);
+                                        d << i << ":" << td.Width << "x" << td.Height << "f" << static_cast<unsigned>(td.Format) << " "; t->Release(); }
+                                    else d << i << ":? ";
+                                    dump_srvs[i]->Release();
+                                }
+                                else d << i << ":0 ";
+                            }
+                            d << "rtvs=";
+                            for (int i = 0; i < 4; ++i)
+                            {
+                                if (dump_rtvs[i])
+                                {
+                                    ID3D11Resource *r = nullptr;
+                                    dump_rtvs[i]->GetResource(&r);
+                                    ID3D11Texture2D *t = nullptr;
+                                    if (r) { r->QueryInterface(IID_PPV_ARGS(&t)); r->Release(); }
+                                    if (t) { D3D11_TEXTURE2D_DESC td{}; t->GetDesc(&td);
+                                        d << i << ":" << td.Width << "x" << td.Height << "f" << static_cast<unsigned>(td.Format) << " "; t->Release(); }
+                                    else d << i << ":? ";
+                                    dump_rtvs[i]->Release();
+                                }
+                                else d << i << ":0 ";
+                            }
+                            LOG_INFO(blog::cat::upscale, d.str());
+                        }
 
                         Fsr2TranslationFrame frame;
                         frame.context = context;
-                        frame.color = make_srv(color_tex);
-                        frame.depth = make_srv(depth_tex);
-                        frame.motion = make_srv(motion_tex);
+                        frame.color = make_srv(color_tex, "color");
+                        frame.depth = make_srv(depth_tex, "depth");
+                        frame.motion = make_srv(motion_tex, "motion");
                         frame.flags = nullptr; // Gen-2 不单独抓 flags 纹理
                         frame.exposure = nullptr; // auto-exposure
                         frame.output = output_tex;
@@ -11239,7 +11472,12 @@ bool try_fsr2_translation_draw(
                                     " frame=" + std::to_string(call_params.frame_index) +
                                     " render=" + std::to_string(sdk_in.render_w) + "x" + std::to_string(sdk_in.render_h) +
                                     " output=" + std::to_string(sdk_in.display_w) + "x" + std::to_string(sdk_in.display_h) +
-                                    " hook=" + std::to_string(outcome.hook_entry_detected ? 1 : 0));
+                                    " hook=" + std::to_string(outcome.hook_entry_detected ? 1 : 0) +
+                                    " jitter=" + std::to_string(frame.jitter_x) + "," + std::to_string(frame.jitter_y) +
+                                    " reset=" + std::to_string(frame.reset ? 1 : 0) +
+                                    " mvj=" + std::to_string(frame.motion_vectors_jittered ? 1 : 0) +
+                                    " mvsign=" + std::to_string(frame.positive_motion_vector_scale ? 1 : 0) +
+                                    " jit_src=" + std::string(jit_src_name));
                             }
                         }
                         else
@@ -12095,9 +12333,9 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     bool final_scene_optifg_boundary = false;
     std::uint64_t final_scene_optifg_frame = 0;
     final_scene_snapshot_boundary =
-        matches_final_scene_boundary(index_count, true, final_scene_snapshot_frame, true);
+        matches_final_scene_boundary(context, index_count, true, final_scene_snapshot_frame, true);
     final_scene_optifg_boundary =
-        matches_final_scene_boundary(index_count, true, final_scene_optifg_frame, false);
+        matches_final_scene_boundary(context, index_count, true, final_scene_optifg_frame, false);
 #endif
     g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
@@ -12183,9 +12421,9 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     bool final_scene_optifg_boundary = false;
     std::uint64_t final_scene_optifg_frame = 0;
     final_scene_snapshot_boundary =
-        matches_final_scene_boundary(vertex_count, false, final_scene_snapshot_frame, true);
+        matches_final_scene_boundary(context, vertex_count, false, final_scene_snapshot_frame, true);
     final_scene_optifg_boundary =
-        matches_final_scene_boundary(vertex_count, false, final_scene_optifg_frame, false);
+        matches_final_scene_boundary(context, vertex_count, false, final_scene_optifg_frame, false);
 #endif
     g_original_draw(context, vertex_count, start_vertex_location);
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
@@ -12816,6 +13054,8 @@ bool swapchain_hook_needed()
 
 void install_swapchain_hooks(IDXGISwapChain *swapchain)
 {
+    if (g_config.disable_dxgi_hooks)
+        return;
     if (swapchain == nullptr)
         return;
 
@@ -12957,6 +13197,8 @@ void set_output_size(UINT width, UINT height, const char *source)
 
 void install_factory_hooks(IDXGIFactory *factory)
 {
+    if (g_config.disable_dxgi_hooks)
+        return;
     if (factory == nullptr)
         return;
 
@@ -12971,6 +13213,8 @@ void install_factory_hooks(IDXGIFactory *factory)
 
 void install_factory2_hooks(IDXGIFactory2 *factory)
 {
+    if (g_config.disable_dxgi_hooks)
+        return;
     if (factory == nullptr)
         return;
 
@@ -12986,6 +13230,8 @@ void install_factory2_hooks(IDXGIFactory2 *factory)
 
 void install_factory_hooks_from_device(ID3D11Device *device)
 {
+    if (g_config.disable_dxgi_hooks)
+        return;
     if (device == nullptr)
         return;
 
@@ -13506,6 +13752,20 @@ void initialize()
         g_config.logging.pending_warnings.clear();
     }
 
+    if (g_config.disable_dxgi_hooks)
+        LOG_INFO(blog::cat::config, "disable_dxgi_hooks=1: DXGI factory/swapchain hooks skipped (FG coexistence experiment)");
+
+    // probe 路径诊断（确认运行 DLL 含 probe 代码且 ini flag 生效）
+    {
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+        const char *probe_built = "yes";
+#else
+        const char *probe_built = "no";
+#endif
+        LOG_INFO(blog::cat::config, std::string("final_scene_probe_built=") + probe_built +
+            " optifg_input=" + std::to_string(g_config.final_scene_optifg_input ? 1 : 0));
+    }
+
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.trace_pixel_shader_draws)
     {
@@ -13658,6 +13918,83 @@ void initialize()
             LOG_ERROR(blog::cat::hook, "fsr2_get_proc_address_shim_failed error=" + shim_error);
     }
 #endif
+
+    // 原神 mhyprot 反作弊在游戏启动早期锁定进程：外部进程的 VirtualAllocEx /
+    // CreateRemoteThread 会被拒绝（启动器注入 OptiScaler 报「拒绝访问」）。桥已在
+    // 进程内（窗口期注入成功），由它在 DllMain 返回后起线程 LoadLibraryW 加载
+    // OptiScaler.dll —— 进程内加载不走外部注入 API，mhyprot 拦不到。
+    //
+    // 路径来自启动器写的 sidecar 文件 Dx11FsrBridge.autoload.txt（UTF-8 单行绝对
+    // 路径，每次注入前覆盖写）。必须在 shim 装好之后加载，保证 OptiScaler 的
+    // HookFSR2Dx11ExeInputs 查 ffxFsr2* 时 shim 已就位。
+    //
+    // ⚠️ 不能在 DllMain 里直接 LoadLibraryW：被加载 DLL 的 DllMain 会尝试获取
+    // loader lock，而当前线程已持有它 → 死锁。用 std::thread + detach：线程函数
+    // 在 DllMain 返回、loader lock 释放后才执行 LoadLibraryW（与 BridgeLogger
+    // writer 线程同一种用法）。
+    {
+        const std::filesystem::path autoload_path = g_module_dir / L"Dx11FsrBridge.autoload.txt";
+        std::string utf8_line;
+        {
+            std::ifstream ifs(autoload_path); // C++20: 接受 filesystem::path，宽路径可含中文
+            if (ifs.is_open())
+            {
+                std::getline(ifs, utf8_line);
+                // 去 UTF-8 BOM（.NET File.WriteAllText(Encoding.UTF8) 会带）
+                if (utf8_line.size() >= 3 &&
+                    static_cast<unsigned char>(utf8_line[0]) == 0xEF &&
+                    static_cast<unsigned char>(utf8_line[1]) == 0xBB &&
+                    static_cast<unsigned char>(utf8_line[2]) == 0xBF)
+                {
+                    utf8_line.erase(0, 3);
+                }
+                // trim 尾部 \r / 空白
+                while (!utf8_line.empty())
+                {
+                    const char c = utf8_line.back();
+                    if (c == '\r' || c == ' ' || c == '\t' || c == '\n')
+                        utf8_line.pop_back();
+                    else
+                        break;
+                }
+            }
+        }
+        if (!utf8_line.empty())
+        {
+            // UTF-8 → wide（路径可含中文，narrow 的逆运算）
+            std::wstring optiscaler_path_w;
+            const int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_line.c_str(),
+                static_cast<int>(utf8_line.size()), nullptr, 0);
+            if (wlen > 0)
+            {
+                optiscaler_path_w.resize(static_cast<std::size_t>(wlen));
+                MultiByteToWideChar(CP_UTF8, 0, utf8_line.c_str(),
+                    static_cast<int>(utf8_line.size()), optiscaler_path_w.data(), wlen);
+            }
+            if (!optiscaler_path_w.empty() && std::filesystem::exists(optiscaler_path_w))
+            {
+                LOG_INFO(blog::cat::core, "optiscaler_autoload scheduled path=" + narrow(optiscaler_path_w));
+                std::thread([path = std::move(optiscaler_path_w)]() {
+                    try
+                    {
+                        const HMODULE m = LoadLibraryW(path.c_str());
+                        if (m != nullptr)
+                            LOG_INFO(blog::cat::core, "optiscaler_autoload loaded base=" + hex64(reinterpret_cast<std::uintptr_t>(m)));
+                        else
+                            LOG_ERROR(blog::cat::core, "optiscaler_autoload_failed gle=" + std::to_string(GetLastError()));
+                    }
+                    catch (...)
+                    {
+                        // LoadLibrary 失败不影响桥自身工作（Gen-2 兜底仍可用）
+                    }
+                }).detach();
+            }
+            else if (!optiscaler_path_w.empty())
+            {
+                LOG_WARN(blog::cat::core, "optiscaler_autoload path_not_found path=" + narrow(optiscaler_path_w));
+            }
+        }
+    }
 }
 
 void initialize_once()

@@ -440,8 +440,11 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
     }
 
     FfxFsr2ContextDescription description {};
+    // 原神是 SDR（sRGB R8G8B8A8），不能设 HDR flag。
+    // 此前硬编码 FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE → OptiScaler 映射成 DLSS IsHdr=true
+    // → DLSS 把 sRGB SDR 当线性 HDR 处理 → 色彩管线错配、画面发灰/对比度丢失 → "像 FSR 画质"。
+    // DepthInverted 保留：Unity reverse-Z（near=1 far=0），FSR2 该 flag 语义正确。
     description.flags =
-        FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE |
         FFX_FSR2_ENABLE_DEPTH_INVERTED;
     if (g_auto_exposure)
         description.flags |= FFX_FSR2_ENABLE_AUTO_EXPOSURE;
