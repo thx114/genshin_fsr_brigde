@@ -13992,33 +13992,13 @@ void initialize()
                 std::thread([path = std::move(optiscaler_path_w)]() {
                     try
                     {
-                        // The Bridge must own the FSR2/D3D hooks before OptiScaler
-                        // enters. Waiting for the first FSR2 dispatch is too late and can
-                        // deadlock: OptiScaler supplies part of the consumer path that
-                        // makes the first dispatch happen. Draw-hook readiness is the
-                        // stable boundary used by the old working package.
-                        constexpr int k_wait_step_ms = 20;
-                        constexpr int k_wait_timeout_ms = 10000;
-                        int waited_ms = 0;
-                        while (!g_bridge_draw_hook_ready.load(std::memory_order_acquire) &&
-                               waited_ms < k_wait_timeout_ms)
-                        {
-                            Sleep(k_wait_step_ms);
-                            waited_ms += k_wait_step_ms;
-                        }
-
-                        if (g_bridge_draw_hook_ready.load(std::memory_order_acquire))
-                        {
-                            LOG_INFO(blog::cat::core,
-                                "optiscaler_autoload Bridge draw-hook ready waited_ms=" +
-                                std::to_string(waited_ms));
-                        }
-                        else
-                        {
-                            LOG_WARN(blog::cat::core,
-                                "optiscaler_autoload timeout waiting for Bridge draw hook; loading anyway");
-                        }
-
+                        // The known-good v2.3.1 path loads OptiScaler immediately
+                        // after the Bridge has installed its GetProcAddress shim,
+                        // before the game creates its D3D device/swapchain. Delaying
+                        // until draw/FSR dispatch is too late (or deadlocks because
+                        // OptiScaler is part of the consumer path). The coexistence
+                        // workaround is now enabled independently from the autoload
+                        // path via g_autoload_optiscaler_ini.
                         const HMODULE m = LoadLibraryW(path.c_str());
                         if (m != nullptr)
                             LOG_INFO(blog::cat::core, "optiscaler_autoload loaded base=" + hex64(reinterpret_cast<std::uintptr_t>(m)));
