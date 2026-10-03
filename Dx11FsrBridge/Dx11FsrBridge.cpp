@@ -514,6 +514,10 @@ std::filesystem::path g_module_dir;
 // same coexistence workaround after migration by remembering the OptiScaler
 // DLL's sibling ini from Dx11FsrBridge.autoload.txt.
 std::filesystem::path g_autoload_optiscaler_ini;
+// Set on the first real D3D11 draw hook. OptiScaler must enter after the Bridge
+// has installed its D3D/FSR hooks, but before waiting for an FSR2 dispatch would
+// deadlock because OptiScaler itself supplies part of the FSR2 consumer path.
+std::atomic_bool g_bridge_draw_hook_ready = false;
 std::filesystem::path g_log_path;
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::atomic_uint64_t g_dxgi_swapchain_request_id = 0;
@@ -12272,6 +12276,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
     capture_runtime_snapshot_if_requested();
 #endif
     static std::atomic_bool hook_logged { false };
+    g_bridge_draw_hook_ready.store(true, std::memory_order_release);
     if (!hook_logged.load(std::memory_order_relaxed) &&
         !hook_logged.exchange(true, std::memory_order_relaxed))
         LOG_INFO(blog::cat::core, "draw_indexed_hook_active");
@@ -12360,6 +12365,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_cou
     capture_runtime_snapshot_if_requested();
 #endif
     static std::atomic_bool hook_logged { false };
+    g_bridge_draw_hook_ready.store(true, std::memory_order_release);
     if (!hook_logged.load(std::memory_order_relaxed) &&
         !hook_logged.exchange(true, std::memory_order_relaxed))
         LOG_INFO(blog::cat::core, "draw_hook_active");
@@ -13986,32 +13992,31 @@ void initialize()
                 std::thread([path = std::move(optiscaler_path_w)]() {
                     try
                     {
-                        // The Bridge must own the FSR2 shim before OptiScaler enters the
-                        // process, but loading OptiScaler immediately after DllMain still
-                        // races the game's first FSR2 setup/dispatch. That race is the
-                        // migration-only transparent/black output regression. Wait for
-                        // one real FFX dispatch, with a bounded timeout for games that
-                        // never reach FSR2 (the timeout preserves the old fallback).
+                        // The Bridge must own the FSR2/D3D hooks before OptiScaler
+                        // enters. Waiting for the first FSR2 dispatch is too late and can
+                        // deadlock: OptiScaler supplies part of the consumer path that
+                        // makes the first dispatch happen. Draw-hook readiness is the
+                        // stable boundary used by the old working package.
                         constexpr int k_wait_step_ms = 20;
-                        constexpr int k_wait_timeout_ms = 15000;
+                        constexpr int k_wait_timeout_ms = 10000;
                         int waited_ms = 0;
-                        while (ffx12::dispatch_count() == 0 && waited_ms < k_wait_timeout_ms)
+                        while (!g_bridge_draw_hook_ready.load(std::memory_order_acquire) &&
+                               waited_ms < k_wait_timeout_ms)
                         {
                             Sleep(k_wait_step_ms);
                             waited_ms += k_wait_step_ms;
                         }
 
-                        const std::uint64_t dispatches = ffx12::dispatch_count();
-                        if (dispatches == 0)
+                        if (g_bridge_draw_hook_ready.load(std::memory_order_acquire))
                         {
-                            LOG_WARN(blog::cat::core,
-                                "optiscaler_autoload timeout waiting for first FSR2 dispatch; loading anyway");
+                            LOG_INFO(blog::cat::core,
+                                "optiscaler_autoload Bridge draw-hook ready waited_ms=" +
+                                std::to_string(waited_ms));
                         }
                         else
                         {
-                            LOG_INFO(blog::cat::core,
-                                "optiscaler_autoload FSR2 ready dispatches=" + std::to_string(dispatches) +
-                                " waited_ms=" + std::to_string(waited_ms));
+                            LOG_WARN(blog::cat::core,
+                                "optiscaler_autoload timeout waiting for Bridge draw hook; loading anyway");
                         }
 
                         const HMODULE m = LoadLibraryW(path.c_str());
