@@ -2685,6 +2685,11 @@ void recover_device_removed_locked()
     g_motion_cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
 }
 
+std::uint64_t dispatch_count()
+{
+    return g_dispatch_counter.load(std::memory_order_acquire);
+}
+
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
 {
     // 停机中：立即返回，不取 g_mutex、不碰 D3D12 资源。

@@ -508,6 +508,12 @@ struct ModeMatch
 HMODULE g_module = nullptr;
 Config g_config;
 std::filesystem::path g_module_dir;
+// The launcher keeps OptiScaler outside the Bridge module directory.  The old
+// one-click package had payload\Bridge and payload\OptiScaler side by side,
+// so the relative candidate happened to find OptiScaler.ini.  Preserve the
+// same coexistence workaround after migration by remembering the OptiScaler
+// DLL's sibling ini from Dx11FsrBridge.autoload.txt.
+std::filesystem::path g_autoload_optiscaler_ini;
 std::filesystem::path g_log_path;
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::atomic_uint64_t g_dxgi_swapchain_request_id = 0;
@@ -8561,6 +8567,7 @@ std::vector<std::filesystem::path> optiscaler_ini_candidates()
         add_path(std::filesystem::path(std::wstring(process_path, process_path + length)).parent_path() / L"OptiScaler.ini");
 
     add_path(g_module_dir / L"OptiScaler.ini");
+    add_path(g_autoload_optiscaler_ini);
     if (!g_module_dir.empty())
     {
         add_path(g_module_dir.parent_path() / L"OptiScaler.ini");
@@ -13973,10 +13980,40 @@ void initialize()
             }
             if (!optiscaler_path_w.empty() && std::filesystem::exists(optiscaler_path_w))
             {
+                g_autoload_optiscaler_ini = std::filesystem::path(optiscaler_path_w).parent_path() / L"OptiScaler.ini";
                 LOG_INFO(blog::cat::core, "optiscaler_autoload scheduled path=" + narrow(optiscaler_path_w));
+                LOG_INFO(blog::cat::coexist, "optiscaler_autoload ini_candidate=" + narrow(g_autoload_optiscaler_ini.wstring()));
                 std::thread([path = std::move(optiscaler_path_w)]() {
                     try
                     {
+                        // The Bridge must own the FSR2 shim before OptiScaler enters the
+                        // process, but loading OptiScaler immediately after DllMain still
+                        // races the game's first FSR2 setup/dispatch. That race is the
+                        // migration-only transparent/black output regression. Wait for
+                        // one real FFX dispatch, with a bounded timeout for games that
+                        // never reach FSR2 (the timeout preserves the old fallback).
+                        constexpr int k_wait_step_ms = 20;
+                        constexpr int k_wait_timeout_ms = 15000;
+                        int waited_ms = 0;
+                        while (ffx12::dispatch_count() == 0 && waited_ms < k_wait_timeout_ms)
+                        {
+                            Sleep(k_wait_step_ms);
+                            waited_ms += k_wait_step_ms;
+                        }
+
+                        const std::uint64_t dispatches = ffx12::dispatch_count();
+                        if (dispatches == 0)
+                        {
+                            LOG_WARN(blog::cat::core,
+                                "optiscaler_autoload timeout waiting for first FSR2 dispatch; loading anyway");
+                        }
+                        else
+                        {
+                            LOG_INFO(blog::cat::core,
+                                "optiscaler_autoload FSR2 ready dispatches=" + std::to_string(dispatches) +
+                                " waited_ms=" + std::to_string(waited_ms));
+                        }
+
                         const HMODULE m = LoadLibraryW(path.c_str());
                         if (m != nullptr)
                             LOG_INFO(blog::cat::core, "optiscaler_autoload loaded base=" + hex64(reinterpret_cast<std::uintptr_t>(m)));

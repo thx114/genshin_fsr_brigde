@@ -162,6 +162,10 @@ void get_chain_samples(ChainSampleData &out);
 // instance_key：区分游戏多个 FFX_FSR2 实例（主渲染/UI 次渲染），每实例独立 context 防历史串流。
 // 线程安全（内部互斥）。返回 false 表示本帧失败（调用方回退）。
 bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key = 0);
+// Number of FFX dispatches that have actually entered the backend. Used by the
+// Bridge-side OptiScaler autoload gate so OptiScaler is not loaded before FSR2
+// has produced its first real frame.
+std::uint64_t dispatch_count();
 
 // 异步交叠（async upscale）：dispatch 只提交 FFX（不等待），游戏继续渲染；
 // Present 前调用 finish_pending 等待 FFX 完成并拷贝输出——FFX 与游戏后续
