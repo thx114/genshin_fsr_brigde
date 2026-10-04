@@ -1,4 +1,4 @@
-#include <fsr2/ffx_fsr2.h>
+﻿#include <fsr2/ffx_fsr2.h>
 
 #include "Fsr2TranslationLayer.h"
 
@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <memory>
+#include <unordered_map>
 
 namespace
 {
@@ -28,33 +30,43 @@ fsr2_context_dispatch_fn g_translation_context_dispatch = nullptr;
 fsr2_context_destroy_fn g_translation_context_destroy = nullptr;
 
 std::mutex g_translation_mutex;
-FfxFsr2Context g_translation_context {};
-ID3D11Device *g_translation_device = nullptr;
-ID3D11ComputeShader *g_input_prepare_shader = nullptr;
-ID3D11ComputeShader *g_input_prepare_pq_shader = nullptr;
-ID3D11ComputeShader *g_input_prepare_direct_color_shader = nullptr;
-ID3D11ComputeShader *g_output_encode_shader = nullptr;
-ID3D11Texture2D *g_prepared_color = nullptr;
-ID3D11Texture2D *g_prepared_motion = nullptr;
-ID3D11Texture2D *g_prepared_reactive = nullptr;
-ID3D11Texture2D *g_prepared_transparency = nullptr;
-ID3D11Texture2D *g_prepared_exposure = nullptr;
-ID3D11Texture2D *g_linear_output = nullptr;
-ID3D11UnorderedAccessView *g_prepared_color_uav = nullptr;
-ID3D11UnorderedAccessView *g_prepared_motion_uav = nullptr;
-ID3D11UnorderedAccessView *g_prepared_reactive_uav = nullptr;
-ID3D11UnorderedAccessView *g_prepared_transparency_uav = nullptr;
-ID3D11UnorderedAccessView *g_prepared_exposure_uav = nullptr;
-ID3D11ShaderResourceView *g_linear_output_srv = nullptr;
-std::uint32_t g_render_width = 0;
-std::uint32_t g_render_height = 0;
-std::uint32_t g_output_width = 0;
-std::uint32_t g_output_height = 0;
-bool g_translation_context_created = false;
-bool g_reset_next_dispatch = true;
-bool g_auto_exposure = true;
+struct TranslationSession
+{
+    FfxFsr2Context translation_context {};
+    ID3D11Device *translation_device = nullptr;
+    ID3D11ComputeShader *input_prepare_shader = nullptr;
+    ID3D11ComputeShader *input_prepare_pq_shader = nullptr;
+    ID3D11ComputeShader *input_prepare_direct_color_shader = nullptr;
+    ID3D11ComputeShader *output_encode_shader = nullptr;
+    ID3D11Texture2D *prepared_color = nullptr;
+    ID3D11Texture2D *prepared_motion = nullptr;
+    ID3D11Texture2D *prepared_reactive = nullptr;
+    ID3D11Texture2D *prepared_transparency = nullptr;
+    ID3D11Texture2D *prepared_exposure = nullptr;
+    ID3D11Texture2D *linear_output = nullptr;
+    ID3D11UnorderedAccessView *prepared_color_uav = nullptr;
+    ID3D11UnorderedAccessView *prepared_motion_uav = nullptr;
+    ID3D11UnorderedAccessView *prepared_reactive_uav = nullptr;
+    ID3D11UnorderedAccessView *prepared_transparency_uav = nullptr;
+    ID3D11UnorderedAccessView *prepared_exposure_uav = nullptr;
+    ID3D11ShaderResourceView *linear_output_srv = nullptr;
+    std::uint32_t render_width = 0;
+    std::uint32_t render_height = 0;
+    std::uint32_t output_width = 0;
+    std::uint32_t output_height = 0;
+    bool translation_context_created = false;
+    bool reset_next_dispatch = true;
+    bool auto_exposure = true;
+    bool depth_inverted = true;
+    bool motion_vectors_jittered = false;
+    bool hdr10_pq_color = false;
+    bool use_direct_linear_color = false;
+    LARGE_INTEGER last_dispatch_counter {};
+};
+std::unordered_map<std::uint64_t, std::unique_ptr<TranslationSession>> g_sessions;
+TranslationSession *g_session = nullptr;
 bool g_hook_entry_detected = false;
-LARGE_INTEGER g_last_dispatch_counter {};
+constexpr std::size_t kMaxTranslationSessions = 8;
 
 template <typename Interface>
 void safe_release(Interface *&value)
@@ -68,36 +80,36 @@ void safe_release(Interface *&value)
 
 void release_translation_locked()
 {
-    if (g_translation_context_created && g_translation_context_destroy != nullptr)
-        g_translation_context_destroy(&g_translation_context);
-    g_translation_context_created = false;
-    g_translation_context = {};
+    if (g_session->translation_context_created && g_translation_context_destroy != nullptr)
+        g_translation_context_destroy(&g_session->translation_context);
+    g_session->translation_context_created = false;
+    g_session->translation_context = {};
 
-    safe_release(g_prepared_color_uav);
-    safe_release(g_prepared_motion_uav);
-    safe_release(g_prepared_reactive_uav);
-    safe_release(g_prepared_transparency_uav);
-    safe_release(g_prepared_exposure_uav);
-    safe_release(g_linear_output_srv);
-    safe_release(g_prepared_color);
-    safe_release(g_prepared_motion);
-    safe_release(g_prepared_reactive);
-    safe_release(g_prepared_transparency);
-    safe_release(g_prepared_exposure);
-    safe_release(g_linear_output);
-    safe_release(g_input_prepare_shader);
-    safe_release(g_input_prepare_pq_shader);
-    safe_release(g_input_prepare_direct_color_shader);
-    safe_release(g_output_encode_shader);
-    safe_release(g_translation_device);
+    safe_release(g_session->prepared_color_uav);
+    safe_release(g_session->prepared_motion_uav);
+    safe_release(g_session->prepared_reactive_uav);
+    safe_release(g_session->prepared_transparency_uav);
+    safe_release(g_session->prepared_exposure_uav);
+    safe_release(g_session->linear_output_srv);
+    safe_release(g_session->prepared_color);
+    safe_release(g_session->prepared_motion);
+    safe_release(g_session->prepared_reactive);
+    safe_release(g_session->prepared_transparency);
+    safe_release(g_session->prepared_exposure);
+    safe_release(g_session->linear_output);
+    safe_release(g_session->input_prepare_shader);
+    safe_release(g_session->input_prepare_pq_shader);
+    safe_release(g_session->input_prepare_direct_color_shader);
+    safe_release(g_session->output_encode_shader);
+    safe_release(g_session->translation_device);
 
-    g_render_width = 0;
-    g_render_height = 0;
-    g_output_width = 0;
-    g_output_height = 0;
-    g_auto_exposure = true;
-    g_reset_next_dispatch = true;
-    g_last_dispatch_counter = {};
+    g_session->render_width = 0;
+    g_session->render_height = 0;
+    g_session->output_width = 0;
+    g_session->output_height = 0;
+    g_session->auto_exposure = true;
+    g_session->reset_next_dispatch = true;
+    g_session->last_dispatch_counter = {};
 }
 
 bool export_entry_is_detoured(const void *address)
@@ -196,7 +208,12 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
  #endif
     PreparedColor[dispatchThreadId.xy] = color;
  #endif
-    PreparedMotion[dispatchThreadId.xy] = sign(centeredMotion) * motionMagnitude * motionMagnitude;
+    // Genshin stores motion as signed-in-unorm square encoding, while FSR2 expects
+    // the opposite history-vector direction. Keep this identical to the active
+    // Ffx12Backend decoder: -sign(d) * 4*d^2. The previous translation shim
+    // omitted the minus sign, so its positive motion-scale mode inverted the
+    // reprojection direction and produced severe moving-surface jelly/ghosting.
+    PreparedMotion[dispatchThreadId.xy] = -sign(centeredMotion) * motionMagnitude * motionMagnitude;
     PreparedReactive[dispatchThreadId.xy] = encodedMotion.z;
     PreparedTransparency[dispatchThreadId.xy] = InputFlags.Load(location) > 0.0 ? 1.0 : 0.0;
 }
@@ -261,7 +278,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             return false;
         }
 
-        const HRESULT create_result = g_translation_device->CreateComputeShader(
+        const HRESULT create_result = g_session->translation_device->CreateComputeShader(
             bytecode->GetBufferPointer(),
             bytecode->GetBufferSize(),
             nullptr,
@@ -289,7 +306,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             sizeof(source) - 1,
             "Dx11FsrBridgeFsr2PrepareInputs",
             nullptr,
-            &g_input_prepare_shader))
+            &g_session->input_prepare_shader))
     {
         return false;
     }
@@ -298,7 +315,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             sizeof(source) - 1,
             "Dx11FsrBridgeFsr2PrepareDirectColorInputs",
             direct_color_macros,
-            &g_input_prepare_direct_color_shader))
+            &g_session->input_prepare_direct_color_shader))
     {
         return false;
     }
@@ -307,7 +324,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             sizeof(source) - 1,
             "Dx11FsrBridgeFsr2PreparePqInputs",
             hdr10_macros,
-            &g_input_prepare_pq_shader))
+            &g_session->input_prepare_pq_shader))
     {
         return false;
     }
@@ -316,7 +333,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             sizeof(output_source) - 1,
             "Dx11FsrBridgeFsr2EncodeOutput",
             nullptr,
-            &g_output_encode_shader))
+            &g_session->output_encode_shader))
     {
         return false;
     }
@@ -340,58 +357,58 @@ bool create_prepared_resources_locked(std::string &error)
         description.SampleDesc.Count = 1;
         description.Usage = D3D11_USAGE_DEFAULT;
         description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        HRESULT result = g_translation_device->CreateTexture2D(&description, nullptr, texture);
+        HRESULT result = g_session->translation_device->CreateTexture2D(&description, nullptr, texture);
         if (SUCCEEDED(result))
-            result = g_translation_device->CreateUnorderedAccessView(*texture, nullptr, uav);
+            result = g_session->translation_device->CreateUnorderedAccessView(*texture, nullptr, uav);
         return result;
     };
 
     HRESULT result = create_texture(
-        g_render_width,
-        g_render_height,
+        g_session->render_width,
+        g_session->render_height,
         DXGI_FORMAT_R16G16B16A16_FLOAT,
-        &g_prepared_color,
-        &g_prepared_color_uav);
+        &g_session->prepared_color,
+        &g_session->prepared_color_uav);
     if (SUCCEEDED(result))
         result = create_texture(
-            g_render_width,
-            g_render_height,
+            g_session->render_width,
+            g_session->render_height,
             DXGI_FORMAT_R16G16_FLOAT,
-            &g_prepared_motion,
-            &g_prepared_motion_uav);
+            &g_session->prepared_motion,
+            &g_session->prepared_motion_uav);
     if (SUCCEEDED(result))
         result = create_texture(
-            g_render_width,
-            g_render_height,
+            g_session->render_width,
+            g_session->render_height,
             DXGI_FORMAT_R8_UNORM,
-            &g_prepared_reactive,
-            &g_prepared_reactive_uav);
+            &g_session->prepared_reactive,
+            &g_session->prepared_reactive_uav);
     if (SUCCEEDED(result))
         result = create_texture(
             1,
             1,
             DXGI_FORMAT_R32_FLOAT,
-            &g_prepared_exposure,
-            &g_prepared_exposure_uav);
+            &g_session->prepared_exposure,
+            &g_session->prepared_exposure_uav);
     if (SUCCEEDED(result))
         result = create_texture(
-            g_render_width,
-            g_render_height,
+            g_session->render_width,
+            g_session->render_height,
             DXGI_FORMAT_R8_UNORM,
-            &g_prepared_transparency,
-            &g_prepared_transparency_uav);
+            &g_session->prepared_transparency,
+            &g_session->prepared_transparency_uav);
     if (SUCCEEDED(result))
     {
         ID3D11UnorderedAccessView *linear_output_uav = nullptr;
         result = create_texture(
-            g_output_width,
-            g_output_height,
+            g_session->output_width,
+            g_session->output_height,
             DXGI_FORMAT_R16G16B16A16_FLOAT,
-            &g_linear_output,
+            &g_session->linear_output,
             &linear_output_uav);
         safe_release(linear_output_uav);
         if (SUCCEEDED(result))
-            result = g_translation_device->CreateShaderResourceView(g_linear_output, nullptr, &g_linear_output_srv);
+            result = g_session->translation_device->CreateShaderResourceView(g_session->linear_output, nullptr, &g_session->linear_output_srv);
     }
     if (FAILED(result))
     {
@@ -415,10 +432,14 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
     }
 
     const bool matches =
-        g_translation_context_created && g_translation_device == device &&
-        g_render_width == frame.render_width && g_render_height == frame.render_height &&
-        g_output_width == frame.output_width && g_output_height == frame.output_height &&
-        g_auto_exposure == (frame.exposure == nullptr);
+        g_session->translation_context_created && g_session->translation_device == device &&
+        g_session->render_width == frame.render_width && g_session->render_height == frame.render_height &&
+        g_session->output_width == frame.output_width && g_session->output_height == frame.output_height &&
+        g_session->auto_exposure == (frame.exposure == nullptr) &&
+        g_session->depth_inverted == frame.depth_inverted &&
+        g_session->motion_vectors_jittered == frame.motion_vectors_jittered &&
+        g_session->hdr10_pq_color == frame.hdr10_pq_color &&
+        g_session->use_direct_linear_color == frame.use_direct_linear_color;
     if (matches)
     {
         device->Release();
@@ -426,12 +447,16 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
     }
 
     release_translation_locked();
-    g_translation_device = device;
-    g_render_width = frame.render_width;
-    g_render_height = frame.render_height;
-    g_output_width = frame.output_width;
-    g_output_height = frame.output_height;
-    g_auto_exposure = frame.exposure == nullptr;
+    g_session->translation_device = device;
+    g_session->render_width = frame.render_width;
+    g_session->render_height = frame.render_height;
+    g_session->output_width = frame.output_width;
+    g_session->output_height = frame.output_height;
+    g_session->auto_exposure = frame.exposure == nullptr;
+    g_session->depth_inverted = frame.depth_inverted;
+    g_session->motion_vectors_jittered = frame.motion_vectors_jittered;
+    g_session->hdr10_pq_color = frame.hdr10_pq_color;
+    g_session->use_direct_linear_color = frame.use_direct_linear_color;
 
     if (!create_input_prepare_shader_locked(error) || !create_prepared_resources_locked(error))
     {
@@ -445,16 +470,16 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
     // → DLSS 把 sRGB SDR 当线性 HDR 处理 → 色彩管线错配、画面发灰/对比度丢失 → "像 FSR 画质"。
     // DepthInverted 保留：Unity reverse-Z（near=1 far=0），FSR2 该 flag 语义正确。
     description.flags =
-        FFX_FSR2_ENABLE_DEPTH_INVERTED;
-    if (g_auto_exposure)
+        (frame.depth_inverted ? FFX_FSR2_ENABLE_DEPTH_INVERTED : 0u);
+    if (g_session->auto_exposure)
         description.flags |= FFX_FSR2_ENABLE_AUTO_EXPOSURE;
     if (frame.motion_vectors_jittered)
         description.flags |= FFX_FSR2_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
     description.maxRenderSize = { frame.render_width, frame.render_height };
     description.displaySize = { frame.output_width, frame.output_height };
-    description.device = g_translation_device;
+    description.device = g_session->translation_device;
 
-    const FfxErrorCode create_result = g_translation_context_create(&g_translation_context, &description);
+    const FfxErrorCode create_result = g_translation_context_create(&g_session->translation_context, &description);
     if (create_result != FFX_OK)
     {
         error = "ffxFsr2ContextCreate failed=" + std::to_string(static_cast<std::uint32_t>(create_result));
@@ -462,8 +487,8 @@ bool ensure_translation_locked(const Fsr2TranslationFrame &frame, bool &created,
         return false;
     }
 
-    g_translation_context_created = true;
-    g_reset_next_dispatch = true;
+    g_session->translation_context_created = true;
+    g_session->reset_next_dispatch = true;
     created = true;
     return true;
 }
@@ -490,23 +515,23 @@ bool prepare_inputs_locked(const Fsr2TranslationFrame &frame, std::string &error
         frame.exposure,
     };
     ID3D11UnorderedAccessView *output_uavs[] {
-        g_prepared_color_uav,
+        g_session->prepared_color_uav,
         nullptr,
-        g_prepared_motion_uav,
-        g_prepared_reactive_uav,
-        g_prepared_exposure_uav,
-        g_prepared_transparency_uav,
+        g_session->prepared_motion_uav,
+        g_session->prepared_reactive_uav,
+        g_session->prepared_exposure_uav,
+        g_session->prepared_transparency_uav,
     };
     UINT initial_counts[] { UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX };
-    ID3D11ComputeShader *prepare_shader = g_input_prepare_shader;
+    ID3D11ComputeShader *prepare_shader = g_session->input_prepare_shader;
     if (frame.hdr10_pq_color)
-        prepare_shader = g_input_prepare_pq_shader;
+        prepare_shader = g_session->input_prepare_pq_shader;
     else if (frame.use_direct_linear_color)
-        prepare_shader = g_input_prepare_direct_color_shader;
+        prepare_shader = g_session->input_prepare_direct_color_shader;
     frame.context->CSSetShader(prepare_shader, nullptr, 0);
     frame.context->CSSetShaderResources(0, 5, input_srvs);
     frame.context->CSSetUnorderedAccessViews(0, 6, output_uavs, initial_counts);
-    frame.context->Dispatch((g_render_width + 7) / 8, (g_render_height + 7) / 8, 1);
+    frame.context->Dispatch((g_session->render_width + 7) / 8, (g_session->render_height + 7) / 8, 1);
 
     ID3D11ShaderResourceView *null_srvs[] { nullptr, nullptr, nullptr, nullptr, nullptr };
     ID3D11UnorderedAccessView *null_uavs[] { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
@@ -537,7 +562,7 @@ bool prepare_inputs_locked(const Fsr2TranslationFrame &frame, std::string &error
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    const HRESULT device_status = g_translation_device->GetDeviceRemovedReason();
+    const HRESULT device_status = g_session->translation_device->GetDeviceRemovedReason();
     if (FAILED(device_status))
     {
         error = "input prepare device error=" + std::to_string(static_cast<long>(device_status));
@@ -551,7 +576,7 @@ bool encode_hdr10_output_locked(const Fsr2TranslationFrame &frame, std::string &
 {
     if (!frame.hdr10_pq_color)
         return true;
-    if (g_output_encode_shader == nullptr || g_linear_output_srv == nullptr || frame.output == nullptr)
+    if (g_session->output_encode_shader == nullptr || g_session->linear_output_srv == nullptr || frame.output == nullptr)
     {
         error = "HDR10 output encoder is unavailable";
         return false;
@@ -585,7 +610,7 @@ bool encode_hdr10_output_locked(const Fsr2TranslationFrame &frame, std::string &
     }
 
     ID3D11UnorderedAccessView *output_uav = nullptr;
-    const HRESULT uav_result = g_translation_device->CreateUnorderedAccessView(
+    const HRESULT uav_result = g_session->translation_device->CreateUnorderedAccessView(
         output_texture, &output_uav_description, &output_uav);
     output_texture->Release();
     if (FAILED(uav_result) || output_uav == nullptr)
@@ -607,10 +632,10 @@ bool encode_hdr10_output_locked(const Fsr2TranslationFrame &frame, std::string &
     frame.context->CSGetUnorderedAccessViews(0, 1, &previous_uav);
 
     UINT initial_count = UINT_MAX;
-    frame.context->CSSetShader(g_output_encode_shader, nullptr, 0);
-    frame.context->CSSetShaderResources(0, 1, &g_linear_output_srv);
+    frame.context->CSSetShader(g_session->output_encode_shader, nullptr, 0);
+    frame.context->CSSetShaderResources(0, 1, &g_session->linear_output_srv);
     frame.context->CSSetUnorderedAccessViews(0, 1, &output_uav, &initial_count);
-    frame.context->Dispatch((g_output_width + 7) / 8, (g_output_height + 7) / 8, 1);
+    frame.context->Dispatch((g_session->output_width + 7) / 8, (g_session->output_height + 7) / 8, 1);
 
     ID3D11ShaderResourceView *null_srv = nullptr;
     ID3D11UnorderedAccessView *null_uav = nullptr;
@@ -634,7 +659,7 @@ bool encode_hdr10_output_locked(const Fsr2TranslationFrame &frame, std::string &
     }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    const HRESULT device_status = g_translation_device->GetDeviceRemovedReason();
+    const HRESULT device_status = g_session->translation_device->GetDeviceRemovedReason();
     if (FAILED(device_status))
     {
         error = "HDR10 output encode device error=" + std::to_string(static_cast<long>(device_status));
@@ -677,14 +702,14 @@ float frame_time_delta_ms()
     LARGE_INTEGER now {};
     QueryPerformanceCounter(&now);
     float delta = 16.6667f;
-    if (g_last_dispatch_counter.QuadPart != 0 && frequency.QuadPart != 0)
+    if (g_session->last_dispatch_counter.QuadPart != 0 && frequency.QuadPart != 0)
     {
         delta = static_cast<float>(
-            static_cast<double>(now.QuadPart - g_last_dispatch_counter.QuadPart) * 1000.0 /
+            static_cast<double>(now.QuadPart - g_session->last_dispatch_counter.QuadPart) * 1000.0 /
             static_cast<double>(frequency.QuadPart));
         delta = std::clamp(delta, 1.0f, 100.0f);
     }
-    g_last_dispatch_counter = now;
+    g_session->last_dispatch_counter = now;
     return delta;
 }
 
@@ -797,6 +822,20 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     }
 
     std::lock_guard lock(g_translation_mutex);
+    auto session = g_sessions.find(frame.instance_key);
+    if (session == g_sessions.end())
+    {
+        // Do not recycle an in-use NGX context to service a different renderer.
+        // Bound memory; the caller's existing FFX path remains available on refusal.
+        if (g_sessions.size() >= kMaxTranslationSessions)
+        {
+            outcome.error = "FSR2 per-instance context limit reached";
+            outcome.error_code = static_cast<std::uint32_t>(FFX_ERROR_BACKEND_API_ERROR);
+            return outcome;
+        }
+        session = g_sessions.emplace(frame.instance_key, std::make_unique<TranslationSession>()).first;
+    }
+    g_session = session->second.get();
     if (!ensure_translation_locked(frame, outcome.context_created, outcome.error))
     {
         outcome.error_code = static_cast<std::uint32_t>(FFX_ERROR_BACKEND_API_ERROR);
@@ -830,7 +869,7 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
         return outcome;
     }
     description.color = make_resource(
-        frame.use_direct_linear_color ? direct_color_resource : g_prepared_color,
+        frame.use_direct_linear_color ? direct_color_resource : g_session->prepared_color,
         frame.use_direct_linear_color
             ? FFX_SURFACE_FORMAT_R11G11B10_FLOAT
             : FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT,
@@ -855,7 +894,7 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
         FFX_RESOURCE_STATE_COMPUTE_READ,
         true);
     description.motionVectors = make_resource(
-        g_prepared_motion,
+        g_session->prepared_motion,
         FFX_SURFACE_FORMAT_R16G16_FLOAT,
         frame.render_width,
         frame.render_height,
@@ -864,7 +903,7 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     if (frame.exposure != nullptr)
     {
         description.exposure = make_resource(
-            g_prepared_exposure,
+            g_session->prepared_exposure,
             FFX_SURFACE_FORMAT_R32_FLOAT,
             1,
             1,
@@ -874,7 +913,7 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     if (frame.use_reactive_mask)
     {
         description.reactive = make_resource(
-            g_prepared_reactive,
+            g_session->prepared_reactive,
             FFX_SURFACE_FORMAT_R8_UNORM,
             frame.render_width,
             frame.render_height,
@@ -884,14 +923,14 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     if (frame.use_transparency_mask)
     {
         description.transparencyAndComposition = make_resource(
-            g_prepared_transparency,
+            g_session->prepared_transparency,
             FFX_SURFACE_FORMAT_R8_UNORM,
             frame.render_width,
             frame.render_height,
             FFX_RESOURCE_STATE_COMPUTE_READ,
             false);
     }
-    ID3D11Resource *translation_output = frame.hdr10_pq_color ? g_linear_output : frame.output;
+    ID3D11Resource *translation_output = frame.hdr10_pq_color ? g_session->linear_output : frame.output;
     const FfxSurfaceFormat translation_output_format =
         frame.hdr10_pq_color ? FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT : FFX_SURFACE_FORMAT_UNKNOWN;
     description.output = make_resource(
@@ -912,13 +951,13 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     description.sharpness = std::clamp(frame.sharpness, 0.0f, 1.0f);
     description.frameTimeDelta = frame_time_delta_ms();
     description.preExposure = 1.0f;
-    description.reset = g_reset_next_dispatch || frame.reset;
+    description.reset = g_session->reset_next_dispatch || frame.reset;
     description.cameraNear = 0.25f;
     description.cameraFar = 6000.0f;
     description.cameraFovAngleVertical = 0.7853981634f;
     description.viewSpaceToMetersFactor = 1.0f;
 
-    const FfxErrorCode dispatch_result = g_translation_context_dispatch(&g_translation_context, &description);
+    const FfxErrorCode dispatch_result = g_translation_context_dispatch(&g_session->translation_context, &description);
     safe_release(direct_color_resource);
     safe_release(direct_depth_resource);
     outcome.error_code = static_cast<std::uint32_t>(dispatch_result);
@@ -933,7 +972,7 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
         return outcome;
     }
 
-    g_reset_next_dispatch = false;
+    g_session->reset_next_dispatch = false;
     outcome.succeeded = true;
     return outcome;
 }
@@ -941,7 +980,13 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
 void reset_fsr2_translation_context()
 {
     std::lock_guard lock(g_translation_mutex);
-    release_translation_locked();
+    for (auto& entry : g_sessions)
+    {
+        g_session = entry.second.get();
+        release_translation_locked();
+    }
+    g_sessions.clear();
+    g_session = nullptr;
 }
 
 FfxErrorCode ffxFsr2ContextCreate(

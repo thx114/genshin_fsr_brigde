@@ -1,4 +1,4 @@
-#include <Windows.h>
+﻿#include <Windows.h>
 #include <TlHelp32.h>
 #include <d3d11.h>
 #include <d3d11_3.h>
@@ -285,7 +285,9 @@ struct Config
     // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5(默认), 4=-norm*width, 5=零
     std::uint32_t ffx12_jitter_mode = 3;
     bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
+    bool ffx12_depth_flip_y = false; // 游戏深度的屏幕空间上下翻转；与 DepthInverted 独立
     bool ffx12_decode_motion = true;  // 游戏 motion 为 R10G10B10A2 平方编码 → 解码 R16G16_FLOAT
+    bool ffx12_motion_flip_y = false; // 只翻转 motion 纹理行坐标，不改变运动向量数值
     bool ffx12_hdr_input = true;      // 游戏 10-bit HDR 管线
     bool ffx12_auto_exposure = true;  // 2026-08-25 用户确认：原神需要自动曝光
     bool ffx12_non_linear = true;     // 非线性色彩空间（OptiScaler 实证）
@@ -3961,8 +3963,12 @@ void load_config()
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterMode", 3, config_path.c_str()));
     g_config.ffx12_depth_inverted =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DepthInverted", 1, config_path.c_str()) != 0;
+    g_config.ffx12_depth_flip_y =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DepthFlipY", 0, config_path.c_str()) != 0;
     g_config.ffx12_decode_motion =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDecode", 1, config_path.c_str()) != 0;
+    g_config.ffx12_motion_flip_y =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionFlipY", 0, config_path.c_str()) != 0;
     g_config.ffx12_jitter_delay =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterDelay", 0, config_path.c_str()) != 0;
     g_config.ffx12_force_reset =
@@ -4024,7 +4030,9 @@ void load_config()
     ffx12::set_motion_deadzone(
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDeadzone", 0, config_path.c_str()) != 0);
     ffx12::set_depth_inverted(g_config.ffx12_depth_inverted);
+    ffx12::set_depth_flip_y(g_config.ffx12_depth_flip_y);
     ffx12::set_decode_motion(g_config.ffx12_decode_motion);
+    ffx12::set_motion_flip_y(g_config.ffx12_motion_flip_y);
     ffx12::set_motion_vectors_jittered(g_config.fsr2_motion_vectors_jittered);
     g_config.ffx12_gpu_interop =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12GpuInterop", 1, config_path.c_str()) != 0;
@@ -11426,6 +11434,7 @@ bool try_fsr2_translation_draw(
                         }
 
                         Fsr2TranslationFrame frame;
+                        frame.instance_key = call_params.instance;
                         frame.context = context;
                         frame.color = make_srv(color_tex, "color");
                         frame.depth = make_srv(depth_tex, "depth");
@@ -11440,6 +11449,7 @@ bool try_fsr2_translation_draw(
                         frame.jitter_x = sdk_in.jitter_x;
                         frame.jitter_y = sdk_in.jitter_y;
                         frame.motion_vectors_jittered = g_config.fsr2_motion_vectors_jittered;
+                        frame.depth_inverted = g_config.ffx12_depth_inverted;
                         frame.positive_motion_vector_scale = g_config.fsr2_positive_motion_vector_scale;
                         frame.use_reactive_mask = sdk_in.use_reactive_mask;
                         frame.use_transparency_mask = sdk_in.use_transparency_mask;
@@ -11476,6 +11486,11 @@ bool try_fsr2_translation_draw(
                             }
                             const std::uint64_t dcount =
                                 sdk234_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (outcome.context_created)
+                                LOG_INFO(blog::cat::upscale, "fsr2_shim_instance_context_created inst=" +
+                                    hex64(frame.instance_key) + " render=" + std::to_string(frame.render_width) +
+                                    "x" + std::to_string(frame.render_height) + " output=" +
+                                    std::to_string(frame.output_width) + "x" + std::to_string(frame.output_height));
                             if (dcount <= 8 || dcount % 1024 == 0)
                             {
                                 LOG_INFO(blog::cat::upscale, "fsr2_shim_result rc=DISPATCH_OK gen=" +
@@ -11690,6 +11705,7 @@ bool try_fsr2_translation_draw(
                             " reset=" + std::to_string(dbg_reset ? 1 : 0) +
                             " recreates=" + std::to_string(dbg_recreates) +
                             " depth_inv=" + std::to_string(g_config.ffx12_depth_inverted ? 1 : 0) +
+                            " depth_flip_y=" + std::to_string(g_config.ffx12_depth_flip_y ? 1 : 0) +
                             // mv_decode 区分"配置值"与"是否真正接线"：该开关此前是**空开关**
                             // （g_decode_motion 除赋值外无读取点，平方解码无条件执行），
                             // 日志只打 0/1，看起来像在生效。

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <d3d11.h>
 
@@ -10,6 +10,8 @@ std::uint32_t fsr2_get_proc_address_shim_query_mask();
 
 struct Fsr2TranslationFrame
 {
+    // Zero preserves legacy callers; game renders supply their actual FSR instance.
+    std::uint64_t instance_key = 0;
     ID3D11DeviceContext *context = nullptr;
     ID3D11ShaderResourceView *color = nullptr;
     ID3D11ShaderResourceView *depth = nullptr;
@@ -25,6 +27,7 @@ struct Fsr2TranslationFrame
     float jitter_x = 0.0f;
     float jitter_y = 0.0f;
     bool motion_vectors_jittered = false;
+    bool depth_inverted = true;
     bool positive_motion_vector_scale = false;
     bool use_reactive_mask = false;
     bool use_transparency_mask = false;

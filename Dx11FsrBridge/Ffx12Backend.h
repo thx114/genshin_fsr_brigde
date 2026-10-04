@@ -56,7 +56,9 @@ void set_sdk_dll_path(const wchar_t *path);
 void set_depth_inverted(bool inverted);
 void set_decode_motion(bool decode);
 void set_motion_flip(float flip); // ：XeSS/DLSS 定向——motion 方向翻转（±1）
+void set_motion_flip_y(bool flip); // 只翻转 motion 纹理的 Y 行坐标，不修改向量 Y 分量
 void set_depth_scale(float scale); // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+void set_depth_flip_y(bool flip); // 只翻转深度纹理的 Y 坐标，不改变逆深度语义
 // 运动矢量是否已经包含投影 jitter。仅在已包含时启用 SDK 的 jitter cancellation。
 void set_motion_vectors_jittered(bool jittered);
 // 输入颜色为 HDR（10-bit 线性 HDR 管线）时置 true（FSR2 需按 HDR 处理颜色/曝光）。

@@ -278,7 +278,9 @@ bool g_depth_inverted = true;   // 游戏深度逆方向（0=far）—— 2026-0
 bool g_decode_motion = true;    // 游戏 motion 为 R10G10B10A2 平方编码
 std::uint32_t g_create_flags = 0; // 实际创建 flags（日志按真值输出，勿硬编码）
 float g_motion_flip = 1.0f;     // ：XeSS/DLSS 定向——motion 方向翻转（默认 +1 = FSR 方向）
+bool g_motion_flip_y = false;      // 只翻转 motion 纹理的 Y 行坐标，不修改向量 Y 分量
 float g_depth_scale = 1.0f;     // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
+bool g_depth_flip_y = false;       // 只翻转送入 Opti/FSR 的深度空间，不改变 depth 数值方向
 ComPtr<ID3D11Buffer> g_motion_cb;   // MotionParams 常数缓冲（b0: g_flip / g_depth_scale）
 // b0 的**已上传值**缓存。b0 被两条独立路径写入（depth 提取写 g_depth_scale、
 // motion 解码写 g_motion_flip），因此必须**各自一份缓存**：共用一个变量时，
@@ -378,14 +380,18 @@ static const char *g_depth_extract_hlsl = R"(
 cbuffer DepthParams : register(b0)
 {
     float g_depth_scale;
-    float3 g_pad;
+    float g_flip_y;
+    float2 g_pad;
 };
 Texture2D<float4> in_depth : register(t0);
 RWTexture2D<float> out_depth : register(u0);
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    out_depth[id.xy] = in_depth.Load(int3(id.xy, 0)).x * g_depth_scale;
+    uint width, height;
+    in_depth.GetDimensions(width, height);
+    uint sy = (g_flip_y > 0.5) ? (height - 1 - id.y) : id.y;
+    out_depth[id.xy] = in_depth.Load(int3(id.x, sy, 0)).x * g_depth_scale;
 }
 )";
 
@@ -398,7 +404,8 @@ static const char *g_motion_decode_d11_hlsl = R"(
 cbuffer MotionParams : register(b0)
 {
     float g_flip; // ：XeSS/DLSS 定向——motion 方向翻转（XeSS-SR 约定 prev→curr，与 FSR 相反）
-    float3 g_pad;
+    float g_flip_y; // 纹理空间 Y 行翻转；不改变 motion 数值
+    float2 g_pad;
 };
 Texture2D<float4> in_mv : register(t0);
 RWTexture2D<float2> out_mv : register(u0);
@@ -406,7 +413,10 @@ RWTexture2D<float> out_reactive : register(u1);
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    float4 c = in_mv.Load(int3(id.xy, 0));
+    uint width, height;
+    in_mv.GetDimensions(width, height);
+    uint sy = (g_flip_y > 0.5) ? (height - 1 - id.y) : id.y;
+    float4 c = in_mv.Load(int3(id.x, sy, 0));
     #if defined(FFX12_MOTION_RAW)
     // 不解码变体：把通道按 R16G16 归一化运动矢量直接读出（只做方向翻转）。
     // 用途：验证/绕开"游戏 motion 是 R10G10B10A2 signed-in-unorm 平方编码"这一前提。
@@ -1838,7 +1848,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
                 // 复用 16B 常数缓冲（b0）：depth 提取用 g_depth_scale（XeSS 激活时归一化 [0,1]）
                 if (g_motion_cb_uploaded_depth != g_depth_scale)
                 {
-                    const float dscale[4] = {g_depth_scale, 0.0f, 0.0f, 0.0f};
+                    const float dscale[4] = {g_depth_scale, g_depth_flip_y ? 1.0f : 0.0f, 0.0f, 0.0f};
                     game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, dscale, 0, 0);
                     g_motion_cb_uploaded_depth = g_depth_scale;
                 }
@@ -1879,7 +1889,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
             {
                 if (g_motion_cb_uploaded_flip != g_motion_flip)
                 {
-                    const float flip[4] = {g_motion_flip, 0.0f, 0.0f, 0.0f};
+                    const float flip[4] = {g_motion_flip, g_motion_flip_y ? 1.0f : 0.0f, 0.0f, 0.0f};
                     game_context->UpdateSubresource(g_motion_cb.Get(), 0, nullptr, flip, 0, 0);
                     g_motion_cb_uploaded_flip = g_motion_flip;
                 }
@@ -2972,9 +2982,19 @@ void set_motion_flip(float flip) // ：XeSS/DLSS 定向——motion 方向翻转
     g_motion_flip = flip;
 }
 
+void set_motion_flip_y(bool flip)
+{
+    g_motion_flip_y = flip;
+}
+
 void set_depth_scale(float scale) // ：XeSS/DLSS 定向——depth 值域归一化（XeSS 期望 [0,1]）
 {
     g_depth_scale = scale;
+}
+
+void set_depth_flip_y(bool flip)
+{
+    g_depth_flip_y = flip;
 }
 
 void set_motion_vectors_jittered(bool jittered)
