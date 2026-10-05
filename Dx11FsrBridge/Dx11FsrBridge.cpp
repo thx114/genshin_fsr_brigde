@@ -5356,6 +5356,104 @@ bool is_d3d11_module(HMODULE module)
     return _wcsicmp(file_name.c_str(), L"d3d11.dll") == 0;
 }
 
+thread_local std::uint32_t g_in_d3d11_create_device = 0;
+
+struct ScopedD3D11CreateDeviceGuard
+{
+    bool is_nested = false;
+    ScopedD3D11CreateDeviceGuard() noexcept
+        : is_nested(g_in_d3d11_create_device++ > 0)
+    {
+    }
+    ~ScopedD3D11CreateDeviceGuard() noexcept
+    {
+        --g_in_d3d11_create_device;
+    }
+};
+
+bool should_skip_d3d11_create_hook_module(HMODULE module)
+{
+    if (module == nullptr)
+        return true;
+
+    HMODULE self_module = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&should_skip_d3d11_create_hook_module),
+            &self_module) &&
+        module == self_module)
+    {
+        return true;
+    }
+
+    wchar_t path[MAX_PATH] {};
+    const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+    if (length == 0)
+        return true;
+
+    const std::filesystem::path fs_path(std::wstring(path, path + length));
+    const std::wstring file_name = fs_path.filename().wstring();
+    const std::wstring ext = fs_path.extension().wstring();
+    if (_wcsicmp(ext.c_str(), L".addon64") == 0 || _wcsicmp(ext.c_str(), L".addon") == 0)
+        return true;
+
+    static constexpr const wchar_t *k_skip_modules[] = {
+        L"NvCamera64.dll",
+        L"NvCamera32.dll",
+        L"nvspcap64.dll",
+        L"nvppex.dll",
+        L"nvwgf2umx.dll",
+        L"nvldumdx.dll",
+        L"nvapi64.dll",
+        L"nvapi64_impl.dll",
+        L"_nvngx.dll",
+        L"nvngx.dll",
+        L"nvngx_dlss.dll",
+        L"nvngx_dlssd.dll",
+        L"nvngx_dlssg.dll",
+        L"nvngx_dlssnr.dll",
+        L"ReShade64.dll",
+        L"ReShade32.dll",
+        L"OptiScaler.dll",
+        L"Dx11FsrBridge.dll",
+        L"d3d11.dll",
+        L"dxgi.dll",
+        L"d3d12.dll",
+        L"D3D12Core.dll",
+        L"d2d1.dll",
+        L"GameOverlayRenderer64.dll",
+        L"DiscordHook64.dll",
+        L"EOSOVH-Win64-Shipping.dll",
+        L"RTSSHooks64.dll",
+    };
+
+    for (const wchar_t *skip_name : k_skip_modules)
+    {
+        if (_wcsicmp(file_name.c_str(), skip_name) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+bool should_skip_d3d11_create_hook_caller(const void *caller_address)
+{
+    if (caller_address == nullptr)
+        return false;
+
+    HMODULE caller_module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(caller_address),
+            &caller_module) ||
+        caller_module == nullptr)
+    {
+        return false;
+    }
+
+    return should_skip_d3d11_create_hook_module(caller_module);
+}
+
 bool is_user32_module(HMODULE module)
 {
     if (module == nullptr)
@@ -5519,6 +5617,9 @@ void install_create_hooks_for_loaded_modules()
 
     for (HMODULE module : enumerate_process_modules())
     {
+        if (should_skip_d3d11_create_hook_module(module))
+            continue;
+
         if (hook_iat(module, "d3d11.dll", "D3D11CreateDeviceAndSwapChain",
                 reinterpret_cast<void *>(&hooked_create_device_and_swapchain),
                 reinterpret_cast<void **>(&g_original_create_device_and_swapchain)))
@@ -12679,53 +12780,35 @@ void install_context_hooks(ID3D11DeviceContext *context)
         return;
 
     void **vtable = *reinterpret_cast<void ***>(context);
-    if (g_original_vs_set_constant_buffers == nullptr)
-        g_original_vs_set_constant_buffers = reinterpret_cast<vs_set_constant_buffers_fn>(vtable[k_idx_vs_set_constant_buffers]);
-    if (g_original_vs_set_shader == nullptr)
-        g_original_vs_set_shader = reinterpret_cast<vs_set_shader_fn>(vtable[k_idx_vs_set_shader]);
-    if (g_original_ps_set_shader_resources == nullptr)
-        g_original_ps_set_shader_resources = reinterpret_cast<ps_set_shader_resources_fn>(vtable[k_idx_ps_set_shader_resources]);
-    if (g_original_ps_set_shader == nullptr)
-        g_original_ps_set_shader = reinterpret_cast<ps_set_shader_fn>(vtable[k_idx_ps_set_shader]);
-    if (g_original_ps_set_constant_buffers == nullptr)
-        g_original_ps_set_constant_buffers = reinterpret_cast<ps_set_constant_buffers_fn>(vtable[k_idx_ps_set_constant_buffers]);
-    if (g_original_cs_set_shader_resources == nullptr)
-        g_original_cs_set_shader_resources = reinterpret_cast<cs_set_shader_resources_fn>(vtable[k_idx_cs_set_shader_resources]);
-    if (g_original_cs_set_uavs == nullptr)
-        g_original_cs_set_uavs = reinterpret_cast<cs_set_uavs_fn>(vtable[k_idx_cs_set_uavs]);
-    if (g_original_cs_set_shader == nullptr)
-        g_original_cs_set_shader = reinterpret_cast<cs_set_shader_fn>(vtable[k_idx_cs_set_shader]);
-    if (g_original_om_set_render_targets == nullptr)
-        g_original_om_set_render_targets = reinterpret_cast<om_set_render_targets_fn>(vtable[k_idx_om_set_render_targets]);
-    if (g_original_om_set_render_targets_and_uavs == nullptr)
     {
-        g_original_om_set_render_targets_and_uavs =
-            reinterpret_cast<om_set_render_targets_and_uavs_fn>(vtable[k_idx_om_set_render_targets_and_uavs]);
+        std::lock_guard lock(g_vtable_mutex);
+        const auto orig_it = g_original_vtables.find(context);
+        if (orig_it != g_original_vtables.end())
+            vtable = orig_it->second;
     }
-    if (g_original_dispatch == nullptr)
-        g_original_dispatch = reinterpret_cast<dispatch_fn>(vtable[k_idx_dispatch]);
-    if (g_original_draw_indexed == nullptr)
-        g_original_draw_indexed = reinterpret_cast<draw_indexed_fn>(vtable[k_idx_draw_indexed]);
-    if (g_original_draw == nullptr)
-        g_original_draw = reinterpret_cast<draw_fn>(vtable[k_idx_draw]);
-    if (g_original_map == nullptr)
-        g_original_map = reinterpret_cast<map_fn>(vtable[k_idx_map]);
-    if (g_original_unmap == nullptr)
-        g_original_unmap = reinterpret_cast<unmap_fn>(vtable[k_idx_unmap]);
-    if (g_original_rs_set_viewports == nullptr)
-        g_original_rs_set_viewports = reinterpret_cast<rs_set_viewports_fn>(vtable[k_idx_rs_set_viewports]);
-    if (g_original_copy_subresource_region == nullptr)
-        g_original_copy_subresource_region = reinterpret_cast<copy_subresource_region_fn>(vtable[k_idx_copy_subresource_region]);
-    if (g_original_copy_resource == nullptr)
-        g_original_copy_resource = reinterpret_cast<copy_resource_fn>(vtable[k_idx_copy_resource]);
-    if (g_original_update_subresource == nullptr)
-        g_original_update_subresource = reinterpret_cast<update_subresource_fn>(vtable[k_idx_update_subresource]);
-    if (g_original_cs_set_constant_buffers == nullptr)
-        g_original_cs_set_constant_buffers = reinterpret_cast<cs_set_constant_buffers_fn>(vtable[k_idx_cs_set_constant_buffers]);
-    if (g_original_clear_rtv == nullptr)
-        g_original_clear_rtv = reinterpret_cast<clear_rtv_fn>(vtable[k_idx_clear_rtv]);
-    if (g_original_clear_dsv == nullptr)
-        g_original_clear_dsv = reinterpret_cast<clear_dsv_fn>(vtable[k_idx_clear_dsv]);
+    g_original_vs_set_constant_buffers = reinterpret_cast<vs_set_constant_buffers_fn>(vtable[k_idx_vs_set_constant_buffers]);
+    g_original_vs_set_shader = reinterpret_cast<vs_set_shader_fn>(vtable[k_idx_vs_set_shader]);
+    g_original_ps_set_shader_resources = reinterpret_cast<ps_set_shader_resources_fn>(vtable[k_idx_ps_set_shader_resources]);
+    g_original_ps_set_shader = reinterpret_cast<ps_set_shader_fn>(vtable[k_idx_ps_set_shader]);
+    g_original_ps_set_constant_buffers = reinterpret_cast<ps_set_constant_buffers_fn>(vtable[k_idx_ps_set_constant_buffers]);
+    g_original_cs_set_shader_resources = reinterpret_cast<cs_set_shader_resources_fn>(vtable[k_idx_cs_set_shader_resources]);
+    g_original_cs_set_uavs = reinterpret_cast<cs_set_uavs_fn>(vtable[k_idx_cs_set_uavs]);
+    g_original_cs_set_shader = reinterpret_cast<cs_set_shader_fn>(vtable[k_idx_cs_set_shader]);
+    g_original_om_set_render_targets = reinterpret_cast<om_set_render_targets_fn>(vtable[k_idx_om_set_render_targets]);
+    g_original_om_set_render_targets_and_uavs =
+        reinterpret_cast<om_set_render_targets_and_uavs_fn>(vtable[k_idx_om_set_render_targets_and_uavs]);
+    g_original_dispatch = reinterpret_cast<dispatch_fn>(vtable[k_idx_dispatch]);
+    g_original_draw_indexed = reinterpret_cast<draw_indexed_fn>(vtable[k_idx_draw_indexed]);
+    g_original_draw = reinterpret_cast<draw_fn>(vtable[k_idx_draw]);
+    g_original_map = reinterpret_cast<map_fn>(vtable[k_idx_map]);
+    g_original_unmap = reinterpret_cast<unmap_fn>(vtable[k_idx_unmap]);
+    g_original_rs_set_viewports = reinterpret_cast<rs_set_viewports_fn>(vtable[k_idx_rs_set_viewports]);
+    g_original_copy_subresource_region = reinterpret_cast<copy_subresource_region_fn>(vtable[k_idx_copy_subresource_region]);
+    g_original_copy_resource = reinterpret_cast<copy_resource_fn>(vtable[k_idx_copy_resource]);
+    g_original_update_subresource = reinterpret_cast<update_subresource_fn>(vtable[k_idx_update_subresource]);
+    g_original_cs_set_constant_buffers = reinterpret_cast<cs_set_constant_buffers_fn>(vtable[k_idx_cs_set_constant_buffers]);
+    g_original_clear_rtv = reinterpret_cast<clear_rtv_fn>(vtable[k_idx_clear_rtv]);
+    g_original_clear_dsv = reinterpret_cast<clear_dsv_fn>(vtable[k_idx_clear_dsv]);
 
     std::vector<std::pair<std::size_t, void *>> patches {
         { k_idx_ps_set_shader_resources, reinterpret_cast<void *>(&hooked_ps_set_shader_resources) },
@@ -12962,16 +13045,17 @@ void install_device_hooks(ID3D11Device *device)
         return;
 
     void **vtable = *reinterpret_cast<void ***>(device);
-    if (g_original_create_buffer == nullptr)
-        g_original_create_buffer = reinterpret_cast<create_buffer_fn>(vtable[k_idx_device_create_buffer]);
-    if (g_original_create_texture_2d == nullptr)
-        g_original_create_texture_2d = reinterpret_cast<create_texture_2d_fn>(vtable[k_idx_device_create_texture_2d]);
-    if (g_original_create_vertex_shader == nullptr)
-        g_original_create_vertex_shader = reinterpret_cast<create_vertex_shader_fn>(vtable[k_idx_device_create_vertex_shader]);
-    if (g_original_create_pixel_shader == nullptr)
-        g_original_create_pixel_shader = reinterpret_cast<create_pixel_shader_fn>(vtable[k_idx_device_create_pixel_shader]);
-    if (g_original_create_compute_shader == nullptr)
-        g_original_create_compute_shader = reinterpret_cast<create_compute_shader_fn>(vtable[k_idx_device_create_compute_shader]);
+    {
+        std::lock_guard lock(g_vtable_mutex);
+        const auto orig_it = g_original_vtables.find(device);
+        if (orig_it != g_original_vtables.end())
+            vtable = orig_it->second;
+    }
+    g_original_create_buffer = reinterpret_cast<create_buffer_fn>(vtable[k_idx_device_create_buffer]);
+    g_original_create_texture_2d = reinterpret_cast<create_texture_2d_fn>(vtable[k_idx_device_create_texture_2d]);
+    g_original_create_vertex_shader = reinterpret_cast<create_vertex_shader_fn>(vtable[k_idx_device_create_vertex_shader]);
+    g_original_create_pixel_shader = reinterpret_cast<create_pixel_shader_fn>(vtable[k_idx_device_create_pixel_shader]);
+    g_original_create_compute_shader = reinterpret_cast<create_compute_shader_fn>(vtable[k_idx_device_create_compute_shader]);
 
     std::vector<std::pair<std::size_t, void *>> patches {
         { k_idx_device_create_buffer, reinterpret_cast<void *>(&hooked_create_buffer) },
@@ -13232,8 +13316,13 @@ void install_factory_hooks(IDXGIFactory *factory)
         return;
 
     void **vtable = *reinterpret_cast<void ***>(factory);
-    if (g_original_factory_create_swap_chain == nullptr)
-        g_original_factory_create_swap_chain = reinterpret_cast<factory_create_swap_chain_fn>(vtable[k_idx_factory_create_swap_chain]);
+    {
+        std::lock_guard lock(g_vtable_mutex);
+        const auto orig_it = g_original_vtables.find(factory);
+        if (orig_it != g_original_vtables.end())
+            vtable = orig_it->second;
+    }
+    g_original_factory_create_swap_chain = reinterpret_cast<factory_create_swap_chain_fn>(vtable[k_idx_factory_create_swap_chain]);
 
     clone_and_patch_vtable(factory, k_factory_vtable_size, {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
@@ -13248,8 +13337,14 @@ void install_factory2_hooks(IDXGIFactory2 *factory)
         return;
 
     void **vtable = *reinterpret_cast<void ***>(factory);
-    if (g_original_factory2_create_swap_chain_for_hwnd == nullptr)
-        g_original_factory2_create_swap_chain_for_hwnd = reinterpret_cast<factory2_create_swap_chain_for_hwnd_fn>(vtable[k_idx_factory2_create_swap_chain_for_hwnd]);
+    {
+        std::lock_guard lock(g_vtable_mutex);
+        const auto orig_it = g_original_vtables.find(factory);
+        if (orig_it != g_original_vtables.end())
+            vtable = orig_it->second;
+    }
+    g_original_factory_create_swap_chain = reinterpret_cast<factory_create_swap_chain_fn>(vtable[k_idx_factory_create_swap_chain]);
+    g_original_factory2_create_swap_chain_for_hwnd = reinterpret_cast<factory2_create_swap_chain_for_hwnd_fn>(vtable[k_idx_factory2_create_swap_chain_for_hwnd]);
 
     clone_and_patch_vtable(factory, k_factory2_vtable_size, {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
@@ -13320,6 +13415,15 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateDeviceAndSwapChain");
     }
 
+    ScopedD3D11CreateDeviceGuard create_guard;
+    void *const caller = _ReturnAddress();
+    const bool skip_bridge_hooks =
+        create_guard.is_nested ||
+        should_skip_d3d11_create_hook_caller(caller) ||
+        device == nullptr ||
+        driver_type == D3D_DRIVER_TYPE_WARP ||
+        driver_type == D3D_DRIVER_TYPE_REFERENCE;
+
     const HRESULT hr = g_original_create_device_and_swapchain(
         adapter,
         driver_type,
@@ -13334,7 +13438,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         feature_level,
         context);
 
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr) && !skip_bridge_hooks)
     {
         install_device_hooks(device != nullptr ? *device : nullptr);
         install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
@@ -13366,6 +13470,15 @@ HRESULT WINAPI hooked_create_device(
     ID3D11DeviceContext **context)
 {
     // 旧 On12 引导移除（旧方案隔离）。
+    ScopedD3D11CreateDeviceGuard create_guard;
+    void *const caller = _ReturnAddress();
+    const bool skip_bridge_hooks =
+        create_guard.is_nested ||
+        should_skip_d3d11_create_hook_caller(caller) ||
+        device == nullptr ||
+        driver_type == D3D_DRIVER_TYPE_WARP ||
+        driver_type == D3D_DRIVER_TYPE_REFERENCE;
+
     const HRESULT hr = g_original_create_device(
         adapter,
         driver_type,
@@ -13378,7 +13491,7 @@ HRESULT WINAPI hooked_create_device(
         feature_level,
         context);
 
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr) && !skip_bridge_hooks)
     {
         install_device_hooks(device != nullptr ? *device : nullptr);
         install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
@@ -13610,11 +13723,11 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
     if (address == nullptr || proc_name == nullptr)
         return address;
 
-    if (is_d3d11_module(module))
+    if (is_d3d11_module(module) && !should_skip_d3d11_create_hook_caller(_ReturnAddress()))
     {
         if (std::strcmp(proc_name, "D3D11CreateDeviceAndSwapChain") == 0)
         {
-            if (g_original_create_device_and_swapchain == nullptr)
+            if (address != reinterpret_cast<FARPROC>(&hooked_create_device_and_swapchain))
                 g_original_create_device_and_swapchain = reinterpret_cast<create_device_and_swapchain_fn>(address);
             LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDeviceAndSwapChain");
             return reinterpret_cast<FARPROC>(&hooked_create_device_and_swapchain);
@@ -13622,7 +13735,7 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
 
         if (std::strcmp(proc_name, "D3D11CreateDevice") == 0)
         {
-            if (g_original_create_device == nullptr)
+            if (address != reinterpret_cast<FARPROC>(&hooked_create_device))
                 g_original_create_device = reinterpret_cast<create_device_fn>(address);
             LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDevice");
             return reinterpret_cast<FARPROC>(&hooked_create_device);
