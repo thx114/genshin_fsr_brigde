@@ -66,7 +66,7 @@ struct TranslationSession
 std::unordered_map<std::uint64_t, std::unique_ptr<TranslationSession>> g_sessions;
 TranslationSession *g_session = nullptr;
 bool g_hook_entry_detected = false;
-constexpr std::size_t kMaxTranslationSessions = 8;
+constexpr std::size_t kMaxTranslationSessions = 16;
 
 template <typename Interface>
 void safe_release(Interface *&value)
@@ -827,13 +827,31 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     {
         // Do not recycle an in-use NGX context to service a different renderer.
         // Bound memory; the caller's existing FFX path remains available on refusal.
-        if (g_sessions.size() >= kMaxTranslationSessions)
+        while (g_sessions.size() >= kMaxTranslationSessions)
         {
-            outcome.error = "FSR2 per-instance context limit reached";
-            outcome.error_code = static_cast<std::uint32_t>(FFX_ERROR_BACKEND_API_ERROR);
-            return outcome;
+            auto oldest_it = g_sessions.end();
+            LONGLONG oldest_counter = LLONG_MAX;
+            for (auto it = g_sessions.begin(); it != g_sessions.end(); ++it)
+            {
+                if (it->second->last_dispatch_counter.QuadPart < oldest_counter)
+                {
+                    oldest_counter = it->second->last_dispatch_counter.QuadPart;
+                    oldest_it = it;
+                }
+            }
+            if (oldest_it != g_sessions.end())
+            {
+                g_session = oldest_it->second.get();
+                release_translation_locked();
+                g_sessions.erase(oldest_it);
+            }
+            else
+            {
+                break;
+            }
         }
         session = g_sessions.emplace(frame.instance_key, std::make_unique<TranslationSession>()).first;
+        QueryPerformanceCounter(&session->second->last_dispatch_counter);
     }
     g_session = session->second.get();
     if (!ensure_translation_locked(frame, outcome.context_created, outcome.error))
@@ -973,6 +991,7 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     }
 
     g_session->reset_next_dispatch = false;
+    QueryPerformanceCounter(&g_session->last_dispatch_counter);
     outcome.succeeded = true;
     return outcome;
 }

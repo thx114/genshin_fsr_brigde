@@ -11407,6 +11407,7 @@ bool try_fsr2_translation_draw(
                 // 纹理形态适配：FrameInput 持 ID3D11Texture2D*，Fsr2TranslationFrame 要
                 // ID3D11ShaderResourceView*，这里临时建 SRV，dispatch 后释放。
                 bool shim_dispatched = false;
+                bool shim_hook_entry_detected = false;
                 if (g_config.enable_fsr2_get_proc_address_shim && color_tex && depth_tex && motion_tex && output_tex)
                 {
                     ID3D11Device *shim_device = nullptr;
@@ -11573,6 +11574,7 @@ bool try_fsr2_translation_draw(
                         if (frame.depth) frame.depth->Release();
                         if (frame.motion) frame.motion->Release();
 
+                        shim_hook_entry_detected = outcome.hook_entry_detected;
                         if (outcome.succeeded)
                         {
                             shim_dispatched = true;
@@ -11618,7 +11620,7 @@ bool try_fsr2_translation_draw(
                     }
                     if (shim_device) shim_device->Release();
                 }
-                if (!shim_dispatched)
+                if (!shim_dispatched && !shim_hook_entry_detected)
 #endif
                 if (ffx12::dispatch(sdk_in, context, call_params.instance))
                 {
