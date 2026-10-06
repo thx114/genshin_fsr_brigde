@@ -1559,7 +1559,6 @@ void poll_mode_hotkeys()
         LOG_INFO(blog::cat::probe, "texture_trace_started duration_ms=" + std::to_string(g_config.texture_trace_duration_ms) +
             " main_base=" + hex64(reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))));
     }
-#endif
     if (GetAsyncKeyState(VK_F10) & 1)
     {
         clear_mode_samples();
@@ -1571,6 +1570,7 @@ void poll_mode_hotkeys()
         toggle_recording_mode(2);
     if (GetAsyncKeyState(VK_F9) & 1)
         toggle_recording_mode(3);
+#endif
 }
 
 ModeMatch classify_current_mode()
@@ -3855,8 +3855,10 @@ void load_config()
         512u);
     g_config.capture_metadata_only =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"CaptureMetadataOnly", 0, config_path.c_str()) != 0;
-    // FSR2 输入纹理转储（诊断，默认关）。放在无条件区，避免被下面的 #if 吞掉。
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // FSR2 输入纹理转储（诊断，开发构建有效）
     fsr2dump::configure(config_path.c_str());
+#endif
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL) || defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
     g_config.enable_fsr2_get_proc_address_shim =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
@@ -11361,10 +11363,8 @@ bool try_fsr2_translation_draw(
                 probe_native_params_once(context, call_params, color_tex, depth_tex, motion_tex);
 #endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
 
-                // FSR2 输入纹理转储（诊断，默认关；Fsr2InputDump=1 才启用）。
-                // **必须无条件调用**：热键/延时触发要在里面轮询，若先判"已启用"再调用，
-                // 开关关闭时永远不会进入 ⇒ 热键永远武装不上。关闭时内部走一次原子读即返回。
-                // 只在这里喂参数与纹理，读回由模块跨帧延迟完成——不在本 draw 内做 CPU 同步。
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+                // FSR2 输入纹理转储（诊断，开发构建有效）
                 {
                     bool dump_dx11on12 = false, dump_gpu_only = false;
                     ffx12::interop_capabilities(dump_dx11on12, dump_gpu_only);
@@ -11400,6 +11400,7 @@ bool try_fsr2_translation_draw(
                     }
                     fsr2dump::on_dispatch(context, dump_desc, !dump_dx11on12);
                 }
+#endif
 
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
                 // Gen-1 GetProcAddress shim 路径：把 draw 层抓到的纹理经标准 ffxFsr2*
@@ -11483,6 +11484,7 @@ bool try_fsr2_translation_draw(
                             return nullptr;
                         };
 
+                        #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
                         // 诊断：在 dispatch 点 dump 真实绑定的 8 SRV + 4 RTV 格式/尺寸 + draw_info 槽位选择。
                         // 目的：定位"color=BC1/motion=BC3/depth=D32_S8 槽位抓错"根因——
                         // 确认是 fixed_slot_identify 抓错 draw，还是 dispatch 与 identify 之间 PS 绑定漂移。
@@ -11534,6 +11536,7 @@ bool try_fsr2_translation_draw(
                             }
                             LOG_INFO(blog::cat::upscale, d.str());
                         }
+#endif
 
                         Fsr2TranslationFrame frame;
                         frame.instance_key = call_params.instance;
