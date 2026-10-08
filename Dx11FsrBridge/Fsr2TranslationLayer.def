@@ -5,3 +5,10 @@ EXPORTS
     ffxFsr2GetUpscaleRatioFromQualityMode
     ffxFsr2GetRenderResolutionFromQualityMode
     ffxFsr2GetJitterPhaseCount
+    OptiScalerGetDepthDx11Frame
+    OptiScalerReleaseDepthDx11Frame
+    OptiScalerGetDepthFrame = OptiScalerGetDepthDx11Frame
+    OptiScalerReleaseDepthFrame = OptiScalerReleaseDepthDx11Frame
+
+    OptiScalerGetDepthCpuFrame
+    OptiScalerReleaseDepthCpuFrame

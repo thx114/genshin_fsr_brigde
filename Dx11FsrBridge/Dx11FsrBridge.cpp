@@ -1,4 +1,4 @@
-﻿#include <Windows.h>
+#include <Windows.h>
 #include <TlHelp32.h>
 #include <d3d11.h>
 #include <d3d11_3.h>
@@ -15,7 +15,11 @@
 #include "Il2CppCallSiteHook.h"
 #include "Ffx12Backend.h"
 #include "Fsr2InputDump.h"
+#include "SkinMaskProbe.h"
+#include "SkinMaterialEvidence.h"
+#include "SkinMaskProbeHooks.h"
 #include "BridgeLogger.h"
+#include "DepthProvider.h"
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
 #include "Fsr2TranslationLayer.h"
 #endif
@@ -927,6 +931,9 @@ create_vertex_shader_fn g_original_create_vertex_shader = nullptr;
 create_pixel_shader_fn g_original_create_pixel_shader = nullptr;
 create_compute_shader_fn g_original_create_compute_shader = nullptr;
 present_fn g_original_present = nullptr;
+// 「有序注入链」用的就绪标志：真正的交换链一建出来就置位，供链清单里的 `wait swapchain` 等待。
+// OptiScaler/ReShade 必须等 GIMI 把设备/交换链包装完之后再挂，才能落在 Present 链的最外层。
+std::atomic<bool> g_chain_swapchain_seen { false };
 std::mutex g_swapchain_present_mutex;
 std::unordered_map<void *, present_fn> g_original_present_by_instance;
 set_fullscreen_state_fn g_original_set_fullscreen_state = nullptr;
@@ -3859,6 +3866,9 @@ void load_config()
     // FSR2 输入纹理转储（诊断，开发构建有效）
     fsr2dump::configure(config_path.c_str());
 #endif
+    // Opt-in skin diagnostics are intentionally available in Release builds.
+    skinprobe::configure(config_path.c_str());
+    skinmaterial::configure(config_path.c_str());
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL) || defined(DX11FSRBRIDGE_ENABLE_FSR2_GETPROC_SHIM)
     g_config.enable_fsr2_get_proc_address_shim =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableFsr2GetProcAddressShim", 1, config_path.c_str()) != 0;
@@ -5766,17 +5776,26 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std:
 
 std::size_t context_vtable_size(ID3D11DeviceContext *context)
 {
+    // 一律按最大长度（ID3D11DeviceContext4，149 项）克隆虚表。
+    //
+    // 原因（2026-10-08 游戏内定位到的崩溃）：clone_and_patch_vtable 克隆出来的是一段
+    // VirtualAlloc 的 RW 内存，只有 method_count 个槽；一旦按 128（Context）克隆，
+    // 而调用方按 Context4 去调第 134 号槽，读到的就是克隆区之后未提交/为零的内存，
+    // 于是 call [rax+0x430] -> RIP=0 访问违例。
+    // 基线里没有第二层包装，没人会调 >=128 的槽，所以一直没暴露；
+    // 3DMigoto(GIMI) 同样是 Context4 包装层，它转发 Context4 方法时就踩到了这个空洞。
+    // 宁可多克隆 21 个槽（顺手把源虚表后面相邻的数据一起拷过来，正常调用方不会碰），
+    // 也绝不能少克隆——少克隆的代价是尾部为 0，别人一转发就是 call 0。
     if (context == nullptr)
-        return k_context_vtable_size;
+        return k_context4_vtable_size;
 
     ID3D11DeviceContext4 *context4 = nullptr;
     const HRESULT result = context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&context4));
     if (FAILED(result) || context4 == nullptr)
-        return k_context_vtable_size;
+        return k_context4_vtable_size;
 
-    const bool shared_instance = static_cast<ID3D11DeviceContext *>(context4) == context;
     context4->Release();
-    return shared_instance ? k_context4_vtable_size : k_context_vtable_size;
+    return k_context4_vtable_size;
 }
 
 bool set_cloned_vtable_enabled(void *instance, bool enabled)
@@ -7809,6 +7828,7 @@ void ensure_context_device_texture_hook(ID3D11DeviceContext *context)
 
 void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *dsv)
 {
+    skinprobe::before_geometry_targets_change(context,count,rtvs,dsv);
     ensure_context_device_texture_hook(context);
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
@@ -7852,6 +7872,7 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets_and_uavs(
     ID3D11UnorderedAccessView *const *unordered_access_views,
     const UINT *uav_initial_counts)
 {
+    skinprobe::before_geometry_targets_change(context,render_target_count,render_targets,depth_stencil);
     ensure_context_device_texture_hook(context);
     if (g_config.dx11_on12_swapchain)
     {
@@ -10828,6 +10849,23 @@ bool try_fsr2_translation_draw(
             {
                 res->QueryInterface(IID_PPV_ARGS(&depth_tex));
                 res->Release();
+
+                // Publish depth for ReShade addon (outside shim gate)
+                if (depth_tex != nullptr)
+                {
+                    D3D11_TEXTURE2D_DESC depth_desc {};
+                    depth_tex->GetDesc(&depth_desc);
+                    LOG_INFO("depth_provider", "publishing depth to ReShade");
+                    DepthProvider::PublishDepth(depth_tex, depth_desc.Width, depth_desc.Height,
+                                               depth_desc.Format, g_config.ffx12_depth_inverted);
+                    if (DepthProvider::CaptureDepthCpu(context, depth_tex, g_config.ffx12_depth_inverted)) {
+                        static bool cpu_depth_logged = false;
+                        if (!cpu_depth_logged) {
+                            LOG_INFO("depth_provider", "CPU depth snapshot ready for final DX12 ReShade (nonblocking readback)");
+                            cpu_depth_logged = true;
+                        }
+                    }
+                }
             }
             if (motion_slot < std::size(bound_srvs) && bound_srvs[motion_slot] &&
                 (bound_srvs[motion_slot]->GetResource(&res), res))
@@ -11544,6 +11582,8 @@ bool try_fsr2_translation_draw(
                         frame.color = make_srv(color_tex, "color");
                         frame.depth = make_srv(depth_tex, "depth");
                         frame.motion = make_srv(motion_tex, "motion");
+
+                        // Note: depth already published at line 10841 (outside shim gate)
                         frame.flags = nullptr; // Gen-2 不单独抓 flags 纹理
                         frame.exposure = nullptr; // auto-exposure
                         frame.output = output_tex;
@@ -12389,8 +12429,91 @@ void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_
 // 必须用**极低采样率**（如每 4096 次 draw 只测 1 次），且先验证探针本身无扰动。
 // ---------------------------------------------------------------------------
 
+// Capture shader/material state only after F8, bounded to a few diagnostic
+// frames. Existing hash registry already tracks creation bytecode in Release.
+void record_skin_probe_draw(ID3D11DeviceContext* context,UINT elements,bool indexed)
+{
+    if(!context || context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;
+    skinprobe::DrawIdentity identity;
+    ID3D11PixelShader* ps=nullptr;ID3D11VertexShader* vs=nullptr;
+    context->PSGetShader(&ps,nullptr,nullptr);context->VSGetShader(&vs,nullptr,nullptr);
+    identity.pixelHash=lookup_pixel_shader_info(ps).hash;
+    identity.vertexHash=lookup_vertex_shader_info(vs).hash;
+    if(ps)ps->Release();if(vs)vs->Release();
+    ID3D11DepthStencilState* ds=nullptr;UINT stencilRef=0;
+    context->OMGetDepthStencilState(&ds,&stencilRef);identity.stencilRef=stencilRef;
+    if(ds) {
+        D3D11_DEPTH_STENCIL_DESC desc{};ds->GetDesc(&desc);ds->Release();
+        identity.stencilEnabled=desc.StencilEnable;identity.writeMask=desc.StencilWriteMask;
+        identity.passOp=static_cast<uint32_t>(desc.FrontFace.StencilPassOp);
+    }
+    ID3D11RenderTargetView* rtvs[8]{};ID3D11DepthStencilView* dsv=nullptr;
+    context->OMGetRenderTargets(8,rtvs,&dsv);auto* rtv=rtvs[0];
+    identity.target=skinprobe::describe_render_target(rtv);
+    for(unsigned i=0;i<8;++i)if(rtvs[i])identity.target.mrtCount=i+1;
+    ResourceInfo color{},depth{};
+    if(rtv)read_resource_info(rtv,L"skin_probe_rt",color);
+    if(dsv) {
+        read_resource_info(dsv,L"skin_probe_ds",depth);
+        if(skinprobe::geometry_extent(color.width,color.height,elements)) {
+            skinprobe::remember_geometry_depth(context,dsv);
+            skinprobe::remember_geometry_target(context,rtv,dsv,identity.pixelHash,identity.stencilEnabled?identity.stencilRef:UINT32_MAX);
+            skinprobe::prepare_face_draw(context,rtv,dsv,identity);
+        }
+        dsv->Release();
+    }
+    for(auto* view:rtvs)if(view)view->Release();
+    if(!skinprobe::geometry_extent(color.width,color.height,elements))return;
+    identity.renderTarget=color.resource_key;identity.depthTarget=depth.resource_key;
+    identity.width=color.width;identity.height=color.height;
+    ID3D11ShaderResourceView* textures[8]{};context->PSGetShaderResources(0,8,textures);
+    for(unsigned i=0;i<8;++i)if(textures[i]) {
+        ResourceInfo t{};read_resource_info(textures[i],L"skin_probe_material",t);
+        identity.textures[i]={t.resource_key,t.width,t.height,static_cast<uint32_t>(t.format),static_cast<uint32_t>(t.view_format)};
+    }
+    skinmaterial::observe_draw(context,identity,textures,8);
+    for(auto* view:textures)if(view)view->Release();
+    skinprobe::record_draw(identity,elements,indexed);
+}
+
+// Per-frame fast-path observation (SkinMaskProbeFastPath). The diagnostic record above is
+// bounded and expensive; this one keeps only what the face guide needs and rejects almost
+// every draw after one pixel-shader hash lookup, so it can run on every draw of every frame.
+void record_skin_probe_fast_draw(ID3D11DeviceContext* context,UINT elements,bool indexed)
+{
+    (void)elements;(void)indexed;
+    if(!context || context->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return;
+    ID3D11PixelShader* ps=nullptr;
+    context->PSGetShader(&ps,nullptr,nullptr);
+    const std::uint64_t pixelHash=lookup_pixel_shader_info(ps).hash;
+    if(ps)ps->Release();
+    if(!skinprobe::fastpath_interesting_shader(pixelHash))return;
+    ID3D11DepthStencilState* ds=nullptr;UINT stencilRef=0;
+    context->OMGetDepthStencilState(&ds,&stencilRef);
+    std::uint32_t stencilEnabled=0;
+    if(ds) {
+        D3D11_DEPTH_STENCIL_DESC desc{};ds->GetDesc(&desc);stencilEnabled=desc.StencilEnable;ds->Release();
+    }
+    ID3D11RenderTargetView* rtvs[8]{};ID3D11DepthStencilView* dsv=nullptr;
+    context->OMGetRenderTargets(8,rtvs,&dsv);auto* rtv=rtvs[0];
+    // Only the fields the observation reads: shader hash, stencil reference and MRT count.
+    skinprobe::DrawIdentity identity;
+    identity.pixelHash=pixelHash;identity.stencilRef=stencilRef;identity.stencilEnabled=stencilEnabled;
+    for(unsigned i=0;i<8;++i)if(rtvs[i])identity.target.mrtCount=i+1;
+    if(dsv) {
+        skinprobe::remember_geometry_depth(context,dsv);
+        skinprobe::remember_geometry_target(context,rtv,dsv,pixelHash,stencilEnabled?stencilRef:UINT32_MAX);
+        skinprobe::prepare_face_draw(context,rtv,dsv,identity);
+        dsv->Release();
+    }
+    for(auto* view:rtvs)if(view)view->Release();
+}
+
 void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location)
 {
+    skinprobe::FaceDrawScope faceDrawScope(context);
+    if(skinprobe::wants_draw_trace())record_skin_probe_draw(context,index_count,true);
+    else if(skinprobe::fastpath_active())record_skin_probe_fast_draw(context,index_count,true);
     // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
     // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
     // N/Intel 上 OptiScaler 用于提供 DLSS/XeSS，不依赖桥让路）。
@@ -12483,6 +12606,9 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 // ---------------------------------------------------------------------------
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
 {
+    skinprobe::FaceDrawScope faceDrawScope(context);
+    if(skinprobe::wants_draw_trace())record_skin_probe_draw(context,vertex_count,false);
+    else if(skinprobe::fastpath_active())record_skin_probe_fast_draw(context,vertex_count,false);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
 #endif
@@ -12750,6 +12876,7 @@ void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, I
 
 void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11RenderTargetView *rtv, const FLOAT color[4])
 {
+    skinprobe::before_geometry_color_clear(context,rtv);
     if (g_config.dx11_on12_swapchain)
     {
         ResourceInfo info {};
@@ -12767,6 +12894,7 @@ void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11Rend
 
 void STDMETHODCALLTYPE hooked_clear_dsv(ID3D11DeviceContext *context, ID3D11DepthStencilView *dsv, UINT flags, FLOAT depth, UINT8 stencil)
 {
+    if(flags&D3D11_CLEAR_STENCIL)skinprobe::before_stencil_clear(context,dsv);
     if (g_config.dx11_on12_swapchain)
     {
         ResourceInfo info {};
@@ -12843,6 +12971,12 @@ void install_context_hooks(ID3D11DeviceContext *context)
         { k_idx_clear_dsv, reinterpret_cast<void *>(&hooked_clear_dsv) },
     });
 #endif
+    if(skinprobe::append_probe_hook(patches,skinprobe::gbuffer_enabled(),k_idx_clear_rtv,
+                                   reinterpret_cast<void*>(&hooked_clear_rtv)))
+        LOG_INFO(blog::cat::core,"skin_probe registered Release ClearRenderTargetView hook for original MRT pre-clear evidence");
+    if(skinprobe::append_probe_hook(patches,skinprobe::enabled(),k_idx_clear_dsv,
+        reinterpret_cast<void*>(&hooked_clear_dsv)))
+        LOG_INFO(blog::cat::core,"skin_probe context hook registered: ClearDepthStencilView (Release included)");
     clone_and_patch_vtable(context, context_vtable_size(context), patches);
 }
 
@@ -12992,6 +13126,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const
             std::lock_guard lock(g_shader_info_mutex);
             g_pixel_shader_info[key] = { bytecode_hash, static_cast<std::size_t>(bytecode_length) };
         }
+        skinmaterial::register_pixel_shader(bytecode_hash,shader_bytecode,static_cast<std::size_t>(bytecode_length));
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         dump_pixel_shader_bytecode(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
 #endif
@@ -13076,6 +13211,9 @@ void install_device_hooks(ID3D11Device *device)
         { k_idx_device_create_compute_shader, reinterpret_cast<void *>(&hooked_create_compute_shader) },
     });
 #endif
+    if(skinprobe::append_probe_hook(patches,skinprobe::enabled(),k_idx_device_create_vertex_shader,
+        reinterpret_cast<void*>(&hooked_create_vertex_shader)))
+        LOG_INFO(blog::cat::core,"skin_probe device hook registered: CreateVertexShader (Release included)");
     clone_and_patch_vtable(device, k_device_vtable_size, patches);
 
     if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
@@ -13394,6 +13532,56 @@ void install_factory_hooks_from_device(ID3D11Device *device)
     dxgi_device->Release();
 }
 
+// 「这个地址属于哪个模块 + 偏移」——诊断两套钩子打架时，用来看清是谁调进来的、
+// 真实函数落在哪个模块。故意不依赖文件末尾的探针（那边用不到）。
+std::string hook_pointer_label(const void *address)
+{
+    if (address == nullptr)
+        return "null";
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(address), &module) ||
+        module == nullptr)
+    {
+        char raw[32] {};
+        std::snprintf(raw, sizeof(raw), "no-module+0x%llX",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(address)));
+        return raw;
+    }
+    wchar_t path[MAX_PATH] {};
+    GetModuleFileNameW(module, path, MAX_PATH);
+    const std::wstring file_name = std::filesystem::path(std::wstring(path)).filename().wstring();
+    char name[MAX_PATH] {};
+    WideCharToMultiByte(CP_UTF8, 0, file_name.c_str(), -1, name, sizeof(name), nullptr, nullptr);
+    char offset[32] {};
+    std::snprintf(offset, sizeof(offset), "+0x%llX",
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(address) -
+            reinterpret_cast<std::uintptr_t>(module)));
+    return std::string(name) + offset;
+}
+
+// 设备创建入口只记前几次：要看清的是「只进了一次」还是「被反复嵌套」。
+void log_create_device_enter(const char *api, bool nested, const void *caller)
+{
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 8)
+        return;
+    LOG_INFO(blog::cat::core, std::string("create_device_enter api=") + api +
+        " nested=" + (nested ? "1" : "0") + " caller=" + hook_pointer_label(caller));
+}
+
+// GetProcAddress 被拦截时记一笔：谁问的、真实函数在哪、我们塞给它的是什么。
+void log_getproc_intercept(const char *name, const void *caller, const void *real)
+{
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) >= 16)
+        return;
+    LOG_INFO(blog::cat::hook, std::string("getproc_intercept name=") + name +
+        " caller=" + hook_pointer_label(caller) +
+        " real=" + hook_pointer_label(real));
+}
+
 HRESULT WINAPI hooked_create_device_and_swapchain(
     IDXGIAdapter *adapter,
     D3D_DRIVER_TYPE driver_type,
@@ -13422,6 +13610,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
 
     ScopedD3D11CreateDeviceGuard create_guard;
     void *const caller = _ReturnAddress();
+    log_create_device_enter("D3D11CreateDeviceAndSwapChain", create_guard.is_nested, caller);
     const bool skip_bridge_hooks =
         create_guard.is_nested ||
         should_skip_d3d11_create_hook_caller(caller) ||
@@ -13477,6 +13666,7 @@ HRESULT WINAPI hooked_create_device(
     // 旧 On12 引导移除（旧方案隔离）。
     ScopedD3D11CreateDeviceGuard create_guard;
     void *const caller = _ReturnAddress();
+    log_create_device_enter("D3D11CreateDevice", create_guard.is_nested, caller);
     const bool skip_bridge_hooks =
         create_guard.is_nested ||
         should_skip_d3d11_create_hook_caller(caller) ||
@@ -13584,6 +13774,8 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
 #endif
     if (SUCCEEDED(hr))
     {
+        // 交换链真的建出来了：叫醒链里可能正在等 `wait swapchain` 的那一步。
+        g_chain_swapchain_seen.store(true, std::memory_order_release);
         if (desc != nullptr)
             set_output_size(desc->Width, desc->Height, "CreateSwapChainForHwnd");
         if (swapchain_hook_needed())
@@ -13734,6 +13926,8 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
         {
             if (address != reinterpret_cast<FARPROC>(&hooked_create_device_and_swapchain))
                 g_original_create_device_and_swapchain = reinterpret_cast<create_device_and_swapchain_fn>(address);
+            log_getproc_intercept("D3D11CreateDeviceAndSwapChain", _ReturnAddress(),
+                reinterpret_cast<const void *>(address));
             LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDeviceAndSwapChain");
             return reinterpret_cast<FARPROC>(&hooked_create_device_and_swapchain);
         }
@@ -13742,6 +13936,8 @@ FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
         {
             if (address != reinterpret_cast<FARPROC>(&hooked_create_device))
                 g_original_create_device = reinterpret_cast<create_device_fn>(address);
+            log_getproc_intercept("D3D11CreateDevice", _ReturnAddress(),
+                reinterpret_cast<const void *>(address));
             LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDevice");
             return reinterpret_cast<FARPROC>(&hooked_create_device);
         }
@@ -13845,6 +14041,559 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
     if (vendor != 0)
         record_adapter_info(vendor, desc_text);
 }
+
+// ── 崩溃/钩子探针（2026-10-08 诊断）──────────────────────────────────
+// 背景：GIMI(XXMI 的 3DMigoto) 由链 LoadLibraryW 进来后 DllMain 会成功返回
+// （桥日志 migoto_loaded），但它装的 Nektra 内联钩子会让游戏 5 秒左右
+// 0xC0000005、addr=0x0、at=<no-module>。要分清"谁在哪个函数上装了钩"和
+// "崩在谁的代码里"，光靠异步日志不行（进程硬崩时队列会丢），所以：
+//   1) prologue：migoto 前后各转储一次关键函数开头的机器码，解出跳转目标；
+//   2) crash   ：VEH 抓致命异常，记录 RIP/访问地址/模块偏移 + 调用栈。
+// 两者都写独立的同步文件（CreateFile/WriteFile/CloseHandle，不经日志队列）。
+// 探针只读、不改控制流：异常一律 EXCEPTION_CONTINUE_SEARCH 交回系统/游戏自己处理。
+namespace crash_probe
+{
+    std::mutex g_lock;
+    std::atomic<int> g_budget { 12 };      // 最多记录 12 次，防异常风暴刷屏
+    std::atomic<bool> g_busy { false };    // 处理器内防重入
+    PVOID g_veh = nullptr;
+    std::filesystem::path g_path;
+
+    std::string hexptr(std::uintptr_t value)
+    {
+        char buf[32] {};
+        std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(value));
+        return buf;
+    }
+
+    std::string file_of(std::uintptr_t addr);   // 定义在下面，handler 里先用
+
+    // 地址 → 「模块名+偏移」，拿不到就 <no-module>（trampoline/已卸载内存就长这样）
+    std::string where(std::uintptr_t addr)
+    {
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(addr), &mod) != FALSE && mod != nullptr)
+        {
+            wchar_t path[MAX_PATH] {};
+            GetModuleFileNameW(mod, path, MAX_PATH);
+            return narrow(std::filesystem::path(path).filename().wstring()) + "+" +
+                   hexptr(addr - reinterpret_cast<std::uintptr_t>(mod));
+        }
+        return std::string("<no-module>+") + hexptr(addr);
+    }
+
+    void sync_line(const std::string &line)
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        if (g_path.empty())
+            return;
+        HANDLE file = CreateFileW(g_path.c_str(), FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            return;
+        const std::string text = line + "\r\n";
+        DWORD written = 0;
+        WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+        CloseHandle(file);
+    }
+
+    LONG WINAPI handler(EXCEPTION_POINTERS *info)
+    {
+        if (info == nullptr || info->ExceptionRecord == nullptr || info->ContextRecord == nullptr)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        // 只忽略明确无意义的通知类（调试打印/线程命名），其余 0xC 类（致命级）全记：
+        // 上一版只认 AV 三种，结果真正致命的那次一条都没留下。
+        if (code == 0x40010006 /*DBG_PRINTEXCEPTION_C*/ ||
+            code == 0x406D1388 /*MS_VC_THREADNAME*/ ||
+            code == 0xE06D7363 /*C++ throw*/)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if ((code & 0xC0000000) != 0xC0000000)
+            return EXCEPTION_CONTINUE_SEARCH;
+        if (g_budget.fetch_sub(1) <= 0 || g_busy.exchange(true))
+            return EXCEPTION_CONTINUE_SEARCH;
+
+        const std::uintptr_t rip =
+            static_cast<std::uintptr_t>(info->ContextRecord->Rip);
+        const std::uintptr_t access = static_cast<std::uintptr_t>(
+            info->ExceptionRecord->ExceptionInformation[0]);
+        const std::uintptr_t at = static_cast<std::uintptr_t>(
+            info->ExceptionRecord->ExceptionInformation[1]);
+        std::string line = "crash t=" + std::to_string(GetTickCount64()) +
+            " tid=" + std::to_string(GetCurrentThreadId()) +
+            " code=" + hexptr(code) +
+            " rip=" + hexptr(rip) + " in " + where(rip) +
+            " rip_file=" + file_of(rip) +
+            " rsp=" + hexptr(static_cast<std::uintptr_t>(info->ContextRecord->Rsp)) +
+            " rbp=" + hexptr(static_cast<std::uintptr_t>(info->ContextRecord->Rbp)) +
+            " access=" + hexptr(access) +
+            " at=" + hexptr(at) + " (" + where(at) + ")";
+        void *frames[24] {};
+        const USHORT count = CaptureStackBackTrace(
+            1, static_cast<DWORD>(std::size(frames)), frames, nullptr);
+        if (count == 0)
+            line += " stack=unavailable";
+        for (USHORT i = 0; i < count; ++i)
+            line += " | #" + std::to_string(i) + " " +
+                    where(reinterpret_cast<std::uintptr_t>(frames[i]));
+        sync_line(line);
+        LOG_ERROR(blog::cat::core, line);
+        g_busy.store(false);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    LONG WINAPI unhandled(EXCEPTION_POINTERS *info);   // 定义在 chase_all 之后
+
+    void install()
+    {
+        if (!g_path.empty())
+            return;
+        g_path = g_module_dir / L"Dx11FsrBridge.crash-probe.txt";
+        { std::ofstream truncate(g_path, std::ios::trunc); }
+        g_veh = AddVectoredExceptionHandler(1, &handler);
+        // 反作弊有可能把 VEH 悄悄摘掉（上一次致命 AV 就一条记录都没有），
+        // 所以再用未处理异常过滤器兜一道底：它是致命异常的最后一道关。
+        SetUnhandledExceptionFilter(&unhandled);
+        sync_line("probe installed pid=" + std::to_string(GetCurrentProcessId()) +
+                  " veh=" + (g_veh != nullptr ? "ok" : "FAILED") + " uef=ok");
+    }
+
+    // 只解析最常见的三种钩子形态；跳转槽一律不解引用（槽本身可能是不可读的）
+    std::string prologue(const char *module, const char *func)
+    {
+        HMODULE mod = GetModuleHandleA(module);
+        if (mod == nullptr)
+            return std::string(module) + "!" + func + "=<not-loaded>";
+        const auto *fn = reinterpret_cast<const unsigned char *>(GetProcAddress(mod, func));
+        if (fn == nullptr)
+            return std::string(module) + "!" + func + "=<no-export>";
+        char bytes[64] {};
+        int pos = 0;
+        for (int i = 0; i < 12 && pos + 4 < static_cast<int>(sizeof(bytes)); ++i)
+            pos += std::snprintf(bytes + pos, sizeof(bytes) - pos, "%02X ", fn[i]);
+        // 带上完整模块路径：GIMI 的代理 d3d11.dll 与系统 d3d11.dll 基名相同，
+        // 只打文件名分不清游戏最终调用的是哪一个。
+        std::string out = std::string(func) + "@" +
+            hexptr(reinterpret_cast<std::uintptr_t>(fn)) + " (" +
+            file_of(reinterpret_cast<std::uintptr_t>(fn)) + ") " + bytes;
+        if (fn[0] == 0xE9)
+        {
+            std::int32_t rel = 0;
+            std::memcpy(&rel, fn + 1, sizeof(rel));
+            out += "jmp_rel32->" + where(reinterpret_cast<std::uintptr_t>(fn) + 5 + rel);
+        }
+        else if (fn[0] == 0xFF && fn[1] == 0x25)
+        {
+            out += "jmp_ptr_slot=" +
+                hexptr(reinterpret_cast<std::uintptr_t>(fn) + 6);
+        }
+        else if (fn[0] == 0x48 && fn[1] == 0xFF && fn[2] == 0x25)
+        {
+            out += "jmp_ptr_slot=" +
+                hexptr(reinterpret_cast<std::uintptr_t>(fn) + 7);
+        }
+        else if (fn[0] == 0x48 && fn[1] == 0xB8)
+        {
+            std::uintptr_t target = 0;
+            std::memcpy(&target, fn + 2, sizeof(target));
+            out += "mov_rax_jmp->" + where(target);
+        }
+        return out;
+    }
+
+    // 该地址所属模块的完整路径。**必须用全路径**：GIMI 的代理 DLL 与系统 DLL 基名
+    // 都叫 d3d11.dll，只看文件名分不清游戏最终调用的是哪一个。
+    std::string file_of(std::uintptr_t addr)
+    {
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(addr), &mod) == FALSE || mod == nullptr)
+            return "<no-module>";
+        wchar_t path[MAX_PATH] {};
+        GetModuleFileNameW(mod, path, MAX_PATH);
+        return narrow(std::wstring(path));
+    }
+
+    // 把进程里所有 d3d11/dxgi 模块连同基址列出来 —— 名字重名时靠它定位。
+    void modules()
+    {
+        if (g_path.empty())
+            return;
+        HANDLE snapshot = CreateToolhelp32Snapshot(
+            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            sync_line("modules enum_failed gle=" + std::to_string(GetLastError()));
+            return;
+        }
+        MODULEENTRY32W entry {};
+        entry.dwSize = sizeof(entry);
+        std::string line = "modules";
+        int scanned = 0;
+        if (Module32FirstW(snapshot, &entry))
+        {
+            do
+            {
+                ++scanned;
+                const std::wstring full(entry.szExePath);
+                if (full.find(L"d3d11") == std::wstring::npos &&
+                    full.find(L"dxgi") == std::wstring::npos)
+                    continue;
+                line += " | " + narrow(full) + " base=" +
+                    hexptr(reinterpret_cast<std::uintptr_t>(entry.modBaseAddr));
+            } while (Module32NextW(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+        sync_line(line + " scanned=" + std::to_string(scanned));
+    }
+
+    // 先确认目标可读再读，绝不触发二次异常
+    bool readable(std::uintptr_t addr, std::size_t count, DWORD *protect)
+    {
+        MEMORY_BASIC_INFORMATION info {};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &info, sizeof(info)) == 0)
+            return false;
+        if (protect != nullptr)
+            *protect = info.Protect;
+        if (info.State != MEM_COMMIT)
+            return false;
+        const DWORD readable_mask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((info.Protect & readable_mask) == 0)
+            return false;
+        const std::uintptr_t region_end =
+            reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        return addr + count <= region_end;
+    }
+
+    std::string hex_bytes(const unsigned char *data, std::size_t count)
+    {
+        std::string out;
+        char buf[8] {};
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            std::snprintf(buf, sizeof(buf), "%02X ", data[i]);
+            out += buf;
+        }
+        return out;
+    }
+
+    // 追着跳转链往下读：每一跳打印 地址/所属模块/保护/字节，遇到指针槽就打印槽里的值。
+    // 这是为了回答「GIMI 的 Nektra 钩子把 dxgi!CreateDXGIFactory1 跳到 __ 之后到底怎么走」。
+    std::string chase(const char *module, const char *func)
+    {
+        HMODULE mod = GetModuleHandleA(module);
+        if (mod == nullptr)
+            return std::string(func) + "=<not-loaded>";
+        std::uintptr_t cur =
+            reinterpret_cast<std::uintptr_t>(GetProcAddress(mod, func));
+        if (cur == 0)
+            return std::string(func) + "=<no-export>";
+        std::string out = "chase " + std::string(func) + " start=" + hexptr(cur) +
+            " (" + file_of(cur) + ")";
+        for (int hop = 0; hop < 4; ++hop)
+        {
+            DWORD protect = 0;
+            if (!readable(cur, 16, &protect))
+            {
+                out += " -> hop" + std::to_string(hop) + " " + hexptr(cur) +
+                    " (" + where(cur) + ") NOT_READABLE prot=" + hexptr(protect);
+                break;
+            }
+            unsigned char bytes[16] {};
+            std::memcpy(bytes, reinterpret_cast<const void *>(cur), 16);
+            out += " -> hop" + std::to_string(hop) + " " + hexptr(cur) +
+                " (" + where(cur) + ")" + " prot=" + hexptr(protect) + " [" +
+                hex_bytes(bytes, 12) + "]";
+            std::uintptr_t next = 0;
+            if (bytes[0] == 0xE9)
+            {
+                std::int32_t rel = 0;
+                std::memcpy(&rel, bytes + 1, sizeof(rel));
+                next = cur + 5 + rel;
+            }
+            else if (bytes[0] == 0xFF && bytes[1] == 0x25)
+            {
+                std::int32_t rel = 0;
+                std::memcpy(&rel, bytes + 2, sizeof(rel));
+                const std::uintptr_t slot = cur + 6 + rel;
+                std::uintptr_t value = 0;
+                DWORD slot_protect = 0;
+                if (readable(slot, sizeof(value), &slot_protect))
+                {
+                    std::memcpy(&value, reinterpret_cast<const void *>(slot), sizeof(value));
+                    out += " slot=" + hexptr(slot) + " value=" + hexptr(value);
+                }
+                else
+                {
+                    out += " slot=" + hexptr(slot) + " UNREADABLE";
+                }
+                next = value;
+            }
+            else if (bytes[0] == 0x48 && bytes[1] == 0xFF && bytes[2] == 0x25)
+            {
+                std::int32_t rel = 0;
+                std::memcpy(&rel, bytes + 3, sizeof(rel));
+                const std::uintptr_t slot = cur + 7 + rel;
+                std::uintptr_t value = 0;
+                DWORD slot_protect = 0;
+                if (readable(slot, sizeof(value), &slot_protect))
+                {
+                    std::memcpy(&value, reinterpret_cast<const void *>(slot), sizeof(value));
+                    out += " slot=" + hexptr(slot) + " value=" + hexptr(value);
+                }
+                else
+                {
+                    out += " slot=" + hexptr(slot) + " UNREADABLE";
+                }
+                next = value;
+            }
+            else if (bytes[0] == 0x48 && bytes[1] == 0xB8)
+            {
+                std::memcpy(&next, bytes + 2, sizeof(next));
+                out += " mov_rax_imm=" + hexptr(next);
+            }
+            else if (bytes[0] == 0xCC)
+            {
+                out += " int3_padding（此函数未被改）";
+                break;
+            }
+            else
+            {
+                out += " plain_code（未识别的跳转形态）";
+                break;
+            }
+            out += " next=" + where(next);
+            if (next == 0)
+            {
+                out += " *** NULL ***";
+                break;
+            }
+            cur = next;
+        }
+        return out;
+    }
+
+    void chase_all(const std::string &tag)
+    {
+        if (g_path.empty())
+            return;
+        modules();
+        static const char *kTargets[][2] = {
+            { "dxgi.dll", "CreateDXGIFactory" },
+            { "dxgi.dll", "CreateDXGIFactory1" },
+            { "dxgi.dll", "CreateDXGIFactory2" },
+            { "d3d11.dll", "D3D11CreateDevice" },
+            { "d3d11.dll", "D3D11CreateDeviceAndSwapChain" },
+            { "kernel32.dll", "LoadLibraryExW" },
+        };
+        for (const auto &target : kTargets)
+            sync_line(tag + " | " + chase(target[0], target[1]));
+    }
+
+    // ── 致命异常兜底 ──────────────────────────────────────────────────
+    // 反作弊有可能把 VEH 摘掉（上一次致命 AV 就没留下任何记录），所以再挂一个
+    // 未处理异常过滤器：它是异常传到最后关头的必经之路。这里只记录、不做恢复，
+    // 也不放 __try（本函数用到 std::string，会被 C2712 拦下）。
+    LONG WINAPI unhandled(EXCEPTION_POINTERS *info)
+    {
+        if (info == nullptr || info->ExceptionRecord == nullptr)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        const std::uintptr_t rip = info->ContextRecord != nullptr
+            ? static_cast<std::uintptr_t>(info->ContextRecord->Rip) : 0;
+        const std::uintptr_t rsp = info->ContextRecord != nullptr
+            ? static_cast<std::uintptr_t>(info->ContextRecord->Rsp) : 0;
+        const std::uintptr_t at =
+            static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]);
+        std::string line = "fatal code=" + hexptr(code) +
+            " rip=" + hexptr(rip) + " (" + file_of(rip) + ")" +
+            " rsp=" + hexptr(rsp) + " at=" + hexptr(at) + " (" + where(at) + ")";
+        sync_line(line);
+        LOG_ERROR(blog::cat::core, line);
+        // 没有符号就按原始栈打：每个槽位连同它所属模块一起写出来，
+        // 调用链照样能还原（之前就是靠这个认出 KERNELBASE 那一跳的）。
+        const auto *slot = reinterpret_cast<const std::uintptr_t *>(rsp);
+        for (int i = 0; i < 32; ++i)
+        {
+            if (!readable(reinterpret_cast<std::uintptr_t>(slot + i),
+                    sizeof(std::uintptr_t), nullptr))
+                break;
+            const std::uintptr_t value = slot[i];
+            sync_line("fatal_stack[" + std::to_string(i) + "]=" + hexptr(value) +
+                      " " + where(value));
+        }
+        chase_all("fatal");
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // ── SEH 受控复现 ──────────────────────────────────────────────────
+    // 下面两个函数故意只用 POD：MSVC 的 __try 不能出现在需要对象展开（有 std::string
+    // 之类局部对象）的函数里（C2712），所以把带 __try 的活在裸函数里做完。
+    void raw_release(void *object)
+    {
+        __try
+        {
+            reinterpret_cast<IUnknown *>(object)->Release();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    int raw_filter(EXCEPTION_POINTERS *info, DWORD *code, std::uintptr_t *rip, std::uintptr_t *at)
+    {
+        if (info != nullptr && info->ExceptionRecord != nullptr)
+        {
+            *code = info->ExceptionRecord->ExceptionCode;
+            *at = static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]);
+            if (info->ContextRecord != nullptr)
+                *rip = static_cast<std::uintptr_t>(info->ContextRecord->Rip);
+        }
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    HRESULT raw_create_factory(void *create_fn, const GUID &iid, void **out,
+        DWORD *exc_code, std::uintptr_t *exc_rip, std::uintptr_t *exc_at)
+    {
+        using CreateFn = HRESULT (WINAPI *)(REFIID, void **);
+        *exc_code = 0;
+        *exc_rip = 0;
+        *exc_at = 0;
+        __try
+        {
+            return reinterpret_cast<CreateFn>(create_fn)(iid, out);
+        }
+        __except (raw_filter(GetExceptionInformation(), exc_code, exc_rip, exc_at))
+        {
+            return static_cast<HRESULT>(0x80004005L);
+        }
+    }
+
+    // 主动调一次 GIMI 的 D3D11CreateDevice。上次只测了工厂（那条路是好的），
+    // 设备这条路才是游戏真正崩掉的地方；崩在这里 __except 就能接住并记下现场。
+    HRESULT raw_create_device_call(void *create_fn, std::uintptr_t *out_device,
+        DWORD *exc_code, std::uintptr_t *exc_rip, std::uintptr_t *exc_at)
+    {
+        using CreateDevFn = HRESULT (WINAPI *)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
+            const D3D_FEATURE_LEVEL *, UINT, UINT, ID3D11Device **, D3D_FEATURE_LEVEL *,
+            ID3D11DeviceContext **);
+        *exc_code = 0;
+        *exc_rip = 0;
+        *exc_at = 0;
+        *out_device = 0;
+        const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
+        ID3D11Device *device = nullptr;
+        ID3D11DeviceContext *context = nullptr;
+        D3D_FEATURE_LEVEL got {};
+        __try
+        {
+            const HRESULT hr = reinterpret_cast<CreateDevFn>(create_fn)(nullptr,
+                D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels, 1, D3D11_SDK_VERSION,
+                &device, &got, &context);
+            *out_device = reinterpret_cast<std::uintptr_t>(device);
+            if (context != nullptr)
+                raw_release(context);
+            return hr;
+        }
+        __except (raw_filter(GetExceptionInformation(), exc_code, exc_rip, exc_at))
+        {
+            return static_cast<HRESULT>(0x80004005L);
+        }
+    }
+
+    void call_device(const std::string &tag, HMODULE migoto_module)
+    {
+        if (g_path.empty() || migoto_module == nullptr)
+            return;
+        Sleep(1000);   // GIMI 是在自己的 DllMain 之后才去加载真 d3d11 的，等它加载完
+        modules();
+        const auto create_fn = GetProcAddress(migoto_module, "D3D11CreateDevice");
+        std::string line = "device_call " + tag + " fn=" +
+            where(reinterpret_cast<std::uintptr_t>(create_fn));
+        if (create_fn == nullptr)
+        {
+            sync_line(line + " <null>");
+            return;
+        }
+        DWORD exc_code = 0;
+        std::uintptr_t exc_rip = 0;
+        std::uintptr_t exc_at = 0;
+        std::uintptr_t device = 0;
+        const HRESULT hr = raw_create_device_call(reinterpret_cast<void *>(create_fn), &device,
+            &exc_code, &exc_rip, &exc_at);
+        line += " hr=" + hexptr(static_cast<std::uintptr_t>(hr));
+        if (exc_code != 0)
+            line += " EXCEPTION code=" + hexptr(exc_code) + " rip=" + hexptr(exc_rip) +
+                " (" + where(exc_rip) + ") at=" + hexptr(exc_at) + " (" + where(exc_at) + ")";
+        line += " device=" + hexptr(device);
+        sync_line(line);
+        LOG_ERROR(blog::cat::core, line);
+        if (device != 0)
+            raw_release(reinterpret_cast<void *>(device));
+    }
+
+    // 桥自己调用一次被 GIMI 钩过的 CreateDXGIFactory1：
+    // - 加载 GIMI 之前调用 = 对照组（应当是 S_OK）；
+    // - 加载之后调用 = 处理组。崩在我这里，__except 就能接住并记录现场，
+    //   不用再依赖 VEH（实测反作弊可能把外来 VEH 摘掉，致命那次一条都没记到）。
+    void call_factory(const std::string &tag)
+    {
+        if (g_path.empty())
+            return;
+        HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+        if (dxgi == nullptr)
+        {
+            sync_line("factory_call " + tag + " dxgi_not_loaded");
+            return;
+        }
+        void *create = reinterpret_cast<void *>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
+        if (create == nullptr)
+        {
+            sync_line("factory_call " + tag + " no_export");
+            return;
+        }
+        // 与游戏/RenoDX 日志里出现的是同一个 IID：IDXGIFactory
+        static const GUID kIidFactory =
+            { 0x7B7166EC, 0x21C7, 0x44AE, { 0xB2, 0x1A, 0xC9, 0xAE, 0x32, 0x1A, 0xE3, 0x69 } };
+        void *factory = nullptr;
+        DWORD exc_code = 0;
+        std::uintptr_t exc_rip = 0;
+        std::uintptr_t exc_at = 0;
+        const HRESULT hr = raw_create_factory(create, kIidFactory, &factory,
+            &exc_code, &exc_rip, &exc_at);
+        std::string line = "factory_call " + tag + " hr=" + hexptr(static_cast<std::uintptr_t>(hr));
+        if (exc_code != 0)
+        {
+            line += " EXCEPTION code=" + hexptr(exc_code) +
+                " rip=" + hexptr(exc_rip) + " in " + where(exc_rip) +
+                " at=" + hexptr(exc_at) + " (" + where(exc_at) + ")";
+        }
+        line += " factory=" + hexptr(reinterpret_cast<std::uintptr_t>(factory));
+        sync_line(line);
+        if (factory != nullptr)
+            raw_release(factory);
+    }
+
+    void dump(const std::string &tag)
+    {
+        if (g_path.empty())
+            return;
+        std::string line = "prologue " + tag + " t=" + std::to_string(GetTickCount64());
+        line += " | d3d11!" + prologue("d3d11.dll", "D3D11CreateDevice");
+        line += " | d3d11!" + prologue("d3d11.dll", "D3D11CreateDeviceAndSwapChain");
+        line += " | dxgi!" + prologue("dxgi.dll", "CreateDXGIFactory");
+        line += " | dxgi!" + prologue("dxgi.dll", "CreateDXGIFactory1");
+        line += " | dxgi!" + prologue("dxgi.dll", "CreateDXGIFactory2");
+        line += " | k32!" + prologue("kernel32.dll", "LoadLibraryExW");
+        sync_line(line);
+    }
+} // namespace crash_probe
+
 
 void initialize()
 {
@@ -14068,87 +14817,308 @@ void initialize()
 
     // 原神 mhyprot 反作弊在游戏启动早期锁定进程：外部进程的 VirtualAllocEx /
     // CreateRemoteThread 会被拒绝（启动器注入 OptiScaler 报「拒绝访问」）。桥已在
-    // 进程内（窗口期注入成功），由它在 DllMain 返回后起线程 LoadLibraryW 加载
-    // OptiScaler.dll —— 进程内加载不走外部注入 API，mhyprot 拦不到。
+    // 进程内（窗口期注入成功），由它在 DllMain 返回后起线程，按一份清单把后续各层
+    // LoadLibraryW 进来 —— 进程内加载不走外部注入 API，mhyprot 拦不到，
+    // 而且顺序由清单说了算，不再靠多个注入者抢时间。
     //
-    // 路径来自启动器写的 sidecar 文件 Dx11FsrBridge.autoload.txt（UTF-8 单行绝对
-    // 路径，每次注入前覆盖写）。必须在 shim 装好之后加载，保证 OptiScaler 的
+    // 清单格式与顺序约束见下方链执行器。必须在 shim 装好之后加载，保证 OptiScaler 的
     // HookFSR2Dx11ExeInputs 查 ffxFsr2* 时 shim 已就位。
     //
     // ⚠️ 不能在 DllMain 里直接 LoadLibraryW：被加载 DLL 的 DllMain 会尝试获取
     // loader lock，而当前线程已持有它 → 死锁。用 std::thread + detach：线程函数
     // 在 DllMain 返回、loader lock 释放后才执行 LoadLibraryW（与 BridgeLogger
     // writer 线程同一种用法）。
+
+
     {
-        const std::filesystem::path autoload_path = g_module_dir / L"Dx11FsrBridge.autoload.txt";
-        std::string utf8_line;
+        // ── 有序注入链 ────────────────────────────────────────────────────
+        // 清单：与桥 DLL 同目录的 Dx11FsrBridge.chain.txt（启动器每次启动覆盖写），
+        // 逐行「动词 空格 参数」：
+        //   wait   <模块名>     等它进目标进程模块表（上限 kChainWaitMs，超时继续下一步）
+        //   wait   swapchain   等桥自己看到真正的交换链建出来（上限 45 秒，超时继续下一步）。
+        //                       这是「GIMI 已经把设备/交换链包装完」的可靠标志：OptiScaler/ReShade
+        //                       必须等到这时才挂，才能落在 Present 链的最外层，否则 DLSSG 的每帧
+        //                       簿记会错位（Frame count jumped too much /
+        //                       slDLSSGSetOptions race condition with Present，2026-10-08 实测）。
+        //   migoto <DLL 路径>   先建 Local\3DMigotoLoader 互斥体（3DMigoto 靠它在场判断
+        //                       loader 存在），再 LoadLibraryW
+        //   load   <DLL 路径>   LoadLibraryW
+        //   # / ; 开头 = 注释，空行忽略；没有动词的裸路径按 load 处理
+        // **行序 = 加载顺序，这是整套方案的全部意义，不要重排。**
+        //
+        // 为什么必须 wait dxgi.dll：3DMigoto 的 DllMain 在 HookDXGIFactories() 失败时直接
+        // 返回 FALSE（LoadLibraryW 拿不到，外部注入表现为返回码 600），而原神进程里
+        // dxgi.dll 是 mhypbase.dll 带进来的 —— 开进程那一刻根本还没有。进程内轮询等它出现，
+        // 既不受 mhyprot 限制，也不占用「反作弊生效前」那不到 1 秒的外部注入窗口。
+        //
+        // 兼容：没有 chain 文件时退回老的 Dx11FsrBridge.autoload.txt 单行（= 只 load
+        // OptiScaler）。于是「只换桥 DLL 不换启动器」或回退启动器都不会把已验证链路弄坏。
+        // 单步失败只记日志、不中断 —— 3DMigoto 装不上也要保住 Opti/ReShade 那条已跑通的链。
+        struct ChainStep
         {
-            std::ifstream ifs(autoload_path); // C++20: 接受 filesystem::path，宽路径可含中文
-            if (ifs.is_open())
+            int kind = 0; // 0=load 1=wait 2=migoto
+            std::wstring text;
+            bool opti = false;
+        };
+
+        const auto trim_ascii = [](std::string &s)
+        {
+            const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+            while (!s.empty() && is_space(s.back()))
+                s.pop_back();
+            std::size_t begin = 0;
+            while (begin < s.size() && is_space(s[begin]))
+                ++begin;
+            if (begin != 0)
+                s.erase(0, begin);
+        };
+        const auto strip_utf8_bom = [](std::string &line)
+        {
+            // .NET File.WriteAllText(Encoding.UTF8) 会带 BOM；启动器故意不写，别人写的要容错
+            if (line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+                static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF)
+                line.erase(0, 3);
+        };
+        const auto lower_ascii = [](std::string s)
+        {
+            for (char &c : s)
+                if (c >= 'A' && c <= 'Z')
+                    c = static_cast<char>(c - 'A' + 'a');
+            return s;
+        };
+        // 只折叠 ASCII：够用来认 "OptiScaler" 这个名字，中文路径原样保留
+        const auto looks_like_optiscaler = [](const std::wstring &path)
+        {
+            std::wstring name = std::filesystem::path(path).filename().wstring();
+            for (wchar_t &c : name)
+                if (c >= L'A' && c <= L'Z')
+                    c = static_cast<wchar_t>(c - L'A' + L'a');
+            return name.find(L"optiscaler") != std::wstring::npos;
+        };
+        const auto utf8_to_wide = [](const std::string &s) -> std::wstring
+        {
+            if (s.empty())
+                return std::wstring();
+            const int wlen = MultiByteToWideChar(CP_UTF8, 0, s.c_str(),
+                static_cast<int>(s.size()), nullptr, 0);
+            if (wlen <= 0)
+                return std::wstring();
+            std::wstring wide(static_cast<std::size_t>(wlen), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), wide.data(), wlen);
+            return wide;
+        };
+
+        std::vector<ChainStep> chain;
+        std::string chain_source = "Dx11FsrBridge.chain.txt";
+        {
+            std::ifstream ifs(g_module_dir / L"Dx11FsrBridge.chain.txt");
+            std::string line;
+            while (std::getline(ifs, line))
             {
-                std::getline(ifs, utf8_line);
-                // 去 UTF-8 BOM（.NET File.WriteAllText(Encoding.UTF8) 会带）
-                if (utf8_line.size() >= 3 &&
-                    static_cast<unsigned char>(utf8_line[0]) == 0xEF &&
-                    static_cast<unsigned char>(utf8_line[1]) == 0xBB &&
-                    static_cast<unsigned char>(utf8_line[2]) == 0xBF)
+                strip_utf8_bom(line);
+                trim_ascii(line);
+                if (line.empty() || line[0] == '#' || line[0] == ';')
+                    continue;
+                const std::size_t space = line.find_first_of(" \t");
+                const std::string head = lower_ascii(space == std::string::npos ? line : line.substr(0, space));
+                std::string arg = space == std::string::npos ? std::string() : line.substr(space + 1);
+                trim_ascii(arg);
+                if (arg.size() >= 2 && arg.front() == '"' && arg.back() == '"')
+                    arg = arg.substr(1, arg.size() - 2);
+                int kind = -1;
+                if (head == "wait")
+                    kind = 1;
+                else if (head == "migoto")
+                    kind = 2;
+                else if (head == "load")
+                    kind = 0;
+                if (kind < 0 && space == std::string::npos)
                 {
-                    utf8_line.erase(0, 3);
+                    // 只有一个词、又不是动词 → 裸路径（旧格式兼容）：整行当一个 load
+                    const std::wstring bare = utf8_to_wide(line);
+                    if (!bare.empty())
+                        chain.push_back(ChainStep { 0, bare, looks_like_optiscaler(bare) });
+                    continue;
                 }
-                // trim 尾部 \r / 空白
-                while (!utf8_line.empty())
-                {
-                    const char c = utf8_line.back();
-                    if (c == '\r' || c == ' ' || c == '\t' || c == '\n')
-                        utf8_line.pop_back();
-                    else
-                        break;
-                }
+                if (kind < 0)
+                    kind = 0; // 认不出的动词当 load：宁可多注一个，也不要静默丢一步
+                if (arg.empty())
+                    continue; // 只写了动词没写参数：跳过，绝不把它当成一个叫 "wait" 的 DLL 去加载
+                const std::wstring wide = utf8_to_wide(arg);
+                if (wide.empty())
+                    continue;
+                chain.push_back(ChainStep { kind, wide, kind != 1 && looks_like_optiscaler(wide) });
             }
         }
-        if (!utf8_line.empty())
+        if (chain.empty())
         {
-            // UTF-8 → wide（路径可含中文，narrow 的逆运算）
-            std::wstring optiscaler_path_w;
-            const int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_line.c_str(),
-                static_cast<int>(utf8_line.size()), nullptr, 0);
-            if (wlen > 0)
+            chain_source = "Dx11FsrBridge.autoload.txt";
+            std::ifstream ifs(g_module_dir / L"Dx11FsrBridge.autoload.txt");
+            std::string line;
+            if (std::getline(ifs, line))
             {
-                optiscaler_path_w.resize(static_cast<std::size_t>(wlen));
-                MultiByteToWideChar(CP_UTF8, 0, utf8_line.c_str(),
-                    static_cast<int>(utf8_line.size()), optiscaler_path_w.data(), wlen);
+                strip_utf8_bom(line);
+                trim_ascii(line);
+                const std::wstring legacy = utf8_to_wide(line);
+                if (!legacy.empty())
+                    chain.push_back(ChainStep { 0, legacy, looks_like_optiscaler(legacy) });
             }
-            if (!optiscaler_path_w.empty() && std::filesystem::exists(optiscaler_path_w))
+        }
+
+        if (!chain.empty())
+        {
+            // coexistence workaround：链里哪个是 OptiScaler，就记住它的兄弟 OptiScaler.ini
+            for (const ChainStep &step : chain)
             {
-                g_autoload_optiscaler_ini = std::filesystem::path(optiscaler_path_w).parent_path() / L"OptiScaler.ini";
-                LOG_INFO(blog::cat::core, "optiscaler_autoload scheduled path=" + narrow(optiscaler_path_w));
+                if (step.kind == 1 || !step.opti)
+                    continue;
+                g_autoload_optiscaler_ini = std::filesystem::path(step.text).parent_path() / L"OptiScaler.ini";
                 LOG_INFO(blog::cat::coexist, "optiscaler_autoload ini_candidate=" + narrow(g_autoload_optiscaler_ini.wstring()));
-                std::thread([path = std::move(optiscaler_path_w)]() {
+                break;
+            }
+
+            std::ostringstream parsed;
+            parsed << "chain_parsed source=" << chain_source << " steps=" << chain.size();
+            for (std::size_t i = 0; i < chain.size(); ++i)
+            {
+                parsed << " [" << i
+                       << (chain[i].kind == 1 ? "=wait:" : (chain[i].kind == 2 ? "=migoto:" : "=load:"))
+                       << narrow(chain[i].text) << "]";
+            }
+            LOG_INFO(blog::cat::core, parsed.str());
+
+            std::thread([steps = std::move(chain)]()
+            {
+                // 探针只在链里带 3DMigoto(GIMI) 时启用：日常配置（桥→Opti→ReShade）完全不注册
+                // VEH、不写探针文件，对反作弊的可见面保持为零。crash_probe::dump 在未安装时
+                // 自行空转，所以下面各步的 dump 调用无需再判断。
+                bool probe_migoto = false;
+                for (const ChainStep &step : steps)
+                {
+                    if (step.kind == 2)
+                    {
+                        probe_migoto = true;
+                        break;
+                    }
+                }
+                if (probe_migoto)
+                {
+                    crash_probe::install();
+                    crash_probe::dump("chain_start");
+                }
+                constexpr DWORD kChainWaitMs = 15000;
+                for (std::size_t i = 0; i < steps.size(); ++i)
+                {
+                    const ChainStep &step = steps[i];
+                    const std::string tag = "chain_step index=" + std::to_string(i);
                     try
                     {
-                        // The known-good v2.3.1 path loads OptiScaler immediately
-                        // after the Bridge has installed its GetProcAddress shim,
-                        // before the game creates its D3D device/swapchain. Delaying
-                        // until draw/FSR dispatch is too late (or deadlocks because
-                        // OptiScaler is part of the consumer path). The coexistence
-                        // workaround is now enabled independently from the autoload
-                        // path via g_autoload_optiscaler_ini.
-                        const HMODULE m = LoadLibraryW(path.c_str());
-                        if (m != nullptr)
-                            LOG_INFO(blog::cat::core, "optiscaler_autoload loaded base=" + hex64(reinterpret_cast<std::uintptr_t>(m)));
+                        if (step.kind == 1)
+                        {
+                            // 「wait swapchain」不是模块名，而是等桥自己看到交换链建出来
+                            // （g_chain_swapchain_seen，见 CreateSwapChainForHwnd 钩子）。
+                            if (_wcsicmp(step.text.c_str(), L"swapchain") == 0)
+                            {
+                                constexpr DWORD kChainSwapchainWaitMs = 45000;
+                                const ULONGLONG wait_began = GetTickCount64();
+                                while (!g_chain_swapchain_seen.load(std::memory_order_acquire) &&
+                                       GetTickCount64() - wait_began < kChainSwapchainWaitMs)
+                                {
+                                    Sleep(5);
+                                }
+                                const std::string waited = std::to_string(GetTickCount64() - wait_began);
+                                if (g_chain_swapchain_seen.load(std::memory_order_acquire))
+                                    LOG_INFO(blog::cat::core, tag + " wait_swapchain ok waited_ms=" + waited);
+                                else
+                                    LOG_WARN(blog::cat::core, tag + " wait_swapchain timeout waited_ms=" + waited + " continuing");
+                                continue;
+                            }
+                            const ULONGLONG began = GetTickCount64();
+                            bool present = GetModuleHandleW(step.text.c_str()) != nullptr;
+                            while (!present && GetTickCount64() - began < kChainWaitMs)
+                            {
+                                Sleep(5);
+                                present = GetModuleHandleW(step.text.c_str()) != nullptr;
+                            }
+                            const std::string waited = std::to_string(GetTickCount64() - began);
+                            if (present)
+                                LOG_INFO(blog::cat::core, tag + " wait_ok module=" + narrow(step.text) +
+                                    " waited_ms=" + waited);
+                            else
+                                LOG_WARN(blog::cat::core, tag + " wait_timeout module=" + narrow(step.text) +
+                                    " waited_ms=" + waited + " continuing");
+                            continue;
+                        }
+
+                        if (!std::filesystem::exists(step.text))
+                        {
+                            LOG_ERROR(blog::cat::core, tag + " path_not_found path=" + narrow(step.text));
+                            if (step.opti)
+                                LOG_ERROR(blog::cat::core, "optiscaler_autoload_failed gle=2");
+                            continue;
+                        }
+
+                        if (step.kind == 2)
+                        {
+                            // 3DMigoto 的 loader 身份标记：它靠这个互斥体判断 loader 在场。
+                            // 故意不 CloseHandle —— 进程活着期间它必须一直存在。
+                            // XXMI 自己注入时也建同一个名字，所以 already_exists 不是错误。
+                            static HANDLE s_migoto_loader_mutex =
+                                CreateMutexW(nullptr, FALSE, L"Local\\3DMigotoLoader");
+                            const DWORD mutex_error = GetLastError();
+                            LOG_INFO(blog::cat::core, tag + " migoto_mutex " +
+                                (s_migoto_loader_mutex == nullptr
+                                    ? ("failed gle=" + std::to_string(mutex_error))
+                                    : (mutex_error == ERROR_ALREADY_EXISTS
+                                        ? std::string("already_exists")
+                                        : std::string("created"))));
+                            // 真身 d3d11 已经进模块表 = 我们来晚了：3DMigoto 走不到
+                            // LoadLibraryExW 重定向，模型替换多半不生效。打出来，
+                            // 省得对着一张没换装的画面猜。
+                            if (GetModuleHandleW(L"d3d11.dll") != nullptr)
+                                LOG_WARN(blog::cat::core, tag + " d3d11_already_loaded_before_migoto");
+                        }
+
+                        crash_probe::dump(tag + (step.kind == 2 ? " before_migoto" : " before_load"));
+                        if (step.kind == 2)
+                            crash_probe::call_factory("before_migoto");
+                        const HMODULE loaded = LoadLibraryW(step.text.c_str());
+                        if (loaded != nullptr)
+                        {
+                            LOG_INFO(blog::cat::core, tag +
+                                (step.kind == 2 ? " migoto_loaded base=" : " loaded base=") +
+                                hex64(reinterpret_cast<std::uintptr_t>(loaded)) +
+                                " path=" + narrow(step.text));
+                            if (step.opti)
+                                LOG_INFO(blog::cat::core, "optiscaler_autoload loaded base=" +
+                                    hex64(reinterpret_cast<std::uintptr_t>(loaded)));
+                        }
                         else
-                            LOG_ERROR(blog::cat::core, "optiscaler_autoload_failed gle=" + std::to_string(GetLastError()));
+                        {
+                            const DWORD load_error = GetLastError();
+                            LOG_ERROR(blog::cat::core, tag +
+                                (step.kind == 2 ? " migoto_failed gle=" : " load_failed gle=") +
+                                std::to_string(load_error) + " path=" + narrow(step.text));
+                            if (step.opti)
+                                LOG_ERROR(blog::cat::core, "optiscaler_autoload_failed gle=" +
+                                    std::to_string(load_error));
+                        }
+                        crash_probe::dump(tag + (step.kind == 2 ? " after_migoto" : " after_load"));
+                        if (step.kind == 2)
+                        {
+                            crash_probe::chase_all(tag + " after_migoto");
+                            crash_probe::call_factory("after_migoto");
+                            crash_probe::call_device("after_migoto", loaded);
+                        }
                     }
                     catch (...)
                     {
-                        // LoadLibrary 失败不影响桥自身工作（Gen-2 兜底仍可用）
+                        // 单步异常不中断整条链（Gen-2 兜底仍可用）
+                        LOG_ERROR(blog::cat::core, tag + " exception");
                     }
-                }).detach();
-            }
-            else if (!optiscaler_path_w.empty())
-            {
-                LOG_WARN(blog::cat::core, "optiscaler_autoload path_not_found path=" + narrow(optiscaler_path_w));
-            }
+                }
+                LOG_INFO(blog::cat::core, "chain_done");
+            }).detach();
         }
     }
 }
@@ -14188,6 +15158,7 @@ void final_shutdown()
 {
     std::call_once(g_final_shutdown_once, []()
         {
+            DepthProvider::ClearDepth();
             blog::shutdown();
         });
 }

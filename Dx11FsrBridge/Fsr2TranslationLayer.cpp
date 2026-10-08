@@ -1,6 +1,7 @@
 ﻿#include <fsr2/ffx_fsr2.h>
 
 #include "Fsr2TranslationLayer.h"
+#include "SkinMaskProbe.h"
 
 #include <Windows.h>
 #include <d3dcompiler.h>
@@ -62,6 +63,7 @@ struct TranslationSession
     bool hdr10_pq_color = false;
     bool use_direct_linear_color = false;
     LARGE_INTEGER last_dispatch_counter {};
+    std::uint64_t diagnostic_frame = 0;
 };
 std::unordered_map<std::uint64_t, std::unique_ptr<TranslationSession>> g_sessions;
 TranslationSession *g_session = nullptr;
@@ -974,6 +976,24 @@ Fsr2TranslationOutcome dispatch_fsr2_translation(const Fsr2TranslationFrame &fra
     description.cameraFar = 6000.0f;
     description.cameraFovAngleVertical = 0.7853981634f;
     description.viewSpaceToMetersFactor = 1.0f;
+
+    if (skinprobe::enabled()) {
+        ID3D11Texture2D* diagnosticColor=g_session->prepared_color;
+        ID3D11Texture2D* directTexture=nullptr;
+        if(frame.use_direct_linear_color && direct_color_resource)
+            direct_color_resource->QueryInterface(IID_PPV_ARGS(&directTexture));
+        if(frame.use_direct_linear_color)diagnosticColor=directTexture;
+        skinprobe::Frame probe;
+        probe.context=frame.context;probe.color=diagnosticColor;probe.depth=frame.depth;
+        probe.width=frame.render_width;probe.height=frame.render_height;
+        probe.outputWidth=frame.output_width;probe.outputHeight=frame.output_height;
+        probe.jitterX=frame.jitter_x;probe.jitterY=frame.jitter_y;
+        probe.instance=frame.instance_key;probe.frame=++g_session->diagnostic_frame;
+        // prepare_inputs has already converted PQ to linear if needed.
+        probe.linear=true;probe.pq=false;
+        skinprobe::on_frame(probe);
+        safe_release(directTexture);
+    }
 
     const FfxErrorCode dispatch_result = g_translation_context_dispatch(&g_session->translation_context, &description);
     safe_release(direct_color_resource);

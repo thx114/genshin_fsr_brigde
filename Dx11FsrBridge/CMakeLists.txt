@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 # 版本号**单一事实源**（2026-09-19 审核报告）。
 # 改版本只改这里；`.rc` 通过下面生成的头读取，不再手写。
-project(Dx11FsrBridge VERSION 2.3.4.0 LANGUAGES C CXX RC)
+project(Dx11FsrBridge VERSION 2.3.5.0 LANGUAGES C CXX RC)
 
 # 生成版本头供 .rc 使用（生成到构建目录，避免污染源码树）。
 configure_file(
@@ -78,6 +78,11 @@ add_library(Dx11FsrBridge SHARED
     Il2CppCallSiteHook.cpp
     Ffx12Backend.cpp
     Fsr2InputDump.cpp
+    SkinMaskProbe.cpp
+    SkinGuideGpu.cpp
+    FaceGuideInterop.cpp
+    SkinMaterialEvidence.cpp
+    DepthProvider.cpp
 )
 
 # Gen-1 GetProcAddress shim（feat/restore-shim 分支恢复）。
@@ -282,4 +287,128 @@ if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)
 
     message(STATUS "Dx11FsrBridge: building Ffx12BackendTest "
         "(KNOWN ISSUE: crashes in ffxCreateContext under the isolated test harness)")
+endif()
+
+# Opt-in skin-mask diagnostics: do not change original FSR/NR bindings.
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(SkinMaskProbeTest SkinMaskProbeTest.cpp)
+    target_compile_features(SkinMaskProbeTest PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(SkinMaskProbeTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    add_test(NAME SkinMaskProbeMath COMMAND SkinMaskProbeTest)
+    add_executable(SkinMaskProbeGpuTest SkinMaskProbeGpuTest.cpp SkinMaskProbe.cpp SkinMaterialEvidence.cpp SkinGuideGpu.cpp FaceGuideInterop.cpp Fsr2InputDump.cpp BridgeLogger.cpp)
+    target_compile_features(SkinMaskProbeGpuTest PRIVATE cxx_std_20)
+    target_include_directories(SkinMaskProbeGpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+    target_compile_definitions(SkinMaskProbeGpuTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(MSVC)
+        target_compile_options(SkinMaskProbeGpuTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    target_link_libraries(SkinMaskProbeGpuTest PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME SkinMaskProbeGPU COMMAND SkinMaskProbeGpuTest)
+endif()
+
+# Diagnostic capture must catch allocation/filesystem/thread errors locally.
+if(MSVC)
+    set_source_files_properties(SkinMaskProbe.cpp SkinMaterialEvidence.cpp SkinGuideGpu.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME SkinMaskProbeReleaseEntry COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/SkinMaskProbeReleaseEntryTest.py")
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(SkinMaterialEvidenceTest SkinMaterialEvidenceTest.cpp SkinMaterialEvidence.cpp BridgeLogger.cpp)
+    target_compile_features(SkinMaterialEvidenceTest PRIVATE cxx_std_20)
+    target_compile_definitions(SkinMaterialEvidenceTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(MSVC)
+        target_compile_options(SkinMaterialEvidenceTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    target_link_libraries(SkinMaterialEvidenceTest PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME SkinMaterialEvidenceGPU COMMAND SkinMaterialEvidenceTest)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_test(NAME SkinMaterialEvidenceDDSDecode COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/SkinMaterialEvidencePreviewTest.py" "$<TARGET_FILE:SkinMaterialEvidenceTest>")
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_test(NAME SkinGBufferTypelessFloatMipGPU COMMAND SkinMaskProbeGpuTest 10 3)
+    add_test(NAME SkinGBufferTypelessUnormMipGPU COMMAND SkinMaskProbeGpuTest 11 3)
+    add_test(NAME SkinGBufferTypelessSnormMipGPU COMMAND SkinMaskProbeGpuTest 13 3)
+    add_test(NAME SkinGBufferTypelessFloat32MipGPU COMMAND SkinMaskProbeGpuTest 2 3)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(SkinGBufferFreshGpuTest SkinGBufferFreshGpuTest.cpp SkinMaskProbe.cpp SkinMaterialEvidence.cpp SkinGuideGpu.cpp FaceGuideInterop.cpp Fsr2InputDump.cpp BridgeLogger.cpp)
+    target_compile_features(SkinGBufferFreshGpuTest PRIVATE cxx_std_20)
+    target_compile_definitions(SkinGBufferFreshGpuTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(SkinGBufferFreshGpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+    if(MSVC)
+        target_compile_options(SkinGBufferFreshGpuTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    target_link_libraries(SkinGBufferFreshGpuTest PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME SkinGBufferFreshIntervalGPU COMMAND SkinGBufferFreshGpuTest)
+    add_test(NAME SkinGBufferMissingFreshGPU COMMAND SkinGBufferFreshGpuTest missing)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(SkinGuideGpuTest SkinGuideGpuTest.cpp SkinGuideGpu.cpp)
+    target_compile_features(SkinGuideGpuTest PRIVATE cxx_std_20)
+    target_compile_definitions(SkinGuideGpuTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(MSVC)
+        target_compile_options(SkinGuideGpuTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    target_link_libraries(SkinGuideGpuTest PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME SkinGuideGpuExactMask COMMAND SkinGuideGpuTest)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_test(NAME SkinGuideGpuProbeIntegration COMMAND SkinGBufferFreshGpuTest gpu)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(SkinShaderFamilyTest SkinShaderFamilyTest.cpp)
+    target_compile_features(SkinShaderFamilyTest PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(SkinShaderFamilyTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    add_test(NAME SkinShaderFamilyStructure COMMAND SkinShaderFamilyTest)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(SkinShaderAnalysisTest SkinShaderAnalysisTest.cpp SkinMaterialEvidence.cpp BridgeLogger.cpp)
+    target_compile_features(SkinShaderAnalysisTest PRIVATE cxx_std_20)
+    target_compile_definitions(SkinShaderAnalysisTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(MSVC)
+        target_compile_options(SkinShaderAnalysisTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    target_link_libraries(SkinShaderAnalysisTest PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME SkinShaderFamilyCPUWorker COMMAND SkinShaderAnalysisTest)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_test(NAME SkinMaterialBC23Decoder COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/SkinMaterialEvidenceDecoderTest.py")
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(SkinFaceProbeGpuTest SkinFaceProbeGpuTest.cpp SkinMaskProbe.cpp SkinMaterialEvidence.cpp SkinGuideGpu.cpp FaceGuideInterop.cpp Fsr2InputDump.cpp BridgeLogger.cpp)
+    target_compile_features(SkinFaceProbeGpuTest PRIVATE cxx_std_20)
+    target_compile_definitions(SkinFaceProbeGpuTest PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(SkinFaceProbeGpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+    if(MSVC)
+        target_compile_options(SkinFaceProbeGpuTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    target_link_libraries(SkinFaceProbeGpuTest PRIVATE d3d11 dxgi d3dcompiler)
+    add_test(NAME FaceOnlyNativeDrawGPU COMMAND SkinFaceProbeGpuTest)
+endif()
+
+if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(FaceGuideInteropTest FaceGuideInteropTest.cpp FaceGuideInterop.cpp)
+    target_compile_features(FaceGuideInteropTest PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(FaceGuideInteropTest PRIVATE /utf-8 /W4 /EHsc)
+    endif()
+    add_test(NAME FaceGuideInteropABI COMMAND FaceGuideInteropTest)
 endif()

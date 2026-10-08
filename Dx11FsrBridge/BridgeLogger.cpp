@@ -201,6 +201,15 @@ void writer_loop()
             {
                 g_file << line << "\n";
                 g_bytes_written += line.size() + 1;
+                // 存活面包屑立刻落盘。正常运行时这里只靠 ofstream 自身缓冲、退出时才 flush，
+                // 于是一局活不到 4KB 缓冲写满就崩的游戏（比如 GIMI 装钩子引发的 0xC0000005）
+                // 会留下 0 字节日志 —— 而"链走到哪一步、3DMigoto 有没有接受这次加载"
+                // （chain_* / migoto_* 行）恰恰只在崩溃局里才最需要看到。
+                // 只对这几行 flush，不影响其余日志的批量写入。crash/prologue 是探针
+                // 镜像到日志的那一份（探针本体已同步落盘，这里只为日志里也能对照）。
+                if (line.find("chain_") != std::string::npos || line.find("migoto") != std::string::npos ||
+                    line.find("crash ") != std::string::npos || line.find("prologue ") != std::string::npos)
+                    g_file.flush();
                 rotate_locked();
             }
         }
