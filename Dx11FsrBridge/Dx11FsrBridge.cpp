@@ -715,25 +715,18 @@ static std::string resolve_backend_auto(std::uint32_t vendor, std::uint32_t devi
                                         bool &want_ngx_out, bool &resolved_out);
 static void apply_backend_auto_result(bool want_ngx, const std::string &note);
 static void route_from_d3d11_device(ID3D11Device *d3d11_device);
-// P1 单实例接管的**生效值**：ini 取值，或后端强制。
-// 为什么 NGX 必须强制（2026-11-13 代码审计）：NGX 的 feature 与资源池是**全局唯一实例**
-// （NgxBackend.cpp 的 `NgxInstance g_inst`，v8 起不再是 map + LRU），只支持一条流水线。
-// 全量接管 + 两路视图交替派发时：尺寸/格式不同 ⇒ 每次 instance_key 变化都
-// destroy_instance() + create_instance()；尺寸格式全等 ⇒ 走跨 key 复用，但每帧把
-// g_inst.first 置 true 复位时域（那里的原话：否则两个视图的时域累积互相污染）。
-// 两种都不可能两路同时正常出图 ⇒ 本键对 NGX 后端无效，一律只接管一个实例。
+// 2026-11-14：接管范围遵从现有配置，不再因 NGX 后端覆盖用户选择。
+// 这里只恢复配置控制；单个 NGX feature 仍在跨视图切换时 Reset 或重建，
+// 不能据此认为两个视图拥有独立的时域历史。实际游戏切换效果待验收。
 static bool single_instance_takeover_effective()
 {
-    return g_config.ffx12_single_instance || ffx12::backend() == ffx12::BackendKind::Ngx;
+    return g_config.ffx12_single_instance;
 }
 
-// 后端选择行（`ngx_core backend=…`）的单实例状态后缀：只在「ini 写 0 却被强制」时出现，
-// 让日志里的**配置值**与**生效值**能分开读（AGENTS.md §五.6 日志口径自洽）。
+// 生效值与配置值一致，不再输出 single_instance=forced。
 static std::string single_instance_log_suffix()
 {
-    return (!g_config.ffx12_single_instance && ffx12::backend() == ffx12::BackendKind::Ngx)
-        ? " single_instance=forced"
-        : "";
+    return "";
 }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 std::mutex g_ps_trace_mutex;
