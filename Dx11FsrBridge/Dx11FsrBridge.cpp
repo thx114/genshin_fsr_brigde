@@ -15079,10 +15079,28 @@ void install_factory_hooks_from_device(ID3D11Device *device)
 
 void observe_created_device(ID3D11Device *device, ID3D11DeviceContext *context)
 {
+    // 2026-11-15：真实 WARP device-only 负控证实，创建时省略 context 输出会
+    // 漏装所有绘制捕获。这里只补全成功返回对象所属的配对，不改变调用者输出。
+    ID3D11Device *owned_device = nullptr;
+    ID3D11DeviceContext *owned_context = nullptr;
+    if (!device && context)
+    {
+        context->GetDevice(&owned_device);
+        device = owned_device;
+    }
+    if (!context && device)
+    {
+        device->GetImmediateContext(&owned_context);
+        context = owned_context;
+    }
     install_device_hooks(device);
     install_factory_hooks_from_device(device);
     install_context_hooks(context);
     route_from_d3d11_device(device);
+    if (owned_context)
+        owned_context->Release();
+    if (owned_device)
+        owned_device->Release();
 }
 
 HRESULT WINAPI hooked_create_device_and_swapchain(

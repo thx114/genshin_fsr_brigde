@@ -25,6 +25,10 @@
 - **不加载 ReShade 的新局启动验收**：真实 WARP／硬件宿主已覆盖 `GetFeatureLevel` 对运行时私有
   槽的转发，`ComVtableMethods.h` 保留原表并仅补丁公开方法。游戏启动、GIMI 模组和画面仍需新局
   验证，绑定实际模块身份与同局日志；离线设备调用通过不能代替游戏验收。
+- **桥与 OptiScaler 共同加载时的 DLSS 输入识别**：用户报告不加载 ReShade 时未检测到 DLSS。
+  `observe_created_device` 已补齐创建调用未显式返回的配对设备或 immediate context；真实 WARP／
+  硬件绘制可识别 FSR 候选，旧桥在 device-only 负控中仍能正常绘制但未捕获候选。该缺口是否为
+  游戏问题的根因仍待同局桥日志及 NGX 调用证据确认，不能将候选识别等同于 DLSS 派发成功。
 
 > **2026-11-12 补充（不修改上方原文）**
 >

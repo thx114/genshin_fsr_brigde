@@ -388,11 +388,14 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         target_link_libraries(CreateRouteImports${importer} PRIVATE CreateRouteProviderFirst)
     endforeach()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
+    target_link_libraries(CreateRouteIntegrationTest PRIVATE d3dcompiler)
     fsrbridge_configure_test(CreateRouteIntegrationTest)
     target_compile_definitions(CreateRouteIntegrationTest PRIVATE
         DX11FSRBRIDGE_TEST_NGX=$<BOOL:${DX11FSRBRIDGE_ENABLE_NGX}>)
     foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4
-        resize-routing resize-routing-reversed warp hardware wrapping-boundary wrapping-boundary-combined wrapping-boundary-retry)
+        resize-routing resize-routing-reversed warp hardware warp-device-only hardware-device-only
+        warp-context-only hardware-context-only warp-combined-device-only hardware-combined-device-only
+        wrapping-boundary wrapping-boundary-combined wrapping-boundary-retry)
         add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest
             "$<TARGET_FILE:Dx11FsrBridge>"
             "$<TARGET_FILE:CreateRouteProviderFirst>" "$<TARGET_FILE:CreateRouteProviderSecond>"

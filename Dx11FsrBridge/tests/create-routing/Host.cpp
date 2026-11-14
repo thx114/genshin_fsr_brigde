@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include "DrawCapture.h"
 
 namespace
 {
@@ -13,6 +14,14 @@ namespace
 // 交换链应保留原方法；ON 构型仍须检查生产 DLL 确实接管，而非只验证透传结果。
 constexpr bool k_ngx_swapchain_hooks = DX11FSRBRIDGE_TEST_NGX != 0;
 int failures = 0;
+HANDLE capture_receipt = nullptr;
+
+void WINAPI capture_debug_line(LPCSTR line)
+{
+    if (std::strstr(line, "fsr2_translation_candidate render=64x64 output=128x128"))
+        SetEvent(capture_receipt);
+}
+
 void expect(bool condition, const char *what)
 {
     std::printf("%s: %s\n", condition ? "PASS" : "FAIL", what);
@@ -20,7 +29,7 @@ void expect(bool condition, const char *what)
 }
 
 // 给两个真实 PE 导入表设置不同提供者，模拟第三方 loader 已建立的两层调用。
-bool set_import(HMODULE module, const char *name, FARPROC target)
+bool set_import(HMODULE module, const char *name, FARPROC target, const char *library = "d3d11.dll")
 {
     auto *base = reinterpret_cast<unsigned char *>(module);
     auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
@@ -29,7 +38,7 @@ bool set_import(HMODULE module, const char *name, FARPROC target)
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
     for (; descriptor->Name; ++descriptor)
     {
-        if (_stricmp(reinterpret_cast<char *>(base + descriptor->Name), "d3d11.dll") != 0)
+        if (library && _stricmp(reinterpret_cast<char *>(base + descriptor->Name), library) != 0)
             continue;
         auto *names = reinterpret_cast<IMAGE_THUNK_DATA *>(base + descriptor->OriginalFirstThunk);
         auto *slots = reinterpret_cast<IMAGE_THUNK_DATA *>(base + descriptor->FirstThunk);
@@ -98,6 +107,10 @@ int wmain(int argc, wchar_t **argv)
         return EXCEPTION_EXECUTE_HANDLER;
     });
     const std::wstring mode = argv[6];
+    const bool device_only = mode.ends_with(L"device-only");
+    const bool context_only = mode.ends_with(L"context-only");
+    const bool real_combined = mode.find(L"combined") != std::wstring::npos;
+    const bool real_device = mode.starts_with(L"warp") || mode.starts_with(L"hardware");
     const bool resize_routing = mode == L"resize-routing" || mode == L"resize-routing-reversed";
     const bool hdr_swapchain = mode == L"swapchain4" || resize_routing;
     const bool swapchain_mode = mode == L"swapchain" || hdr_swapchain;
@@ -149,10 +162,20 @@ int wmain(int argc, wchar_t **argv)
     const auto bridge_path = run / L"Dx11FsrBridge.dll";
     std::filesystem::copy_file(argv[1], bridge_path, std::filesystem::copy_options::overwrite_existing);
     std::ofstream(run / L"Dx11FsrBridge.ini") <<
-        "[Dx11FsrBridge]\nEnabled=1\nTransparentJitter=0\nFsr2Il2CppHook=0\nRenderScaleMenu=0\nFfx12Backend=ngx\n";
+        "[Dx11FsrBridge]\nEnabled=1\nTransparentJitter=0\nFsr2Il2CppHook=0\nRenderScaleMenu=0\nFfx12Backend=ngx\n"
+        "[Log]\nto_debugger=1\n";
     const HMODULE bridge = LoadLibraryW(bridge_path.c_str());
     if (!bridge)
         return 6;
+    if (real_device)
+    {
+        // 2026-11-15：文件流可一直缓冲到退出；在隔离进程的既有调试sink上
+        // 等生产消息回执，不能把ExitProcess或固定延时当作日志队列已排空。
+        capture_receipt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!capture_receipt || !set_import(bridge, "OutputDebugStringA",
+            reinterpret_cast<FARPROC>(&capture_debug_line), nullptr))
+            return 12;
+    }
 
     // 反向查询第二提供者，不能让查询顺序或 IAT 首次绑定决定 original。
     const auto device2 = GetProcAddress(second, names[0]);
@@ -250,7 +273,7 @@ int wmain(int argc, wchar_t **argv)
                 expect(chain->ResizeTarget(&target) == E_ABORT,
                     "interleaved ResizeTarget retains matching receiver, layout and original");
     }
-    else if (mode == L"warp" || mode == L"hardware")
+    else if (real_device)
     {
         wchar_t system[MAX_PATH] {};
         GetSystemDirectoryW(system, MAX_PATH);
@@ -261,8 +284,34 @@ int wmain(int argc, wchar_t **argv)
         {
             ID3D11Device *device = nullptr;
             ID3D11DeviceContext *context = nullptr;
-            const HRESULT created = create(nullptr, mode == L"hardware" ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
-                D3D11_SDK_VERSION, &device, nullptr, &context);
+            const auto driver = mode.starts_with(L"hardware") ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP;
+            IDXGISwapChain *chain = nullptr;
+            HWND window = nullptr;
+            HRESULT created = E_FAIL;
+            if (real_combined)
+            {
+                window = CreateWindowExW(0, L"STATIC", L"FSR bridge isolated draw test", WS_POPUP,
+                    0, 0, 128, 128, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+                DXGI_SWAP_CHAIN_DESC desc {};
+                desc.BufferDesc.Width = desc.BufferDesc.Height = 128;
+                desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                desc.SampleDesc.Count = desc.BufferCount = 1;
+                desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                desc.OutputWindow = window;
+                desc.Windowed = TRUE;
+                const auto combined = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(GetProcAddress(runtime, names[1]));
+                expect(belongs_to(bridge, reinterpret_cast<void *>(combined)),
+                    "system combined creation actually enters bridge");
+                created = combined(nullptr, driver, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                    &desc, &chain, &device, nullptr, nullptr);
+            }
+            else
+                created = create(nullptr, driver, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                    context_only ? nullptr : &device, nullptr, device_only ? nullptr : &context);
+            if (SUCCEEDED(created) && context && context_only)
+                context->GetDevice(&device);
+            if (SUCCEEDED(created) && device && device_only)
+                device->GetImmediateContext(&context);
             expect(SUCCEEDED(created) && device && context, "real WARP device and context returned");
             if (FAILED(created) || !device || !context)
                 return 8;
@@ -271,6 +320,7 @@ int wmain(int argc, wchar_t **argv)
             const auto level = device->GetFeatureLevel();
             expect(level >= D3D_FEATURE_LEVEL_11_0, "real GetFeatureLevel preserves runtime private dispatch");
             expect(SUCCEEDED(device->GetDeviceRemovedReason()), "real device status remains callable");
+            expect(draw_capture(device, context), "real shaders draw both outputs and preserve exact pixels");
             ID3D11DeviceContext *fetched = nullptr;
             device->GetImmediateContext(&fetched);
             expect(fetched != nullptr, "real GetImmediateContext remains callable");
@@ -305,6 +355,8 @@ int wmain(int argc, wchar_t **argv)
             }
             readback->Release();
             source->Release();
+            if (chain) chain->Release();
+            if (window) DestroyWindow(window);
             // 保留至进程退出，避免旧桥本身未退休的实例地址重用干扰本回归。
         }
     }
@@ -408,6 +460,11 @@ int wmain(int argc, wchar_t **argv)
         for (const HMODULE provider : {first, second})
             expect(reinterpret_cast<unsigned(WINAPI *)()>(GetProcAddress(provider, "GetFactoryCalls"))() == 2,
                 "each real factory called exactly twice");
+    }
+    if (real_device)
+    {
+        expect(WaitForSingleObject(capture_receipt, 5000) == WAIT_OBJECT_0,
+            "real Draw reached the production FSR signature capture before process exit");
     }
     std::printf("production DLL routing: %d failures\n", failures);
     std::fflush(stdout);
