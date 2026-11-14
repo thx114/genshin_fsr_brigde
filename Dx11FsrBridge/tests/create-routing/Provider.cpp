@@ -13,6 +13,7 @@ bool successful = false;
 bool extended_context = false;
 bool successful_swapchain = false;
 bool hdr_swapchain = false;
+bool return_wrapper_chain = false;
 struct Device
 {
     void **vtable;
@@ -28,13 +29,38 @@ Device adapter_object { adapter_methods };
 void *factory_methods[40] {};
 Device factory_object { factory_methods };
 void *swapchain_methods[41] {};
-Device swapchain_object { swapchain_methods };
+void *wrapper_methods[41] {};
+unsigned native_layout_tag = 0;
+unsigned operations_layout_tag = 0;
+struct NativeSwapchain
+{
+    void **vtable;
+    const void *original;
+};
+struct WrappedSwapchain
+{
+    void **vtable;
+    const void *operations;
+    unsigned marker;
+};
+NativeSwapchain swapchain_object { swapchain_methods, &native_layout_tag };
+WrappedSwapchain wrapper_object { wrapper_methods, &operations_layout_tag, 42 };
 std::atomic<unsigned> wrong_this {};
 std::atomic<unsigned> draws {};
 std::atomic<unsigned> factory_calls {};
 
 void STDMETHODCALLTYPE unused() {}
 ULONG STDMETHODCALLTYPE release(void *) { return 1; }
+
+bool is_swapchain(void *object)
+{
+    return object == &swapchain_object || object == &wrapper_object;
+}
+
+void *selected_swapchain()
+{
+    return return_wrapper_chain ? static_cast<void *>(&wrapper_object) : static_cast<void *>(&swapchain_object);
+}
 
 HRESULT STDMETHODCALLTYPE query_interface(void *object, REFIID iid, void **output)
 {
@@ -50,10 +76,10 @@ HRESULT STDMETHODCALLTYPE query_interface(void *object, REFIID iid, void **outpu
         *output = &factory_object;
         return S_OK;
     }
-    if (object == &swapchain_object && output &&
+    if (is_swapchain(object) && output &&
         (iid == __uuidof(IDXGISwapChain3) || (iid == __uuidof(IDXGISwapChain4) && hdr_swapchain)))
     {
-        *output = &swapchain_object;
+        *output = object;
         return S_OK;
     }
     if (object == &context_object && output)
@@ -105,7 +131,7 @@ HRESULT STDMETHODCALLTYPE create_swapchain(void *object, IUnknown *, DXGI_SWAP_C
     ++factory_calls;
     if (successful_swapchain && output && object == &factory_object)
     {
-        *output = reinterpret_cast<IDXGISwapChain *>(&swapchain_object);
+        *output = reinterpret_cast<IDXGISwapChain *>(selected_swapchain());
         return S_OK;
     }
     return object == &factory_object ? static_cast<HRESULT>(FIXTURE_RESULT) : E_UNEXPECTED;
@@ -117,7 +143,7 @@ HRESULT STDMETHODCALLTYPE create_hwnd(void *object, IUnknown *, HWND, const DXGI
     ++factory_calls;
     if (successful_swapchain && output && object == &factory_object)
     {
-        *output = reinterpret_cast<IDXGISwapChain1 *>(&swapchain_object);
+        *output = reinterpret_cast<IDXGISwapChain1 *>(selected_swapchain());
         return S_OK;
     }
     return object == &factory_object ? static_cast<HRESULT>(FIXTURE_RESULT) : E_UNEXPECTED;
@@ -135,12 +161,30 @@ HRESULT STDMETHODCALLTYPE swapchain_desc(void *, DXGI_SWAP_CHAIN_DESC *desc)
 HRESULT STDMETHODCALLTYPE resize_tail(void *object, UINT, UINT, UINT, DXGI_FORMAT, UINT,
     const UINT *, IUnknown *const *)
 {
-    return object == &swapchain_object ? static_cast<HRESULT>(FIXTURE_RESULT) : E_UNEXPECTED;
+    return is_swapchain(object) ? static_cast<HRESULT>(FIXTURE_RESULT) : E_UNEXPECTED;
+}
+
+HRESULT STDMETHODCALLTYPE native_resize_target(void *object, const DXGI_MODE_DESC *target)
+{
+    // 把跨布局的错误 this 转为可观察失败，避免负控在解引用错误布局前崩溃。
+    if (object != &swapchain_object || !target || target->Width != 640 || target->Height != 360)
+        return E_UNEXPECTED;
+    return static_cast<NativeSwapchain *>(object)->original == &native_layout_tag
+        ? static_cast<HRESULT>(FIXTURE_RESULT) : E_UNEXPECTED;
+}
+
+HRESULT STDMETHODCALLTYPE wrapper_resize_target(void *object, const DXGI_MODE_DESC *target)
+{
+    if (object != &wrapper_object || !target || target->Width != 640 || target->Height != 360)
+        return E_UNEXPECTED;
+    const auto *wrapper = static_cast<WrappedSwapchain *>(object);
+    return wrapper->operations == &operations_layout_tag && wrapper->marker == 42
+        ? static_cast<HRESULT>(FIXTURE_RESULT) : E_UNEXPECTED;
 }
 
 HRESULT STDMETHODCALLTYPE set_hdr_metadata(void *object, DXGI_HDR_METADATA_TYPE type, UINT size, void *metadata)
 {
-    return object == &swapchain_object && type == DXGI_HDR_METADATA_TYPE_NONE && size == 0 && metadata == nullptr
+    return is_swapchain(object) && type == DXGI_HDR_METADATA_TYPE_NONE && size == 0 && metadata == nullptr
         ? static_cast<HRESULT>(FIXTURE_RESULT) : E_UNEXPECTED;
 }
 
@@ -192,8 +236,16 @@ extern "C" __declspec(dllexport) void WINAPI SetSuccess(BOOL enabled)
     swapchain_methods[0] = reinterpret_cast<void *>(&query_interface);
     swapchain_methods[2] = reinterpret_cast<void *>(&release);
     swapchain_methods[12] = reinterpret_cast<void *>(&swapchain_desc);
+    swapchain_methods[14] = reinterpret_cast<void *>(&native_resize_target);
     swapchain_methods[39] = reinterpret_cast<void *>(&resize_tail);
     swapchain_methods[40] = reinterpret_cast<void *>(&set_hdr_metadata);
+    std::memcpy(wrapper_methods, swapchain_methods, sizeof(wrapper_methods));
+    wrapper_methods[14] = reinterpret_cast<void *>(&wrapper_resize_target);
+}
+
+extern "C" __declspec(dllexport) void WINAPI SetWrapperChain(BOOL enabled)
+{
+    return_wrapper_chain = enabled != FALSE;
 }
 
 extern "C" __declspec(dllexport) void WINAPI SetSwapchain(BOOL enabled)
@@ -231,6 +283,7 @@ extern "C" __declspec(dllexport) void WINAPI GuardTables()
     context_object.vtable = guarded_table(context_methods, extended_context ? 149 : 115);
     factory_object.vtable = guarded_table(factory_methods, 25);
     swapchain_object.vtable = guarded_table(swapchain_methods, hdr_swapchain ? 41 : 40);
+    wrapper_object.vtable = guarded_table(wrapper_methods, hdr_swapchain ? 41 : 40);
 }
 
 extern "C" __declspec(dllexport) unsigned WINAPI GetWrongThis() { return wrong_this.load(); }

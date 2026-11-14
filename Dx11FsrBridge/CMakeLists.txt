@@ -376,6 +376,7 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     foreach(provider IN ITEMS First Second)
         add_library(CreateRouteProvider${provider} SHARED
             tests/create-routing/Provider.cpp tests/create-routing/Provider.def)
+        fsrbridge_configure_test(CreateRouteProvider${provider})
         set_target_properties(CreateRouteProvider${provider} PROPERTIES OUTPUT_NAME d3d11
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/create-routing/${provider}"
             ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/create-routing/${provider}")
@@ -388,7 +389,8 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     endforeach()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
     fsrbridge_configure_test(CreateRouteIntegrationTest)
-    foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4 warp)
+    foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4
+        resize-routing resize-routing-reversed warp)
         add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest
             "$<TARGET_FILE:Dx11FsrBridge>"
             "$<TARGET_FILE:CreateRouteProviderFirst>" "$<TARGET_FILE:CreateRouteProviderSecond>"

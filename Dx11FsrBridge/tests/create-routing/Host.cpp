@@ -96,7 +96,8 @@ int wmain(int argc, wchar_t **argv)
     });
     const std::wstring mode = argv[6];
     const bool nested = mode == L"nested" || mode == L"nested-success";
-    const bool hdr_swapchain = mode == L"swapchain4";
+    const bool resize_routing = mode == L"resize-routing" || mode == L"resize-routing-reversed";
+    const bool hdr_swapchain = mode == L"swapchain4" || resize_routing;
     const bool swapchain_mode = mode == L"swapchain" || hdr_swapchain;
     const bool success = mode == L"success" || mode == L"nested-success" || swapchain_mode;
     const HMODULE first = LoadLibraryW(argv[2]);
@@ -127,7 +128,10 @@ int wmain(int argc, wchar_t **argv)
             reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetExtended"))(nested);
             reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetSwapchain"))(swapchain_mode);
             reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetHdrSwapchain"))(hdr_swapchain);
-            reinterpret_cast<void(WINAPI *)()>(GetProcAddress(provider, "GuardTables"))();
+            // 错配专项也运行旧 DLL 负控，保留旧版本所读的额外 backing 槽。
+            // 精确页边界继续由其余成功路径用例独立覆盖。
+            if (!resize_routing)
+                reinterpret_cast<void(WINAPI *)()>(GetProcAddress(provider, "GuardTables"))();
         }
     }
 
@@ -154,7 +158,45 @@ int wmain(int argc, wchar_t **argv)
         belongs_to(bridge, reinterpret_cast<void *>(device2)) &&
         belongs_to(bridge, reinterpret_cast<void *>(combined1)) &&
         belongs_to(bridge, reinterpret_cast<void *>(combined2)), "both creation APIs actually enter production bridge");
-    if (mode == L"warp")
+    if (resize_routing)
+    {
+        ID3D11Device *device = nullptr;
+        expect(call_device(device1, &device) == S_OK && device, "single provider creates device");
+        if (!device)
+            return 12;
+        IDXGIDevice *dxgi = nullptr;
+        IDXGIAdapter *adapter = nullptr;
+        IDXGIFactory2 *factory = nullptr;
+        if (FAILED(device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi))) ||
+            FAILED(dxgi->GetAdapter(&adapter)) ||
+            FAILED(adapter->GetParent(__uuidof(IDXGIFactory2), reinterpret_cast<void **>(&factory))))
+            return 13;
+        const auto select_wrapper = reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(first, "SetWrapperChain"));
+        const bool reversed = mode == L"resize-routing-reversed";
+        IDXGISwapChain1 *chains[2] {};
+        DXGI_SWAP_CHAIN_DESC1 desc {};
+        desc.Width = 640;
+        desc.Height = 360;
+        for (unsigned i = 0; i < 2; ++i)
+        {
+            select_wrapper(reversed ? i == 0 : i != 0);
+            expect(SUCCEEDED(factory->CreateSwapChainForHwnd(device, nullptr, &desc, nullptr, nullptr, &chains[i])) &&
+                chains[i], "factory returns distinct-layout swapchain");
+            if (!chains[i])
+                return 14;
+            expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chains[i]))[14]),
+                "each ResizeTarget actually enters production bridge");
+        }
+        expect(chains[0] != chains[1], "two live swapchains have distinct receiver identities");
+        DXGI_MODE_DESC target {};
+        target.Width = 640;
+        target.Height = 360;
+        for (unsigned pass = 0; pass < 2; ++pass)
+            for (auto *chain : chains)
+                expect(chain->ResizeTarget(&target) == E_ABORT,
+                    "interleaved ResizeTarget retains matching receiver, layout and original");
+    }
+    else if (mode == L"warp")
     {
         wchar_t system[MAX_PATH] {};
         GetSystemDirectoryW(system, MAX_PATH);
