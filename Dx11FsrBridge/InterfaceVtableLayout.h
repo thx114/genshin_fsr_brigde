@@ -17,7 +17,7 @@ bool same_address(IUnknown *object)
     return same;
 }
 
-// SDK 的完整继承槽数；只把同址扩展接口的尾部保留在当前对象的克隆表中。
+// SDK 公开继承槽数只用于补丁索引边界；runtime 可能有公开接口之外的私有槽。
 inline std::size_t device(ID3D11Device *object, std::size_t minimum = 43)
 {
     if (same_address<ID3D11Device5>(object)) return 69;

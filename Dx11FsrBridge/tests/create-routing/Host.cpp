@@ -250,7 +250,7 @@ int wmain(int argc, wchar_t **argv)
                 expect(chain->ResizeTarget(&target) == E_ABORT,
                     "interleaved ResizeTarget retains matching receiver, layout and original");
     }
-    else if (mode == L"warp")
+    else if (mode == L"warp" || mode == L"hardware")
     {
         wchar_t system[MAX_PATH] {};
         GetSystemDirectoryW(system, MAX_PATH);
@@ -261,13 +261,21 @@ int wmain(int argc, wchar_t **argv)
         {
             ID3D11Device *device = nullptr;
             ID3D11DeviceContext *context = nullptr;
-            const HRESULT created = create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+            const HRESULT created = create(nullptr, mode == L"hardware" ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
                 D3D11_SDK_VERSION, &device, nullptr, &context);
             expect(SUCCEEDED(created) && device && context, "real WARP device and context returned");
             if (FAILED(created) || !device || !context)
                 return 8;
             expect(belongs_to(bridge, (*reinterpret_cast<void ***>(device))[3]) &&
                 belongs_to(bridge, (*reinterpret_cast<void ***>(context))[47]), "real device/context methods enter bridge");
+            const auto level = device->GetFeatureLevel();
+            expect(level >= D3D_FEATURE_LEVEL_11_0, "real GetFeatureLevel preserves runtime private dispatch");
+            expect(SUCCEEDED(device->GetDeviceRemovedReason()), "real device status remains callable");
+            ID3D11DeviceContext *fetched = nullptr;
+            device->GetImmediateContext(&fetched);
+            expect(fetched != nullptr, "real GetImmediateContext remains callable");
+            if (fetched)
+                fetched->Release();
             unsigned data[16] {};
             for (unsigned i = 0; i < 16; ++i)
                 data[i] = 0x12345678 + i + round;
@@ -378,7 +386,7 @@ int wmain(int argc, wchar_t **argv)
                 expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chain3))[13]) == k_ngx_swapchain_hooks,
                     "SwapChain3 hook presence matches the compiled backend");
                 expect(chain3->ResizeBuffers1(2, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, 0,
-                    nullptr, nullptr) == expected, "SwapChain3 final slot39 survives full-table clone");
+                    nullptr, nullptr) == expected, "SwapChain3 final slot39 retains exact provider routing");
                 if (hdr_swapchain)
                 {
                     IDXGISwapChain4 *chain4 = nullptr;

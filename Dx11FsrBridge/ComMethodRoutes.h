@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CreateFunctionRoutes.h"
+#include "D3D11CreationScope.h"
 #include <d3d11.h>
 #include <type_traits>
 
@@ -43,6 +44,9 @@ class ComMethodRoutes<Result(STDMETHODCALLTYPE *)(Object *, Args...), Observe, M
             Frame *previous;
             ~Restore() { active_ = previous; }
         } restore { frame.previous };
+        // 共享 runtime 表会被后续新设备继承；包装器构造尚未结束时只转发。
+        if (D3D11CreationScope::active())
+            return frame.original(object, args...);
         if constexpr (std::is_same_v<Object, ID3D11DeviceContext>)
             if (context_policy_bypass != 0)
                 return frame.original(object, args...);

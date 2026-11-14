@@ -13,6 +13,7 @@
 #include "RenderScaleMenu.h"
 #include "CreateFunctionRoutes.h"
 #include "ComMethodRoutes.h"
+#include "ComVtableMethods.h"
 #include "InterfaceVtableLayout.h"
 #include "D3D11CreationScope.h"
 #include "Fsr2FamilyTakeover.h"
@@ -1198,8 +1199,6 @@ std::mutex g_fsr2_color_diagnostics_mutex;
 std::string g_last_fsr2_color_diagnostics;
 #endif
 
-std::mutex g_vtable_mutex;
-std::unordered_map<void *, void **> g_cloned_vtables;
 std::mutex g_context_device_hook_mutex;
 std::unordered_set<std::uint64_t> g_context_device_hooks;
 std::atomic_uint32_t g_native_ldr_final_target_candidate_count { 0 };
@@ -6283,36 +6282,9 @@ void install_loader_hooks_for_loaded_modules()
         LOG_INFO(blog::cat::core, summary);
 }
 
-bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std::vector<std::pair<std::size_t, void *>> &patches)
+bool patch_vtable_methods(void *instance, std::size_t method_count, const std::vector<std::pair<std::size_t, void *>> &patches)
 {
-    if (instance == nullptr)
-        return false;
-
-    std::lock_guard lock(g_vtable_mutex);
-    if (g_cloned_vtables.contains(instance))
-        return true;
-
-    void ***object = reinterpret_cast<void ***>(instance);
-    void **source = *object;
-    void **clone = reinterpret_cast<void **>(VirtualAlloc(nullptr, sizeof(void *) * method_count, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (clone == nullptr)
-        return false;
-
-    std::memcpy(clone, source, sizeof(void *) * method_count);
-    for (const auto &[index, value] : patches)
-    {
-        void *entry = bind_com_method(value, source[index]);
-        if (entry == nullptr)
-        {
-            VirtualFree(clone, 0, MEM_RELEASE);
-            return false;
-        }
-        clone[index] = entry;
-    }
-
-    *object = clone;
-    g_cloned_vtables[instance] = clone;
-    return true;
+    return com_vtable::patch(instance, method_count, patches, bind_com_method);
 }
 
 std::size_t context_vtable_size(ID3D11DeviceContext *context)
@@ -14577,7 +14549,7 @@ void install_context_hooks(ID3D11DeviceContext *context)
         { k_idx_clear_dsv, reinterpret_cast<void *>(&hooked_clear_dsv) },
     });
 #endif
-    clone_and_patch_vtable(context, context_vtable_size(context), patches);
+    patch_vtable_methods(context, context_vtable_size(context), patches);
 }
 
 HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer)
@@ -14795,7 +14767,7 @@ bool install_device_hooks(ID3D11Device *device)
         { k_idx_device_create_compute_shader, reinterpret_cast<void *>(&hooked_create_compute_shader) },
     });
 #endif
-    bool installed = clone_and_patch_vtable(device, interface_layout::device(device), patches);
+    bool installed = patch_vtable_methods(device, interface_layout::device(device), patches);
 
     if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
     {
@@ -14808,7 +14780,7 @@ bool install_device_hooks(ID3D11Device *device)
             if (FAILED(device->QueryInterface(interface_id, reinterpret_cast<void **>(&extended))) || extended == nullptr)
                 return;
             const auto interface_key = reinterpret_cast<std::uint64_t>(extended);
-            const bool extended_installed = clone_and_patch_vtable(extended, interface_layout::device(
+            const bool extended_installed = patch_vtable_methods(extended, interface_layout::device(
                 reinterpret_cast<ID3D11Device *>(extended), minimum), texture_patches);
             installed = extended_installed && installed;
             LOG_DEBUG(blog::cat::hook, std::string("texture_device_interface_hook interface=") + interface_name +
@@ -15023,7 +14995,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
 #endif
         }
     }
-    clone_and_patch_vtable(hook_instance, hook_method_count, patches);
+    patch_vtable_methods(hook_instance, hook_method_count, patches);
     if (swapchain4 != nullptr)
         swapchain4->Release();
     if (swapchain3 != nullptr)
@@ -15053,7 +15025,7 @@ void install_factory_hooks(IDXGIFactory *factory)
         return;
 
 
-    clone_and_patch_vtable(factory, interface_layout::factory(factory), {
+    patch_vtable_methods(factory, interface_layout::factory(factory), {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
     });
 }
@@ -15064,7 +15036,7 @@ void install_factory2_hooks(IDXGIFactory2 *factory)
         return;
 
 
-    clone_and_patch_vtable(factory, interface_layout::factory(factory, 25), {
+    patch_vtable_methods(factory, interface_layout::factory(factory, 25), {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
         { k_idx_factory2_create_swap_chain_for_hwnd, reinterpret_cast<void *>(&hooked_factory2_create_swap_chain_for_hwnd) },
     });

@@ -22,4 +22,5 @@ public:
     D3D11CreationScope &operator=(const D3D11CreationScope &) = delete;
 
     bool outermost() const noexcept { return previous_ == nullptr; }
+    static bool active() noexcept { return active_ != nullptr; }
 };

@@ -1,4 +1,5 @@
 #include "ComMethodRoutes.h"
+#include "ComVtableMethods.h"
 #include <cstdio>
 
 namespace
@@ -53,6 +54,48 @@ void expect(bool condition, const char *what)
         std::printf("FAIL: %s\n", what);
     }
 }
+
+void **racing_table = nullptr;
+void *bind_patch(void *replacement, void *original)
+{
+    if (racing_table && replacement == reinterpret_cast<void *>(22))
+        racing_table[1] = reinterpret_cast<void *>(99);
+    return original ? replacement : nullptr;
+}
+
+void test_vtable_slots()
+{
+    auto **table = static_cast<void **>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    table[0] = reinterpret_cast<void *>(1);
+    table[1] = reinterpret_cast<void *>(2);
+    table[69] = reinterpret_cast<void *>(70); // runtime 私有转发目标，不属于公开复制范围。
+    Context instance { table };
+    DWORD old = 0;
+    VirtualProtect(table, 4096, PAGE_READONLY, &old);
+    expect(com_vtable::patch(&instance, 69, {{0, reinterpret_cast<void *>(11)}}, bind_patch),
+        "read-only shared vtable accepts a public method patch");
+    expect(instance.table == table && table[69] == reinterpret_cast<void *>(70),
+        "original vptr and runtime private dispatch remain intact");
+    expect(com_vtable::patch(&instance, 69, {{1, reinterpret_cast<void *>(22)}}, bind_patch) &&
+        table[0] == reinterpret_cast<void *>(11) && table[1] == reinterpret_cast<void *>(22),
+        "later patches merge rather than hitting a stale object cache");
+    MEMORY_BASIC_INFORMATION info {};
+    VirtualQuery(table, &info, sizeof(info));
+    expect(info.Protect == PAGE_READONLY, "read-only page protection restored");
+    expect(!com_vtable::patch(&instance, 69, {{69, reinterpret_cast<void *>(71)}}, bind_patch) &&
+        table[69] == reinterpret_cast<void *>(70), "public bounds never patch a private slot");
+    VirtualProtect(table, 4096, PAGE_READWRITE, &old);
+    table[0] = reinterpret_cast<void *>(1);
+    table[1] = reinterpret_cast<void *>(2);
+    racing_table = table;
+    expect(!com_vtable::patch(&instance, 2,
+        {{0, reinterpret_cast<void *>(11)}, {1, reinterpret_cast<void *>(22)}}, bind_patch),
+        "another injector changing a prepared slot rejects publication");
+    racing_table = nullptr;
+    expect(table[0] == reinterpret_cast<void *>(1) && table[1] == reinterpret_cast<void *>(99),
+        "rollback restores only owned slots and preserves the other injector");
+    VirtualFree(table, 0, MEM_RELEASE);
+}
 }
 
 int main()
@@ -82,6 +125,22 @@ int main()
         "takeover resumes after internal work");
     expect(Routes::original_for(reinterpret_cast<ID3D11DeviceContext *>(&native)) == &native_draw,
         "internal direct call resolves the object's own original");
+    {
+        D3D11CreationScope creation;
+        draw(context, 3, 0);
+        expect(takeovers == 2 && gpu_draws == 4,
+            "later device construction bypasses already shared runtime policy");
+        {
+            D3D11CreationScope nested;
+            draw(context, 3, 0);
+        }
+        expect(D3D11CreationScope::active() && takeovers == 2 && gpu_draws == 5,
+            "nested creation preserves bypass until the outer wrapper finishes");
+    }
+    draw(context, 3, 0);
+    expect(!D3D11CreationScope::active() && takeovers == 3 && gpu_draws == 5,
+        "bridge takeover resumes after the completed creation boundary");
+    test_vtable_slots();
     std::printf("ComMethodRoutes takeover/bypass: %u failures\n", failures);
     return failures ? 1 : 0;
 }
