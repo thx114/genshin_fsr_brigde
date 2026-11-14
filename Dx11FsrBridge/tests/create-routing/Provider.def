@@ -1,0 +1,3 @@
+EXPORTS
+    D3D11CreateDevice=FixtureCreateDevice
+    D3D11CreateDeviceAndSwapChain=FixtureCreateDeviceAndSwapChain

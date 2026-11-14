@@ -11,6 +11,9 @@
 #include <dxgi1_6.h>
 #include <detours/detours.h>
 #include "RenderScaleMenu.h"
+#include "CreateFunctionRoutes.h"
+#include "ComMethodRoutes.h"
+#include "InterfaceVtableLayout.h"
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
@@ -67,15 +70,6 @@
 namespace
 {
 std::once_flag g_initialize_once;
-constexpr std::size_t k_context_vtable_size = 128;
-constexpr std::size_t k_context4_vtable_size = 149;
-constexpr std::size_t k_device_vtable_size = 80;
-// DLSSG exposes the returned DX11-on-DX12 swap chain as IDXGISwapChain4.
-// Keep all inherited entries when cloning its vtable, not only the older
-// IDXGISwapChain2-sized prefix.
-constexpr std::size_t k_swapchain_vtable_size = 41;
-constexpr std::size_t k_factory_vtable_size = 32;
-constexpr std::size_t k_factory2_vtable_size = 40;
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 constexpr bool k_color_diagnostics_enabled = true;
 #else
@@ -117,7 +111,8 @@ constexpr std::size_t k_idx_resize_buffers = k_swapchain_base_methods + 5;
 constexpr std::size_t k_idx_resize_target = k_swapchain_base_methods + 6;
 constexpr std::size_t k_idx_check_color_space_support = 37;
 constexpr std::size_t k_idx_set_color_space1 = 38;
-constexpr std::size_t k_idx_set_hdr_metadata = 39;
+// IDXGISwapChain3 的末槽 39 是 ResizeBuffers1；SwapChain4 在其后追加 HDR 方法。
+constexpr std::size_t k_idx_set_hdr_metadata = 40;
 constexpr std::size_t k_idx_factory_create_swap_chain = 10;
 constexpr std::size_t k_idx_factory2_create_swap_chain_for_hwnd = 15;
 constexpr std::size_t k_idx_output6_get_desc1 = 27;
@@ -1012,8 +1007,6 @@ using check_color_space_support_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain
 using set_color_space1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
 using set_hdr_metadata_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain4 *, DXGI_HDR_METADATA_TYPE, UINT, void *);
 
-create_device_and_swapchain_fn g_original_create_device_and_swapchain = nullptr;
-create_device_fn g_original_create_device = nullptr;
 load_library_a_fn g_original_load_library_a = nullptr;
 load_library_w_fn g_original_load_library_w = nullptr;
 load_library_ex_a_fn g_original_load_library_ex_a = nullptr;
@@ -1022,57 +1015,192 @@ get_proc_address_fn g_original_get_proc_address = nullptr;
 display_config_get_device_info_fn g_original_display_config_get_device_info = nullptr;
 display_config_set_device_info_fn g_original_display_config_set_device_info = nullptr;
 output_get_desc1_fn g_original_output_get_desc1 = nullptr;
-factory_create_swap_chain_fn g_original_factory_create_swap_chain = nullptr;
-factory2_create_swap_chain_for_hwnd_fn g_original_factory2_create_swap_chain_for_hwnd = nullptr;
-create_buffer_fn g_original_create_buffer = nullptr;
-create_texture_2d_fn g_original_create_texture_2d = nullptr;
-create_vertex_shader_fn g_original_create_vertex_shader = nullptr;
-create_pixel_shader_fn g_original_create_pixel_shader = nullptr;
-create_compute_shader_fn g_original_create_compute_shader = nullptr;
-present_fn g_original_present = nullptr;
-std::mutex g_swapchain_present_mutex;
-std::unordered_map<void *, present_fn> g_original_present_by_instance;
-set_fullscreen_state_fn g_original_set_fullscreen_state = nullptr;
-get_fullscreen_state_fn g_original_get_fullscreen_state = nullptr;
-resize_buffers_fn g_original_resize_buffers = nullptr;
-resize_target_fn g_original_resize_target = nullptr;
-check_color_space_support_fn g_original_check_color_space_support = nullptr;
-set_color_space1_fn g_original_set_color_space1 = nullptr;
-set_hdr_metadata_fn g_original_set_hdr_metadata = nullptr;
-std::mutex g_swapchain_resize_mutex;
-std::unordered_map<void *, resize_buffers_fn> g_original_resize_buffers_by_instance;
+void STDMETHODCALLTYPE hooked_vs_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers);
+ComMethodRoutes<vs_set_constant_buffers_fn, &hooked_vs_set_constant_buffers, k_idx_vs_set_constant_buffers> g_original_vs_set_constant_buffers;
+void STDMETHODCALLTYPE hooked_vs_set_shader(ID3D11DeviceContext *context, ID3D11VertexShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count);
+ComMethodRoutes<vs_set_shader_fn, &hooked_vs_set_shader, k_idx_vs_set_shader> g_original_vs_set_shader;
+void STDMETHODCALLTYPE hooked_ps_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views);
+ComMethodRoutes<ps_set_shader_resources_fn, &hooked_ps_set_shader_resources, k_idx_ps_set_shader_resources> g_original_ps_set_shader_resources;
+void STDMETHODCALLTYPE hooked_ps_set_shader(ID3D11DeviceContext *context, ID3D11PixelShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count);
+ComMethodRoutes<ps_set_shader_fn, &hooked_ps_set_shader, k_idx_ps_set_shader> g_original_ps_set_shader;
+void STDMETHODCALLTYPE hooked_ps_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers);
+ComMethodRoutes<ps_set_constant_buffers_fn, &hooked_ps_set_constant_buffers, k_idx_ps_set_constant_buffers> g_original_ps_set_constant_buffers;
+void STDMETHODCALLTYPE hooked_cs_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views);
+ComMethodRoutes<cs_set_shader_resources_fn, &hooked_cs_set_shader_resources, k_idx_cs_set_shader_resources> g_original_cs_set_shader_resources;
+void STDMETHODCALLTYPE hooked_cs_set_uavs(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11UnorderedAccessView *const *views, const UINT *initial_counts);
+ComMethodRoutes<cs_set_uavs_fn, &hooked_cs_set_uavs, k_idx_cs_set_uavs> g_original_cs_set_uavs;
+void STDMETHODCALLTYPE hooked_cs_set_shader(ID3D11DeviceContext *context, ID3D11ComputeShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count);
+ComMethodRoutes<cs_set_shader_fn, &hooked_cs_set_shader, k_idx_cs_set_shader> g_original_cs_set_shader;
+void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *dsv);
+ComMethodRoutes<om_set_render_targets_fn, &hooked_om_set_render_targets, k_idx_om_set_render_targets> g_original_om_set_render_targets;
+void STDMETHODCALLTYPE hooked_om_set_render_targets_and_uavs(
+    ID3D11DeviceContext *context,
+    UINT render_target_count,
+    ID3D11RenderTargetView *const *render_targets,
+    ID3D11DepthStencilView *depth_stencil,
+    UINT uav_start_slot,
+    UINT uav_count,
+    ID3D11UnorderedAccessView *const *unordered_access_views,
+    const UINT *uav_initial_counts);
+ComMethodRoutes<om_set_render_targets_and_uavs_fn, &hooked_om_set_render_targets_and_uavs, k_idx_om_set_render_targets_and_uavs> g_original_om_set_render_targets_and_uavs;
+void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_x, UINT group_y, UINT group_z);
+ComMethodRoutes<dispatch_fn, &hooked_dispatch, k_idx_dispatch, true> g_original_dispatch;
+void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location);
+ComMethodRoutes<draw_indexed_fn, &hooked_draw_indexed, k_idx_draw_indexed, true> g_original_draw_indexed;
+void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location);
+ComMethodRoutes<draw_fn, &hooked_draw, k_idx_draw, true> g_original_draw;
+HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped);
+ComMethodRoutes<map_fn, &hooked_map, k_idx_map> g_original_map;
+void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource);
+ComMethodRoutes<unmap_fn, &hooked_unmap, k_idx_unmap> g_original_unmap;
+void STDMETHODCALLTYPE hooked_rs_set_viewports(ID3D11DeviceContext *context, UINT count, const D3D11_VIEWPORT *viewports);
+ComMethodRoutes<rs_set_viewports_fn, &hooked_rs_set_viewports, k_idx_rs_set_viewports> g_original_rs_set_viewports;
+void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, UINT dst_x, UINT dst_y, UINT dst_z, ID3D11Resource *src, UINT src_subresource, const D3D11_BOX *src_box);
+ComMethodRoutes<copy_subresource_region_fn, &hooked_copy_subresource_region, k_idx_copy_subresource_region> g_original_copy_subresource_region;
+void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11Resource *dst, ID3D11Resource *src);
+ComMethodRoutes<copy_resource_fn, &hooked_copy_resource, k_idx_copy_resource> g_original_copy_resource;
+void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, const D3D11_BOX *dst_box, const void *src_data, UINT src_row_pitch, UINT src_depth_pitch);
+ComMethodRoutes<update_subresource_fn, &hooked_update_subresource, k_idx_update_subresource> g_original_update_subresource;
+void STDMETHODCALLTYPE hooked_cs_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers);
+ComMethodRoutes<cs_set_constant_buffers_fn, &hooked_cs_set_constant_buffers, k_idx_cs_set_constant_buffers> g_original_cs_set_constant_buffers;
+void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11RenderTargetView *rtv, const FLOAT color[4]);
+ComMethodRoutes<clear_rtv_fn, &hooked_clear_rtv, k_idx_clear_rtv> g_original_clear_rtv;
+void STDMETHODCALLTYPE hooked_clear_dsv(ID3D11DeviceContext *context, ID3D11DepthStencilView *dsv, UINT flags, FLOAT depth, UINT8 stencil);
+ComMethodRoutes<clear_dsv_fn, &hooked_clear_dsv, k_idx_clear_dsv> g_original_clear_dsv;
+HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer);
+ComMethodRoutes<create_buffer_fn, &hooked_create_buffer, k_idx_device_create_buffer> g_original_create_buffer;
+HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D3D11_TEXTURE2D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Texture2D **texture);
+ComMethodRoutes<create_texture_2d_fn, &hooked_create_texture_2d, k_idx_device_create_texture_2d> g_original_create_texture_2d;
+HRESULT STDMETHODCALLTYPE hooked_create_vertex_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11VertexShader **vertex_shader);
+ComMethodRoutes<create_vertex_shader_fn, &hooked_create_vertex_shader, k_idx_device_create_vertex_shader> g_original_create_vertex_shader;
+HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11PixelShader **pixel_shader);
+ComMethodRoutes<create_pixel_shader_fn, &hooked_create_pixel_shader, k_idx_device_create_pixel_shader> g_original_create_pixel_shader;
+HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11ComputeShader **compute_shader);
+ComMethodRoutes<create_compute_shader_fn, &hooked_create_compute_shader, k_idx_device_create_compute_shader> g_original_create_compute_shader;
+HRESULT STDMETHODCALLTYPE hooked_set_fullscreen_state(IDXGISwapChain *swapchain, BOOL fullscreen, IDXGIOutput *target);
+ComMethodRoutes<set_fullscreen_state_fn, &hooked_set_fullscreen_state, k_idx_set_fullscreen_state> g_original_set_fullscreen_state;
+HRESULT STDMETHODCALLTYPE hooked_get_fullscreen_state(IDXGISwapChain *swapchain, BOOL *fullscreen, IDXGIOutput **target);
+ComMethodRoutes<get_fullscreen_state_fn, &hooked_get_fullscreen_state, k_idx_get_fullscreen_state> g_original_get_fullscreen_state;
+HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
+    IDXGISwapChain *swapchain,
+    UINT buffer_count,
+    UINT width,
+    UINT height,
+    DXGI_FORMAT format,
+    UINT flags);
+ComMethodRoutes<resize_buffers_fn, &hooked_resize_buffers, k_idx_resize_buffers> g_original_resize_buffers;
+HRESULT STDMETHODCALLTYPE hooked_resize_target(IDXGISwapChain *swapchain, const DXGI_MODE_DESC *target_parameters);
+ComMethodRoutes<resize_target_fn, &hooked_resize_target, k_idx_resize_target> g_original_resize_target;
+HRESULT STDMETHODCALLTYPE hooked_check_color_space_support(
+    IDXGISwapChain3 *swapchain,
+    DXGI_COLOR_SPACE_TYPE color_space,
+    UINT *support);
+ComMethodRoutes<check_color_space_support_fn, &hooked_check_color_space_support, k_idx_check_color_space_support> g_original_check_color_space_support;
+HRESULT STDMETHODCALLTYPE hooked_set_color_space1(
+    IDXGISwapChain3 *swapchain,
+    DXGI_COLOR_SPACE_TYPE color_space);
+ComMethodRoutes<set_color_space1_fn, &hooked_set_color_space1, k_idx_set_color_space1> g_original_set_color_space1;
+HRESULT STDMETHODCALLTYPE hooked_set_hdr_metadata(
+    IDXGISwapChain4 *swapchain,
+    DXGI_HDR_METADATA_TYPE type,
+    UINT size,
+    void *metadata);
+ComMethodRoutes<set_hdr_metadata_fn, &hooked_set_hdr_metadata, k_idx_set_hdr_metadata> g_original_set_hdr_metadata;
+HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory, IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **swapchain);
+ComMethodRoutes<factory_create_swap_chain_fn, &hooked_factory_create_swap_chain, k_idx_factory_create_swap_chain> g_original_factory_create_swap_chain;
+HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactory2 *factory, IUnknown *device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1 *desc, const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fullscreen_desc, IDXGIOutput *restrict_to_output, IDXGISwapChain1 **swapchain);
+ComMethodRoutes<factory2_create_swap_chain_for_hwnd_fn, &hooked_factory2_create_swap_chain_for_hwnd, k_idx_factory2_create_swap_chain_for_hwnd> g_original_factory2_create_swap_chain_for_hwnd;
+HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags);
+ComMethodRoutes<present_fn, &hooked_present, k_idx_present, true> g_original_present;
+
+void *bind_com_method(void *callback, void *original)
+{
+    if (callback == reinterpret_cast<void *>(&hooked_vs_set_constant_buffers))
+        return decltype(g_original_vs_set_constant_buffers)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_vs_set_shader))
+        return decltype(g_original_vs_set_shader)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_ps_set_shader_resources))
+        return decltype(g_original_ps_set_shader_resources)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_ps_set_shader))
+        return decltype(g_original_ps_set_shader)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_ps_set_constant_buffers))
+        return decltype(g_original_ps_set_constant_buffers)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_cs_set_shader_resources))
+        return decltype(g_original_cs_set_shader_resources)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_cs_set_uavs))
+        return decltype(g_original_cs_set_uavs)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_cs_set_shader))
+        return decltype(g_original_cs_set_shader)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_om_set_render_targets))
+        return decltype(g_original_om_set_render_targets)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_om_set_render_targets_and_uavs))
+        return decltype(g_original_om_set_render_targets_and_uavs)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_dispatch))
+        return decltype(g_original_dispatch)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_draw_indexed))
+        return decltype(g_original_draw_indexed)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_draw))
+        return decltype(g_original_draw)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_map))
+        return decltype(g_original_map)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_unmap))
+        return decltype(g_original_unmap)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_rs_set_viewports))
+        return decltype(g_original_rs_set_viewports)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_copy_subresource_region))
+        return decltype(g_original_copy_subresource_region)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_copy_resource))
+        return decltype(g_original_copy_resource)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_update_subresource))
+        return decltype(g_original_update_subresource)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_cs_set_constant_buffers))
+        return decltype(g_original_cs_set_constant_buffers)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_clear_rtv))
+        return decltype(g_original_clear_rtv)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_clear_dsv))
+        return decltype(g_original_clear_dsv)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_create_buffer))
+        return decltype(g_original_create_buffer)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_create_texture_2d))
+        return decltype(g_original_create_texture_2d)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_create_vertex_shader))
+        return decltype(g_original_create_vertex_shader)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_create_pixel_shader))
+        return decltype(g_original_create_pixel_shader)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_create_compute_shader))
+        return decltype(g_original_create_compute_shader)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_set_fullscreen_state))
+        return decltype(g_original_set_fullscreen_state)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_get_fullscreen_state))
+        return decltype(g_original_get_fullscreen_state)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_resize_buffers))
+        return decltype(g_original_resize_buffers)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_resize_target))
+        return decltype(g_original_resize_target)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_check_color_space_support))
+        return decltype(g_original_check_color_space_support)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_set_color_space1))
+        return decltype(g_original_set_color_space1)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_set_hdr_metadata))
+        return decltype(g_original_set_hdr_metadata)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_factory_create_swap_chain))
+        return decltype(g_original_factory_create_swap_chain)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_factory2_create_swap_chain_for_hwnd))
+        return decltype(g_original_factory2_create_swap_chain_for_hwnd)::bind(original);
+    if (callback == reinterpret_cast<void *>(&hooked_present))
+        return decltype(g_original_present)::bind(original);
+    return nullptr;
+}
+
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 std::mutex g_fsr2_color_diagnostics_mutex;
 std::string g_last_fsr2_color_diagnostics;
 #endif
-vs_set_constant_buffers_fn g_original_vs_set_constant_buffers = nullptr;
-vs_set_shader_fn g_original_vs_set_shader = nullptr;
-ps_set_shader_resources_fn g_original_ps_set_shader_resources = nullptr;
-ps_set_shader_fn g_original_ps_set_shader = nullptr;
-ps_set_constant_buffers_fn g_original_ps_set_constant_buffers = nullptr;
-cs_set_shader_resources_fn g_original_cs_set_shader_resources = nullptr;
-cs_set_uavs_fn g_original_cs_set_uavs = nullptr;
-cs_set_shader_fn g_original_cs_set_shader = nullptr;
-cs_set_constant_buffers_fn g_original_cs_set_constant_buffers = nullptr;
-om_set_render_targets_fn g_original_om_set_render_targets = nullptr;
-om_set_render_targets_and_uavs_fn g_original_om_set_render_targets_and_uavs = nullptr;
-dispatch_fn g_original_dispatch = nullptr;
-draw_indexed_fn g_original_draw_indexed = nullptr;
-draw_fn g_original_draw = nullptr;
-map_fn g_original_map = nullptr;
-unmap_fn g_original_unmap = nullptr;
-rs_set_viewports_fn g_original_rs_set_viewports = nullptr;
-copy_resource_fn g_original_copy_resource = nullptr;
-copy_subresource_region_fn g_original_copy_subresource_region = nullptr;
-update_subresource_fn g_original_update_subresource = nullptr;
-clear_rtv_fn g_original_clear_rtv = nullptr;
-clear_dsv_fn g_original_clear_dsv = nullptr;
 
 std::mutex g_vtable_mutex;
 std::unordered_map<void *, void **> g_cloned_vtables;
-std::unordered_map<void *, void **> g_original_vtables;
 std::mutex g_context_device_hook_mutex;
-std::unordered_set<std::uint64_t> g_context_device_hook_attempts;
+std::unordered_set<std::uint64_t> g_context_device_hooks;
 std::atomic_uint32_t g_native_ldr_final_target_candidate_count { 0 };
 std::atomic_uint32_t g_native_ldr_texture_create_observed_count { 0 };
 
@@ -1102,6 +1230,29 @@ HRESULT WINAPI hooked_create_device(
     D3D_FEATURE_LEVEL *feature_level,
     ID3D11DeviceContext **context);
 
+using DeviceCreateRoutes = CreateFunctionRoutes<create_device_fn, &hooked_create_device>;
+using CombinedCreateRoutes = CreateFunctionRoutes<create_device_and_swapchain_fn, &hooked_create_device_and_swapchain>;
+void log_create_route(const char *api, void *target, void *entry);
+
+void *resolve_create_device(void *target)
+{
+    bool added = false;
+    void *entry = reinterpret_cast<void *>(DeviceCreateRoutes::bind(reinterpret_cast<create_device_fn>(target), &added));
+    if (added)
+        log_create_route("D3D11CreateDevice", target, entry);
+    return entry;
+}
+
+void *resolve_create_device_and_swapchain(void *target)
+{
+    bool added = false;
+    void *entry = reinterpret_cast<void *>(CombinedCreateRoutes::bind(
+        reinterpret_cast<create_device_and_swapchain_fn>(target), &added));
+    if (added)
+        log_create_route("D3D11CreateDeviceAndSwapChain", target, entry);
+    return entry;
+}
+
 HMODULE WINAPI hooked_load_library_a(LPCSTR file_name);
 HMODULE WINAPI hooked_load_library_w(LPCWSTR file_name);
 HMODULE WINAPI hooked_load_library_ex_a(LPCSTR file_name, HANDLE file, DWORD flags);
@@ -1118,7 +1269,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D
 HRESULT STDMETHODCALLTYPE hooked_create_vertex_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11VertexShader **vertex_shader);
 HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11PixelShader **pixel_shader);
 HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, const void *shader_bytecode, SIZE_T bytecode_length, ID3D11ClassLinkage *class_linkage, ID3D11ComputeShader **compute_shader);
-void install_device_hooks(ID3D11Device *device);
+bool install_device_hooks(ID3D11Device *device);
 void log_line(const std::string &line);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 void set_osd_text(const std::wstring &text);
@@ -3519,6 +3670,15 @@ std::string module_path_from_address(void *address)
     return length != 0 ? std::string(path, length) : "unknown";
 }
 
+void log_create_route(const char *api, void *target, void *entry)
+{
+    // 每个真实提供者仅在首次绑定时记录，供新局判定是否经过 Rocket；不是逐帧探针。
+    LOG_INFO(blog::cat::hook, std::string("d3d11_create_route api=") + api +
+        " original=" + hex64(reinterpret_cast<std::uintptr_t>(target)) +
+        " entry=" + hex64(reinterpret_cast<std::uintptr_t>(entry)) +
+        " provider=" + module_path_from_address(target));
+}
+
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
 std::string describe_dxgi_swapchain_device(IUnknown *device)
 {
@@ -5459,7 +5619,8 @@ void log_iat_skip(const char *reason, HMODULE module, const void *slot, std::siz
     LOG_INFO(blog::cat::core, buf);
 }
 
-bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *function_name, void *replacement, void **original)
+bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *function_name, void *replacement,
+    void **original, void *(*resolve)(void *))
 {
     const auto *base = reinterpret_cast<const std::uint8_t *>(module);
     const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
@@ -5586,6 +5747,16 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
             }
 
             void *current = reinterpret_cast<void *>(iat[thunk_index].u1.Function);
+            if (resolve != nullptr)
+            {
+                replacement = resolve(current);
+                if (replacement == nullptr)
+                {
+                    perf_probe::virtual_protect_counted(&iat[thunk_index].u1.Function,
+                        sizeof(std::uintptr_t), old_protect, &old_protect);
+                    return false;
+                }
+            }
             if (current == replacement)
             {
                 perf_probe::virtual_protect_counted(&iat[thunk_index].u1.Function, sizeof(std::uintptr_t), old_protect, &old_protect);
@@ -5656,7 +5827,8 @@ bool hook_iat_unchecked(HMODULE module, const char *import_name, const char *fun
     return false;
 }
 
-bool hook_iat(HMODULE module, const char *import_name, const char *function_name, void *replacement, void **original)
+bool hook_iat(HMODULE module, const char *import_name, const char *function_name, void *replacement,
+    void **original, void *(*resolve)(void *) = nullptr)
 {
     if (module == nullptr)
         return false;
@@ -5670,7 +5842,7 @@ bool hook_iat(HMODULE module, const char *import_name, const char *function_name
 
     __try
     {
-        return hook_iat_unchecked(module, import_name, function_name, replacement, original);
+        return hook_iat_unchecked(module, import_name, function_name, replacement, original, resolve);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -5996,15 +6168,13 @@ void install_create_hooks_for_loaded_modules()
     for (HMODULE module : enumerate_process_modules())
     {
         if (hook_iat(module, "d3d11.dll", "D3D11CreateDeviceAndSwapChain",
-                reinterpret_cast<void *>(&hooked_create_device_and_swapchain),
-                reinterpret_cast<void **>(&g_original_create_device_and_swapchain)))
+                nullptr, nullptr, &resolve_create_device_and_swapchain))
         {
             ++swapchain_hooks;
         }
 
         if (hook_iat(module, "d3d11.dll", "D3D11CreateDevice",
-                reinterpret_cast<void *>(&hooked_create_device),
-                reinterpret_cast<void **>(&g_original_create_device)))
+                nullptr, nullptr, &resolve_create_device))
         {
             ++device_hooks;
         }
@@ -6129,66 +6299,28 @@ bool clone_and_patch_vtable(void *instance, std::size_t method_count, const std:
 
     std::memcpy(clone, source, sizeof(void *) * method_count);
     for (const auto &[index, value] : patches)
-        clone[index] = value;
+    {
+        void *entry = bind_com_method(value, source[index]);
+        if (entry == nullptr)
+        {
+            VirtualFree(clone, 0, MEM_RELEASE);
+            return false;
+        }
+        clone[index] = entry;
+    }
 
     *object = clone;
     g_cloned_vtables[instance] = clone;
-    g_original_vtables[instance] = source;
     return true;
 }
 
 std::size_t context_vtable_size(ID3D11DeviceContext *context)
 {
-    if (context == nullptr)
-        return k_context_vtable_size;
-
-    ID3D11DeviceContext4 *context4 = nullptr;
-    const HRESULT result = context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&context4));
-    if (FAILED(result) || context4 == nullptr)
-        return k_context_vtable_size;
-
-    const bool shared_instance = static_cast<ID3D11DeviceContext *>(context4) == context;
-    context4->Release();
-    return shared_instance ? k_context4_vtable_size : k_context_vtable_size;
+    return interface_layout::context(context);
 }
 
-bool set_cloned_vtable_enabled(void *instance, bool enabled)
-{
-    if (instance == nullptr)
-        return false;
-
-    std::lock_guard lock(g_vtable_mutex);
-    const auto cloned = g_cloned_vtables.find(instance);
-    const auto original = g_original_vtables.find(instance);
-    if (cloned == g_cloned_vtables.end() || original == g_original_vtables.end())
-        return false;
-
-    void ***object = reinterpret_cast<void ***>(instance);
-    *object = enabled ? cloned->second : original->second;
-    return true;
-}
-
-class ScopedContextVtableBypass
-{
-  public:
-    explicit ScopedContextVtableBypass(ID3D11DeviceContext *context)
-        : context_(context), active_(set_cloned_vtable_enabled(context, false))
-    {
-    }
-
-    ~ScopedContextVtableBypass()
-    {
-        if (active_)
-            set_cloned_vtable_enabled(context_, true);
-    }
-
-    ScopedContextVtableBypass(const ScopedContextVtableBypass &) = delete;
-    ScopedContextVtableBypass &operator=(const ScopedContextVtableBypass &) = delete;
-
-  private:
-    ID3D11DeviceContext *context_ = nullptr;
-    bool active_ = false;
-};
+// 内部工作跨代理转发时共享线程域，避免临时改写某一对象的全局 vptr。
+using ScopedContextVtableBypass = ContextPolicyBypass;
 
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
 void update_final_scene_probe_backbuffers(IDXGISwapChain *swapchain)
@@ -7468,14 +7600,7 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     // 无挂起时零开销（单锁内布尔检查）。
     if (ffx12::async_upscale_enabled())
         ffx12::finish_pending();
-    present_fn original_present = g_original_present;
-    {
-        std::lock_guard lock(g_swapchain_present_mutex);
-        const auto it = g_original_present_by_instance.find(swapchain);
-        if (it != g_original_present_by_instance.end())
-            original_present = it->second;
-    }
-    return original_present != nullptr ? original_present(swapchain, sync_interval, flags) : E_FAIL;
+    return g_original_present(swapchain, sync_interval, flags);
 }
 
 HRESULT STDMETHODCALLTYPE hooked_set_fullscreen_state(IDXGISwapChain *swapchain, BOOL fullscreen, IDXGIOutput *target)
@@ -7546,15 +7671,7 @@ HRESULT STDMETHODCALLTYPE hooked_resize_buffers(
         }
     }
 
-    resize_buffers_fn original_resize = nullptr;
-    {
-        std::lock_guard lock(g_swapchain_resize_mutex);
-        const auto it = g_original_resize_buffers_by_instance.find(swapchain);
-        if (it != g_original_resize_buffers_by_instance.end())
-            original_resize = it->second;
-    }
-    if (original_resize == nullptr)
-        original_resize = g_original_resize_buffers;
+    const auto original_resize = decltype(g_original_resize_buffers)::original_for(swapchain);
 
     const HRESULT result = original_resize != nullptr
         ? original_resize(swapchain, buffer_count, width, height, effective_format, flags)
@@ -8080,19 +8197,22 @@ void ensure_context_device_texture_hook(ID3D11DeviceContext *context)
         return;
 
     const std::uint64_t device_key = reinterpret_cast<std::uint64_t>(device);
-    bool first_attempt = false;
+    bool needs_install = false;
     {
         std::lock_guard lock(g_context_device_hook_mutex);
-        first_attempt = g_context_device_hook_attempts.insert(device_key).second;
+        needs_install = !g_context_device_hooks.contains(device_key);
     }
-    if (first_attempt)
+    if (needs_install)
     {
         void **device_vtable = *reinterpret_cast<void ***>(device);
         LOG_INFO(blog::cat::core, "device_create_texture_entry device=" + hex64(device_key) +
             " entry=" + hex64(reinterpret_cast<std::uintptr_t>(device_vtable[k_idx_device_create_texture_2d])) +
             " expected=" + hex64(reinterpret_cast<std::uintptr_t>(&hooked_create_texture_2d)));
-        install_device_hooks(device);
-        LOG_DEBUG(blog::cat::hook, "context_device_texture_hook device=" + hex64(device_key));
+        if (install_device_hooks(device))
+        {
+            std::lock_guard lock(g_context_device_hook_mutex);
+            g_context_device_hooks.insert(device_key);
+        }
     }
     device->Release();
 }
@@ -14416,54 +14536,17 @@ void install_context_hooks(ID3D11DeviceContext *context)
     if (context == nullptr)
         return;
 
-    void **vtable = *reinterpret_cast<void ***>(context);
-    if (g_original_vs_set_constant_buffers == nullptr)
-        g_original_vs_set_constant_buffers = reinterpret_cast<vs_set_constant_buffers_fn>(vtable[k_idx_vs_set_constant_buffers]);
-    if (g_original_vs_set_shader == nullptr)
-        g_original_vs_set_shader = reinterpret_cast<vs_set_shader_fn>(vtable[k_idx_vs_set_shader]);
-    if (g_original_ps_set_shader_resources == nullptr)
-        g_original_ps_set_shader_resources = reinterpret_cast<ps_set_shader_resources_fn>(vtable[k_idx_ps_set_shader_resources]);
-    if (g_original_ps_set_shader == nullptr)
-        g_original_ps_set_shader = reinterpret_cast<ps_set_shader_fn>(vtable[k_idx_ps_set_shader]);
-    if (g_original_ps_set_constant_buffers == nullptr)
-        g_original_ps_set_constant_buffers = reinterpret_cast<ps_set_constant_buffers_fn>(vtable[k_idx_ps_set_constant_buffers]);
-    if (g_original_cs_set_shader_resources == nullptr)
-        g_original_cs_set_shader_resources = reinterpret_cast<cs_set_shader_resources_fn>(vtable[k_idx_cs_set_shader_resources]);
-    if (g_original_cs_set_uavs == nullptr)
-        g_original_cs_set_uavs = reinterpret_cast<cs_set_uavs_fn>(vtable[k_idx_cs_set_uavs]);
-    if (g_original_cs_set_shader == nullptr)
-        g_original_cs_set_shader = reinterpret_cast<cs_set_shader_fn>(vtable[k_idx_cs_set_shader]);
-    if (g_original_om_set_render_targets == nullptr)
-        g_original_om_set_render_targets = reinterpret_cast<om_set_render_targets_fn>(vtable[k_idx_om_set_render_targets]);
-    if (g_original_om_set_render_targets_and_uavs == nullptr)
+    ID3D11DeviceContext *execution = interface_layout::execution_context(context);
+    if (execution != nullptr)
     {
-        g_original_om_set_render_targets_and_uavs =
-            reinterpret_cast<om_set_render_targets_and_uavs_fn>(vtable[k_idx_om_set_render_targets_and_uavs]);
+        if (execution != context)
+        {
+            install_context_hooks(execution);
+            execution->Release();
+            return;
+        }
+        execution->Release();
     }
-    if (g_original_dispatch == nullptr)
-        g_original_dispatch = reinterpret_cast<dispatch_fn>(vtable[k_idx_dispatch]);
-    if (g_original_draw_indexed == nullptr)
-        g_original_draw_indexed = reinterpret_cast<draw_indexed_fn>(vtable[k_idx_draw_indexed]);
-    if (g_original_draw == nullptr)
-        g_original_draw = reinterpret_cast<draw_fn>(vtable[k_idx_draw]);
-    if (g_original_map == nullptr)
-        g_original_map = reinterpret_cast<map_fn>(vtable[k_idx_map]);
-    if (g_original_unmap == nullptr)
-        g_original_unmap = reinterpret_cast<unmap_fn>(vtable[k_idx_unmap]);
-    if (g_original_rs_set_viewports == nullptr)
-        g_original_rs_set_viewports = reinterpret_cast<rs_set_viewports_fn>(vtable[k_idx_rs_set_viewports]);
-    if (g_original_copy_subresource_region == nullptr)
-        g_original_copy_subresource_region = reinterpret_cast<copy_subresource_region_fn>(vtable[k_idx_copy_subresource_region]);
-    if (g_original_copy_resource == nullptr)
-        g_original_copy_resource = reinterpret_cast<copy_resource_fn>(vtable[k_idx_copy_resource]);
-    if (g_original_update_subresource == nullptr)
-        g_original_update_subresource = reinterpret_cast<update_subresource_fn>(vtable[k_idx_update_subresource]);
-    if (g_original_cs_set_constant_buffers == nullptr)
-        g_original_cs_set_constant_buffers = reinterpret_cast<cs_set_constant_buffers_fn>(vtable[k_idx_cs_set_constant_buffers]);
-    if (g_original_clear_rtv == nullptr)
-        g_original_clear_rtv = reinterpret_cast<clear_rtv_fn>(vtable[k_idx_clear_rtv]);
-    if (g_original_clear_dsv == nullptr)
-        g_original_clear_dsv = reinterpret_cast<clear_dsv_fn>(vtable[k_idx_clear_dsv]);
 
     std::vector<std::pair<std::size_t, void *>> patches {
         { k_idx_ps_set_shader_resources, reinterpret_cast<void *>(&hooked_ps_set_shader_resources) },
@@ -14691,22 +14774,11 @@ HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, con
     return hr;
 }
 
-void install_device_hooks(ID3D11Device *device)
+bool install_device_hooks(ID3D11Device *device)
 {
     if (device == nullptr)
-        return;
+        return false;
 
-    void **vtable = *reinterpret_cast<void ***>(device);
-    if (g_original_create_buffer == nullptr)
-        g_original_create_buffer = reinterpret_cast<create_buffer_fn>(vtable[k_idx_device_create_buffer]);
-    if (g_original_create_texture_2d == nullptr)
-        g_original_create_texture_2d = reinterpret_cast<create_texture_2d_fn>(vtable[k_idx_device_create_texture_2d]);
-    if (g_original_create_vertex_shader == nullptr)
-        g_original_create_vertex_shader = reinterpret_cast<create_vertex_shader_fn>(vtable[k_idx_device_create_vertex_shader]);
-    if (g_original_create_pixel_shader == nullptr)
-        g_original_create_pixel_shader = reinterpret_cast<create_pixel_shader_fn>(vtable[k_idx_device_create_pixel_shader]);
-    if (g_original_create_compute_shader == nullptr)
-        g_original_create_compute_shader = reinterpret_cast<create_compute_shader_fn>(vtable[k_idx_device_create_compute_shader]);
 
     std::vector<std::pair<std::size_t, void *>> patches {
         { k_idx_device_create_buffer, reinterpret_cast<void *>(&hooked_create_buffer) },
@@ -14722,30 +14794,33 @@ void install_device_hooks(ID3D11Device *device)
         { k_idx_device_create_compute_shader, reinterpret_cast<void *>(&hooked_create_compute_shader) },
     });
 #endif
-    clone_and_patch_vtable(device, k_device_vtable_size, patches);
+    bool installed = clone_and_patch_vtable(device, interface_layout::device(device), patches);
 
     if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
     {
         const std::vector<std::pair<std::size_t, void *>> texture_patches {
             { k_idx_device_create_texture_2d, reinterpret_cast<void *>(&hooked_create_texture_2d) },
         };
-        auto patch_extended_interface = [&](REFIID interface_id, const char *interface_name)
+        auto patch_extended_interface = [&](REFIID interface_id, const char *interface_name, std::size_t minimum)
         {
             IUnknown *extended = nullptr;
             if (FAILED(device->QueryInterface(interface_id, reinterpret_cast<void **>(&extended))) || extended == nullptr)
                 return;
             const auto interface_key = reinterpret_cast<std::uint64_t>(extended);
-            clone_and_patch_vtable(extended, k_device_vtable_size, texture_patches);
+            const bool extended_installed = clone_and_patch_vtable(extended, interface_layout::device(
+                reinterpret_cast<ID3D11Device *>(extended), minimum), texture_patches);
+            installed = extended_installed && installed;
             LOG_DEBUG(blog::cat::hook, std::string("texture_device_interface_hook interface=") + interface_name +
-                " instance=" + hex64(interface_key));
+                " instance=" + hex64(interface_key) + " installed=" + std::to_string(extended_installed));
             extended->Release();
         };
-        patch_extended_interface(__uuidof(ID3D11Device1), "ID3D11Device1");
-        patch_extended_interface(__uuidof(ID3D11Device2), "ID3D11Device2");
-        patch_extended_interface(__uuidof(ID3D11Device3), "ID3D11Device3");
-        patch_extended_interface(__uuidof(ID3D11Device4), "ID3D11Device4");
-        patch_extended_interface(__uuidof(ID3D11Device5), "ID3D11Device5");
+        patch_extended_interface(__uuidof(ID3D11Device1), "ID3D11Device1", 50);
+        patch_extended_interface(__uuidof(ID3D11Device2), "ID3D11Device2", 54);
+        patch_extended_interface(__uuidof(ID3D11Device3), "ID3D11Device3", 65);
+        patch_extended_interface(__uuidof(ID3D11Device4), "ID3D11Device4", 67);
+        patch_extended_interface(__uuidof(ID3D11Device5), "ID3D11Device5", 69);
     }
+    return installed;
 }
 
 void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain)
@@ -14875,7 +14950,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)));
 
     void *hook_instance = swapchain;
-    std::size_t hook_method_count = k_swapchain_vtable_size;
+    std::size_t hook_method_count = interface_layout::swapchain(swapchain);
     IDXGISwapChain4 *swapchain4 = nullptr;
     IDXGISwapChain3 *swapchain3 = nullptr;
     bool supports_hdr_metadata = false;
@@ -14884,12 +14959,13 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain4), reinterpret_cast<void **>(&swapchain4))) && swapchain4 != nullptr)
         {
             hook_instance = swapchain4;
+            hook_method_count = interface_layout::swapchain(swapchain4);
             supports_hdr_metadata = true;
         }
         else if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) && swapchain3 != nullptr)
         {
             hook_instance = swapchain3;
-            hook_method_count = 39;
+            hook_method_count = interface_layout::swapchain(swapchain3);
         }
         else
         {
@@ -14900,36 +14976,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         }
     }
 
-    void **vtable = *reinterpret_cast<void ***>(hook_instance);
-    if (should_hook_present)
-    {
-        const auto original_present = reinterpret_cast<present_fn>(vtable[k_idx_present]);
-        if (g_original_present == nullptr)
-            g_original_present = original_present;
-        std::lock_guard lock(g_swapchain_present_mutex);
-        g_original_present_by_instance.try_emplace(hook_instance, original_present);
-        g_original_present_by_instance.try_emplace(swapchain, original_present);
-    }
-    if (should_hook_general_swapchain_controls && g_original_set_fullscreen_state == nullptr)
-        g_original_set_fullscreen_state = reinterpret_cast<set_fullscreen_state_fn>(vtable[k_idx_set_fullscreen_state]);
-    if (should_hook_general_swapchain_controls && g_original_get_fullscreen_state == nullptr)
-        g_original_get_fullscreen_state = reinterpret_cast<get_fullscreen_state_fn>(vtable[k_idx_get_fullscreen_state]);
-    if (should_hook_general_swapchain_controls && g_original_resize_buffers == nullptr)
-        g_original_resize_buffers = reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]);
-    if (should_hook_native_ldr_resize)
-    {
-        std::lock_guard lock(g_swapchain_resize_mutex);
-        g_original_resize_buffers_by_instance.try_emplace(hook_instance, reinterpret_cast<resize_buffers_fn>(vtable[k_idx_resize_buffers]));
-    }
-    if (should_hook_general_swapchain_controls && g_original_resize_target == nullptr)
-        g_original_resize_target = reinterpret_cast<resize_target_fn>(vtable[k_idx_resize_target]);
     const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
-    if (has_color_interface && g_original_check_color_space_support == nullptr)
-        g_original_check_color_space_support = reinterpret_cast<check_color_space_support_fn>(vtable[k_idx_check_color_space_support]);
-    if (has_color_interface && g_original_set_color_space1 == nullptr)
-        g_original_set_color_space1 = reinterpret_cast<set_color_space1_fn>(vtable[k_idx_set_color_space1]);
-    if (supports_hdr_metadata && g_original_set_hdr_metadata == nullptr)
-        g_original_set_hdr_metadata = reinterpret_cast<set_hdr_metadata_fn>(vtable[k_idx_set_hdr_metadata]);
     std::vector<std::pair<std::size_t, void *>> patches;
     if (should_hook_present)
         patches.emplace_back(k_idx_present, reinterpret_cast<void *>(&hooked_present));
@@ -15004,11 +15051,8 @@ void install_factory_hooks(IDXGIFactory *factory)
     if (factory == nullptr)
         return;
 
-    void **vtable = *reinterpret_cast<void ***>(factory);
-    if (g_original_factory_create_swap_chain == nullptr)
-        g_original_factory_create_swap_chain = reinterpret_cast<factory_create_swap_chain_fn>(vtable[k_idx_factory_create_swap_chain]);
 
-    clone_and_patch_vtable(factory, k_factory_vtable_size, {
+    clone_and_patch_vtable(factory, interface_layout::factory(factory), {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
     });
 }
@@ -15018,11 +15062,8 @@ void install_factory2_hooks(IDXGIFactory2 *factory)
     if (factory == nullptr)
         return;
 
-    void **vtable = *reinterpret_cast<void ***>(factory);
-    if (g_original_factory2_create_swap_chain_for_hwnd == nullptr)
-        g_original_factory2_create_swap_chain_for_hwnd = reinterpret_cast<factory2_create_swap_chain_for_hwnd_fn>(vtable[k_idx_factory2_create_swap_chain_for_hwnd]);
 
-    clone_and_patch_vtable(factory, k_factory2_vtable_size, {
+    clone_and_patch_vtable(factory, interface_layout::factory(factory, 25), {
         { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
         { k_idx_factory2_create_swap_chain_for_hwnd, reinterpret_cast<void *>(&hooked_factory2_create_swap_chain_for_hwnd) },
     });
@@ -15089,7 +15130,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateDeviceAndSwapChain");
     }
 
-    const HRESULT hr = g_original_create_device_and_swapchain(
+    const HRESULT hr = CombinedCreateRoutes::original()(
         adapter,
         driver_type,
         software,
@@ -15135,7 +15176,7 @@ HRESULT WINAPI hooked_create_device(
     ID3D11DeviceContext **context)
 {
     // 旧 On12 引导移除（旧方案隔离）。
-    const HRESULT hr = g_original_create_device(
+    const HRESULT hr = DeviceCreateRoutes::original()(
         adapter,
         driver_type,
         software,
@@ -15394,25 +15435,23 @@ LONG WINAPI hooked_display_config_set_device_info(DISPLAYCONFIG_DEVICE_INFO_HEAD
 FARPROC WINAPI hooked_get_proc_address(HMODULE module, LPCSTR proc_name)
 {
     FARPROC address = g_original_get_proc_address(module, proc_name);
-    if (address == nullptr || proc_name == nullptr)
+    if (address == nullptr || reinterpret_cast<ULONG_PTR>(proc_name) <= 0xffff)
         return address;
 
     if (is_d3d11_module(module))
     {
         if (std::strcmp(proc_name, "D3D11CreateDeviceAndSwapChain") == 0)
         {
-            if (g_original_create_device_and_swapchain == nullptr)
-                g_original_create_device_and_swapchain = reinterpret_cast<create_device_and_swapchain_fn>(address);
+            void *entry = resolve_create_device_and_swapchain(reinterpret_cast<void *>(address));
             LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDeviceAndSwapChain");
-            return reinterpret_cast<FARPROC>(&hooked_create_device_and_swapchain);
+            return entry != nullptr ? reinterpret_cast<FARPROC>(entry) : address;
         }
 
         if (std::strcmp(proc_name, "D3D11CreateDevice") == 0)
         {
-            if (g_original_create_device == nullptr)
-                g_original_create_device = reinterpret_cast<create_device_fn>(address);
+            void *entry = resolve_create_device(reinterpret_cast<void *>(address));
             LOG_DEBUG(blog::cat::hook, "GetProcAddress intercepted D3D11CreateDevice");
-            return reinterpret_cast<FARPROC>(&hooked_create_device);
+            return entry != nullptr ? reinterpret_cast<FARPROC>(entry) : address;
         }
     }
 

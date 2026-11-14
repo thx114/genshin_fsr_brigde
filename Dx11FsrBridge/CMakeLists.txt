@@ -364,6 +364,38 @@ enable_testing()
 add_test(NAME NgxParamMapTest COMMAND NgxParamMapTest)
 
 if(DX11FSRBRIDGE_BUILD_TESTS)
+    add_executable(CreateFunctionRoutesTest tests/CreateFunctionRoutesTest.cpp)
+    fsrbridge_configure_test(CreateFunctionRoutesTest)
+    target_include_directories(CreateFunctionRoutesTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME CreateFunctionRoutesTest COMMAND CreateFunctionRoutesTest)
+    add_executable(ComMethodRoutesTest tests/ComMethodRoutesTest.cpp)
+    fsrbridge_configure_test(ComMethodRoutesTest)
+    target_include_directories(ComMethodRoutesTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME ComMethodRoutesTest COMMAND ComMethodRoutesTest)
+
+    foreach(provider IN ITEMS First Second)
+        add_library(CreateRouteProvider${provider} SHARED
+            tests/create-routing/Provider.cpp tests/create-routing/Provider.def)
+        set_target_properties(CreateRouteProvider${provider} PROPERTIES OUTPUT_NAME d3d11
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/create-routing/${provider}"
+            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/create-routing/${provider}")
+    endforeach()
+    target_compile_definitions(CreateRouteProviderFirst PRIVATE FIXTURE_RESULT=0x80004004)
+    target_compile_definitions(CreateRouteProviderSecond PRIVATE FIXTURE_RESULT=0x80070057)
+    foreach(importer IN ITEMS First Second)
+        add_library(CreateRouteImports${importer} SHARED tests/create-routing/Imports.cpp)
+        target_link_libraries(CreateRouteImports${importer} PRIVATE CreateRouteProviderFirst)
+    endforeach()
+    add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
+    fsrbridge_configure_test(CreateRouteIntegrationTest)
+    foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4 warp)
+        add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest
+            "$<TARGET_FILE:Dx11FsrBridge>"
+            "$<TARGET_FILE:CreateRouteProviderFirst>" "$<TARGET_FILE:CreateRouteProviderSecond>"
+            "$<TARGET_FILE:CreateRouteImportsFirst>" "$<TARGET_FILE:CreateRouteImportsSecond>" ${mode})
+        set_tests_properties(CreateRouteIntegration-${mode} PROPERTIES TIMEOUT 30)
+    endforeach()
+
     # il2cpp callsite hook：观察/跳过/还原模式 + per-instance 隔离 + 相机 hook。
     # 需链 Il2CppCallSiteHook.cpp。**此测试已实测通过**。
     add_executable(Il2CppCallSiteHookTest
