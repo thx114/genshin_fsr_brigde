@@ -14,6 +14,7 @@
 #include "CreateFunctionRoutes.h"
 #include "ComMethodRoutes.h"
 #include "InterfaceVtableLayout.h"
+#include "D3D11CreationScope.h"
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
@@ -15104,6 +15105,14 @@ void install_factory_hooks_from_device(ID3D11Device *device)
     dxgi_device->Release();
 }
 
+void observe_created_device(ID3D11Device *device, ID3D11DeviceContext *context)
+{
+    install_device_hooks(device);
+    install_factory_hooks_from_device(device);
+    install_context_hooks(context);
+    route_from_d3d11_device(device);
+}
+
 HRESULT WINAPI hooked_create_device_and_swapchain(
     IDXGIAdapter *adapter,
     D3D_DRIVER_TYPE driver_type,
@@ -15119,9 +15128,10 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
     ID3D11DeviceContext **context)
 {
     // 旧 On12 引导移除（旧方案隔离）。
+    D3D11CreationScope creation;
     DXGI_SWAP_CHAIN_DESC effective_swapchain_desc {};
     const DXGI_SWAP_CHAIN_DESC *effective_desc = swapchain_desc;
-    if (g_config.native_ldr_swapchain_unorm && swapchain_desc != nullptr &&
+    if (creation.outermost() && g_config.native_ldr_swapchain_unorm && swapchain_desc != nullptr &&
         swapchain_desc->BufferDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
     {
         effective_swapchain_desc = *swapchain_desc;
@@ -15144,12 +15154,9 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         feature_level,
         context);
 
-    if (SUCCEEDED(hr))
+    if (creation.outermost() && SUCCEEDED(hr))
     {
-        install_device_hooks(device != nullptr ? *device : nullptr);
-        install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
-        install_context_hooks(context != nullptr ? *context : nullptr);
-        route_from_d3d11_device(device != nullptr ? *device : nullptr); // 设备级路由补检
+        observe_created_device(device != nullptr ? *device : nullptr, context != nullptr ? *context : nullptr);
         if (swapchain != nullptr && *swapchain != nullptr)
         {
             DXGI_SWAP_CHAIN_DESC created_desc {};
@@ -15176,6 +15183,7 @@ HRESULT WINAPI hooked_create_device(
     ID3D11DeviceContext **context)
 {
     // 旧 On12 引导移除（旧方案隔离）。
+    D3D11CreationScope creation;
     const HRESULT hr = DeviceCreateRoutes::original()(
         adapter,
         driver_type,
@@ -15188,12 +15196,9 @@ HRESULT WINAPI hooked_create_device(
         feature_level,
         context);
 
-    if (SUCCEEDED(hr))
+    if (creation.outermost() && SUCCEEDED(hr))
     {
-        install_device_hooks(device != nullptr ? *device : nullptr);
-        install_factory_hooks_from_device(device != nullptr ? *device : nullptr);
-        install_context_hooks(context != nullptr ? *context : nullptr);
-        route_from_d3d11_device(device != nullptr ? *device : nullptr); // 设备级路由补检
+        observe_created_device(device != nullptr ? *device : nullptr, context != nullptr ? *context : nullptr);
         LOG_INFO(blog::cat::core, "hooked D3D11CreateDevice");
     }
     return hr;

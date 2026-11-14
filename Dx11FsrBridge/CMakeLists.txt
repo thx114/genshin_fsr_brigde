@@ -390,7 +390,7 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
     fsrbridge_configure_test(CreateRouteIntegrationTest)
     foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4
-        resize-routing resize-routing-reversed warp)
+        resize-routing resize-routing-reversed warp wrapping-boundary wrapping-boundary-combined wrapping-boundary-retry)
         add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest
             "$<TARGET_FILE:Dx11FsrBridge>"
             "$<TARGET_FILE:CreateRouteProviderFirst>" "$<TARGET_FILE:CreateRouteProviderSecond>"

@@ -95,11 +95,13 @@ int wmain(int argc, wchar_t **argv)
         return EXCEPTION_EXECUTE_HANDLER;
     });
     const std::wstring mode = argv[6];
-    const bool nested = mode == L"nested" || mode == L"nested-success";
     const bool resize_routing = mode == L"resize-routing" || mode == L"resize-routing-reversed";
     const bool hdr_swapchain = mode == L"swapchain4" || resize_routing;
     const bool swapchain_mode = mode == L"swapchain" || hdr_swapchain;
-    const bool success = mode == L"success" || mode == L"nested-success" || swapchain_mode;
+    const bool creation_boundary = mode == L"wrapping-boundary" || mode == L"wrapping-boundary-combined" ||
+        mode == L"wrapping-boundary-retry";
+    const bool nested = mode == L"nested" || mode == L"nested-success" || creation_boundary;
+    const bool success = mode == L"success" || mode == L"nested-success" || swapchain_mode || creation_boundary;
     const HMODULE first = LoadLibraryW(argv[2]);
     const HMODULE second = LoadLibraryW(argv[3]);
     const HMODULE imports1 = LoadLibraryW(argv[4]);
@@ -158,7 +160,56 @@ int wmain(int argc, wchar_t **argv)
         belongs_to(bridge, reinterpret_cast<void *>(device2)) &&
         belongs_to(bridge, reinterpret_cast<void *>(combined1)) &&
         belongs_to(bridge, reinterpret_cast<void *>(combined2)), "both creation APIs actually enter production bridge");
-    if (resize_routing)
+    if (creation_boundary)
+    {
+        if (mode == L"wrapping-boundary-retry")
+        {
+            for (const HMODULE provider : {first, second})
+                reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetSuccess"))(FALSE);
+            expect(call_device(device2) == E_INVALIDARG, "failed nested creation retains exact failure");
+            for (const HMODULE provider : {first, second})
+                reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetSuccess"))(TRUE);
+        }
+        ID3D11Device *device = nullptr;
+        ID3D11DeviceContext *context = nullptr;
+        HRESULT result = E_UNEXPECTED;
+        if (mode == L"wrapping-boundary-combined")
+        {
+            reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(second, "SetCombinedUsesDevice"))(TRUE);
+            result = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(combined2)(nullptr,
+                D3D_DRIVER_TYPE_NULL, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, nullptr,
+                nullptr, &device, nullptr, &context);
+        }
+        else
+            result = call_device(device2, &device, &context);
+        expect(result == S_OK && device && context, "outer wrapper creation succeeds");
+        const unsigned premature = reinterpret_cast<unsigned(WINAPI *)()>(
+            GetProcAddress(second, "GetEarlyObservation"))();
+        std::printf("methods changed before wrapper returned: %u\n", premature);
+        expect(premature == 0, "inner device, context and factory remain untouched during wrapping");
+        if (result != S_OK || !device || !context)
+            return 15;
+        expect(belongs_to(bridge, (*reinterpret_cast<void ***>(device))[3]),
+            "outer returned device is observed after wrapping");
+        D3D11_BUFFER_DESC desc {};
+        desc.ByteWidth = 16;
+        expect(device->CreateBuffer(&desc, nullptr, nullptr) == E_INVALIDARG,
+            "completed wrapper keeps matching receiver and original");
+        const auto native_context = reinterpret_cast<ID3D11DeviceContext *(WINAPI *)()>(
+            GetProcAddress(first, "GetContext"))();
+        expect(belongs_to(bridge, (*reinterpret_cast<void ***>(native_context))[13]) &&
+            !belongs_to(bridge, (*reinterpret_cast<void ***>(context))[13]),
+            "native execution is observed after return while proxy retains draw processing");
+        context->Draw(5, 1);
+        for (const HMODULE provider : {first, second})
+        {
+            expect(reinterpret_cast<unsigned(WINAPI *)()>(GetProcAddress(provider, "GetDraws"))() == 1,
+                "proxy and runtime each process the draw exactly once");
+            expect(reinterpret_cast<unsigned(WINAPI *)()>(GetProcAddress(provider, "GetWrongThis"))() == 0,
+                "construction boundary preserves exact COM receiver");
+        }
+    }
+    else if (resize_routing)
     {
         ID3D11Device *device = nullptr;
         expect(call_device(device1, &device) == S_OK && device, "single provider creates device");

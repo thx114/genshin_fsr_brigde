@@ -13,6 +13,11 @@
 
 - **DX11 FSR2 导出层路线**：是否把 FSR2 以导出层形式暴露，至今未定案。
 - **OptiScaler `Dx11wDx12` 开启帧生成会闪退**：现象稳定复现，根因未定位。
+- **GIMI 与桥共同加载的启动退出**：用户已确认单独 GIMI 能启动，共同加载仍有启动退出，
+  本局尚无异常调用栈，不能沿用其他加载组合的归因。`D3D11CreationScope.h` 与两个创建入口
+  现将对象观察推迟至最外层包装返回；实际 DLL 宿主覆盖内层方法身份、跨 API 嵌套及失败重试，
+  但尚未通过真实 GIMI 新局。需要绑定同局 PID、实际模块身份与异常栈后继续定位，
+  不能用离线创建边界用例宣称稳定性或性能改善。
 - **COM 对象同址重建的 Hook 身份与退休**：`Dx11FsrBridge.cpp` 的 `clone_and_patch_vtable` 和
   `ensure_context_device_texture_hook` 只按裸地址记录安装成功，没有对象销毁的退休入口。设备、
   context、factory 或 swapchain 销毁后复用地址，可能跳过新对象的安装，已发布的克隆表也一直保留。

@@ -14,6 +14,8 @@ bool extended_context = false;
 bool successful_swapchain = false;
 bool hdr_swapchain = false;
 bool return_wrapper_chain = false;
+bool combined_uses_device = false;
+std::atomic<unsigned> early_observation {};
 struct Device
 {
     void **vtable;
@@ -299,6 +301,29 @@ extern "C" __declspec(dllexport) void WINAPI SetInner(HMODULE module)
     inner_module = module;
 }
 
+extern "C" __declspec(dllexport) void WINAPI SetCombinedUsesDevice(BOOL enabled)
+{
+    combined_uses_device = enabled != FALSE;
+}
+
+extern "C" __declspec(dllexport) unsigned WINAPI GetMutatedMethods()
+{
+    return (device_object.vtable[3] != reinterpret_cast<void *>(&create_buffer)) +
+        (context_object.vtable[13] != reinterpret_cast<void *>(&draw)) +
+        (factory_object.vtable[10] != reinterpret_cast<void *>(&create_swapchain));
+}
+
+extern "C" __declspec(dllexport) unsigned WINAPI GetEarlyObservation()
+{
+    return early_observation.load();
+}
+
+void observe_before_wrapping()
+{
+    const auto mutated = reinterpret_cast<unsigned(WINAPI *)()>(GetProcAddress(inner_module, "GetMutatedMethods"));
+    early_observation += mutated();
+}
+
 extern "C" __declspec(dllexport) unsigned WINAPI GetCalls()
 {
     return calls.load();
@@ -317,6 +342,8 @@ extern "C" __declspec(dllexport) HRESULT WINAPI FixtureCreateDevice(
         const HRESULT expected = successful ? S_OK : E_ABORT;
         if (!inner || inner(adapter, driver, software, flags, levels, count, sdk, device, level, context) != expected)
             return E_UNEXPECTED;
+        if (successful)
+            observe_before_wrapping();
     }
     if (successful)
     {
@@ -337,11 +364,34 @@ extern "C" __declspec(dllexport) HRESULT WINAPI FixtureCreateDeviceAndSwapChain(
     ++calls;
     if (inner_module != nullptr)
     {
-        const auto inner = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
-            GetProcAddress(inner_module, "D3D11CreateDeviceAndSwapChain"));
-        if (!inner || inner(adapter, driver, software, flags, levels, count, sdk,
-            desc, swapchain, device, level, context) != E_ABORT)
+        HRESULT result = E_UNEXPECTED;
+        if (combined_uses_device)
+        {
+            const auto inner = reinterpret_cast<decltype(&D3D11CreateDevice)>(
+                GetProcAddress(inner_module, "D3D11CreateDevice"));
+            if (inner)
+                result = inner(adapter, driver, software, flags, levels, count, sdk, device, level, context);
+        }
+        else
+        {
+            const auto inner = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
+                GetProcAddress(inner_module, "D3D11CreateDeviceAndSwapChain"));
+            if (inner)
+                result = inner(adapter, driver, software, flags, levels, count, sdk,
+                    desc, swapchain, device, level, context);
+        }
+        if (result != (successful ? S_OK : E_ABORT))
             return E_UNEXPECTED;
+        if (successful)
+            observe_before_wrapping();
+    }
+    if (successful)
+    {
+        if (device)
+            *device = reinterpret_cast<ID3D11Device *>(&device_object);
+        if (context)
+            *context = reinterpret_cast<ID3D11DeviceContext *>(&context_object);
+        return S_OK;
     }
     return static_cast<HRESULT>(FIXTURE_RESULT);
 }
