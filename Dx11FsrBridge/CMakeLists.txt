@@ -389,6 +389,8 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     endforeach()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
     fsrbridge_configure_test(CreateRouteIntegrationTest)
+    target_compile_definitions(CreateRouteIntegrationTest PRIVATE
+        DX11FSRBRIDGE_TEST_NGX=$<BOOL:${DX11FSRBRIDGE_ENABLE_NGX}>)
     foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4
         resize-routing resize-routing-reversed warp wrapping-boundary wrapping-boundary-combined wrapping-boundary-retry)
         add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest

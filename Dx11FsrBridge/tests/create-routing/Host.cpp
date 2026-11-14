@@ -9,6 +9,9 @@
 
 namespace
 {
+// 2026-11-14：宿主选择 ngx，但 OFF 构型不接受该后端。没有其它启用条件时，
+// 交换链应保留原方法；ON 构型仍须检查生产 DLL 确实接管，而非只验证透传结果。
+constexpr bool k_ngx_swapchain_hooks = DX11FSRBRIDGE_TEST_NGX != 0;
 int failures = 0;
 void expect(bool condition, const char *what)
 {
@@ -235,8 +238,8 @@ int wmain(int argc, wchar_t **argv)
                 chains[i], "factory returns distinct-layout swapchain");
             if (!chains[i])
                 return 14;
-            expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chains[i]))[14]),
-                "each ResizeTarget actually enters production bridge");
+            expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chains[i]))[14]) == k_ngx_swapchain_hooks,
+                "ResizeTarget hook presence matches the compiled backend");
         }
         expect(chains[0] != chains[1], "two live swapchains have distinct receiver identities");
         DXGI_MODE_DESC target {};
@@ -372,8 +375,8 @@ int wmain(int argc, wchar_t **argv)
                     reinterpret_cast<void **>(&chain3))) && chain3, "guarded SwapChain3 returned");
                 if (!chain3)
                     return 10;
-                expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chain3))[13]),
-                    "SwapChain3 actually hooked by production DLL");
+                expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chain3))[13]) == k_ngx_swapchain_hooks,
+                    "SwapChain3 hook presence matches the compiled backend");
                 expect(chain3->ResizeBuffers1(2, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, 0,
                     nullptr, nullptr) == expected, "SwapChain3 final slot39 survives full-table clone");
                 if (hdr_swapchain)
@@ -384,8 +387,9 @@ int wmain(int argc, wchar_t **argv)
                     if (!chain4)
                         return 11;
                     void **methods = *reinterpret_cast<void ***>(chain4);
-                    expect(!belongs_to(bridge, methods[39]) && belongs_to(bridge, methods[40]),
-                        "SwapChain4 hooks HDR slot40 and preserves ResizeBuffers1 slot39");
+                    expect(!belongs_to(bridge, methods[39]) &&
+                        belongs_to(bridge, methods[40]) == k_ngx_swapchain_hooks,
+                        "SwapChain4 HDR slot40 matches backend and preserves ResizeBuffers1 slot39");
                     expect(chain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr) == expected,
                         "HDR metadata retains matching provider and exact receiver");
                     chain4->Release();
