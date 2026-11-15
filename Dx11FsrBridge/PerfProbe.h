@@ -1869,6 +1869,21 @@ inline std::atomic<std::uint32_t> g_entry_filter_canary_stride { 64 };
 inline std::atomic_uint64_t g_entry_filter_sequence { 0 };   // canary 抽样序号（非区间）
 inline std::atomic_uint64_t g_entry_filter_skipped { 0 };    // 被入口淘汰的调用数
 inline std::atomic_uint64_t g_entry_filter_canary { 0 };     // 被 canary 放行的非 3 调用数
+#if !defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+// 2026-11-16：sequence 只给 stride>1 编号，扣掉其中的 canary 就是这一路的拒绝数。
+// stride=0 的拒绝仍单独计数；stride=1 不消耗序号，切换步长也不改变原抽样相位。
+inline std::atomic_uint64_t g_numbered_canaries { 0 };
+#endif
+inline std::uint64_t entry_skipped()
+{
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    return g_entry_filter_skipped.load(std::memory_order_relaxed);
+#else
+    const auto numbered = g_numbered_canaries.load(std::memory_order_acquire);
+    return g_entry_filter_sequence.load(std::memory_order_relaxed) - numbered +
+        g_entry_filter_skipped.load(std::memory_order_relaxed);
+#endif
+}
 inline std::atomic_uint64_t g_entry_filter_non3_identified { 0 }; // 非 3 且识别成功的次数
 inline std::atomic<std::uint32_t> g_entry_filter_disable_element_count { 0 };
 // 初始值 = `unknown`（**不是 0**：0 是 `indexed` ⇒ 会把"还没触发"打印成 `disable_entry=ix`，
@@ -1942,10 +1957,15 @@ inline DrawEntryAdmit draw_entry_filter_admit(std::uint32_t element_count)
             detail::g_entry_filter_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((sequence % stride) != 0)
         {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
             detail::g_entry_filter_skipped.fetch_add(1, std::memory_order_relaxed);
+#endif
             result.admitted = false;
             return result;
         }
+#if !defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        detail::g_numbered_canaries.fetch_add(1, std::memory_order_release);
+#endif
     }
     detail::g_entry_filter_canary.fetch_add(1, std::memory_order_relaxed);
     result.canary = true;
@@ -2000,7 +2020,7 @@ inline void note_draw_identified_element_count(std::uint32_t element_count, Draw
         const std::string line = format_draw_entry_filter_disabled(
             element_count, entry, canary,
             detail::g_entry_filter_non3_identified.load(std::memory_order_relaxed),
-            detail::g_entry_filter_skipped.load(std::memory_order_relaxed),
+            detail::entry_skipped(),
             detail::g_entry_filter_canary.load(std::memory_order_relaxed),
             draw_entry_filter_canary_stride());
         sink(line.c_str());
@@ -2040,6 +2060,7 @@ inline void fill_draw_entry_filter_state(DrawEntryFilterSnapshot &out_snapshot)
     out_snapshot.disable_at_ms = detail::g_entry_filter_disable_at_ms.load(std::memory_order_relaxed);
 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 // flush 用：读走（并复位）区间计数。**必须无条件调用**（同 B108 纪律：防残值串区间）。
 inline DrawEntryFilterSnapshot snapshot_draw_entry_filter()
 {
@@ -2052,12 +2073,14 @@ inline DrawEntryFilterSnapshot snapshot_draw_entry_filter()
     return snapshot;
 }
 
+#endif
+
 // 单测/诊断用：只读，**不动任何计数**。
 inline DrawEntryFilterSnapshot read_draw_entry_filter()
 {
     DrawEntryFilterSnapshot snapshot;
     fill_draw_entry_filter_state(snapshot);
-    snapshot.skipped = detail::g_entry_filter_skipped.load(std::memory_order_relaxed);
+    snapshot.skipped = detail::entry_skipped();
     snapshot.canary = detail::g_entry_filter_canary.load(std::memory_order_relaxed);
     snapshot.non3_identified =
         detail::g_entry_filter_non3_identified.load(std::memory_order_relaxed);
