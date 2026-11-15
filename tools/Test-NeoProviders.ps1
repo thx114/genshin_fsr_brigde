@@ -5,6 +5,8 @@ param(
     [Parameter(Mandatory)][string]$FfxDll,
     [Parameter(Mandatory)][string]$F6FixtureDirectory,
     [ValidateSet('ngx', 'ngx-resize', 'ngx-receipt', 'ngx-skip-control', 'ngx-v1', 'ngx-v1-resize', 'ngx-v1-skip-control',
+        'ngx-v1-ao-on', 'ngx-v1-ao-off', 'ngx-nvidia-ao-on', 'ngx-nvidia-ao-off', 'ngx-v1-present', 'ngx-nvidia-present',
+        'ngx-v1-dlaa', 'ngx-nvidia-dlaa',
         'native', 'native-async', 'native-resize', 'native-fsr3', 'native-fsr4', 'native-fsr4-fallback',
         'native-reject', 'native-fallback')][string[]]$Cases = @(
         'ngx', 'ngx-resize', 'ngx-receipt', 'native', 'native-async', 'native-resize', 'native-reject', 'native-fallback'),
@@ -35,6 +37,10 @@ foreach ($case in $Cases)
     if ($case -eq 'ngx-receipt')
     {
         Copy-Item -LiteralPath "$build\F6ReceiptProvider.dll" -Destination $path
+    }
+    elseif ($case -like 'ngx-nvidia-*')
+    {
+        Copy-Item -LiteralPath "$fixture\nvngx_dlss.dll" -Destination $path
     }
     elseif ($case -like 'ngx*')
     {
@@ -69,9 +75,9 @@ foreach ($case in $Cases)
     $null = $process.Handle # 保留句柄，PS 5.1 才能在进程结束后读取 ExitCode。
     $complete = $process.WaitForExit($TimeoutSeconds * 1000)
     if (-not $complete) { $process.Kill(); $process.WaitForExit() }
-    $pixels = @(Select-Lines "$path\provider-receipt.txt" '^target=|^provider (host|export):|^receipt host:')
+    $pixels = @(Select-Lines "$path\provider-receipt.txt" '^target=|^provider (host|export|dimensions):|^receipt host:|^native ao:|^present host:')
     $mock = if ($case -eq 'ngx-receipt') { @(Select-Lines $stdout '^receipt fixture:') } else { @() }
-    $bridge = @(Select-Lines "$path\Dx11FsrBridge.log" 'ffx12_result|ngx_core release_all|ngx_core create_feature|ngx_in jitter|sdk_selected|ffx12_version|FFX : FSR|ngx_out')
+    $bridge = @(Select-Lines "$path\Dx11FsrBridge.log" 'ffx12_result|ngx_core (release_all|create_feature|provider resolved=)|ngx_in jitter|sdk_selected|ffx12_version|FFX : FSR|ngx_out')
     $f6 = @(Select-Lines "$path\OptiScaler.log" 'NVSDK_NGX_D3D11_.*Feature|Hotfix.SkipFirstFrames:|F6 evaluate receipt v1')
     $writes = @($bridge -match 'rc=DISPATCH_OK copy_enqueued=1').Count
     $samples = @($pixels -match '^target=')
@@ -91,9 +97,46 @@ foreach ($case in $Cases)
             @($bridge -match 'ngx_out copy .*evidence=f6_receipt_v1').Count -ge 1 -and
             @($bridge -match 'evidence=ngx_status_only').Count -eq 0
     }
-    switch ($case)
+    switch -Wildcard ($case)
     {
         'ngx-v1' { }
+        'ngx-v1-dlaa' {
+            $passed = $passed -and
+                @($pixels -eq 'provider dimensions: render=512x512 display=512x512').Count -eq 1 -and
+                @($bridge -match 'ngx_out copy .*evidence=f6_receipt_v1').Count -eq 2 -and
+                @($f6 -match 'F6 evaluate receipt v1 .*status=2 result=1(?:\s|$)').Count -eq 2
+        }
+        'ngx-nvidia-dlaa' {
+            $passed = $passed -and
+                @($pixels -eq 'provider dimensions: render=512x512 display=512x512').Count -eq 1 -and
+                @($bridge -match 'ngx_core provider resolved=nvidia_registry ').Count -eq 1 -and
+                @($bridge -match 'ngx_out copy .*evidence=ngx_status_only').Count -eq 2 -and $f6.Count -eq 0
+        }
+        'ngx-v1-present' {
+            $passed = $passed -and @($pixels -match '^present host: hr=00000000$').Count -eq 2 -and
+                @($bridge -match 'ngx_out copy .*evidence=f6_receipt_v1').Count -eq 2 -and
+                @($f6 -match 'F6 evaluate receipt v1 .*status=2 result=1(?:\s|$)').Count -eq 2
+        }
+        'ngx-nvidia-present' {
+            $passed = $passed -and @($pixels -match '^present host: hr=00000000$').Count -eq 2 -and
+                @($bridge -match 'ngx_core provider resolved=nvidia_registry ').Count -eq 1 -and
+                @($bridge -match 'ngx_out copy .*evidence=ngx_status_only').Count -eq 2 -and $f6.Count -eq 0
+        }
+        'ngx-v1-ao-*' {
+            # 像素负控不能代替真 F6 同次回执：两帧都必须由实际执行的 provider 交付。
+            $enabled = if ($case -eq 'ngx-v1-ao-on') { 1 } else { 0 }
+            $passed = $passed -and
+                @($pixels -eq "native ao: enabled=$enabled provider=f6 neutral=1 contact=1").Count -eq 1 -and
+                @($bridge -match 'ngx_out copy .*evidence=f6_receipt_v1').Count -eq 2 -and
+                @($f6 -match 'F6 evaluate receipt v1 .*status=2 result=1(?:\s|$)').Count -eq 2
+        }
+        'ngx-nvidia-ao-*' {
+            $enabled = if ($case -eq 'ngx-nvidia-ao-on') { 1 } else { 0 }
+            $passed = $passed -and
+                @($pixels -eq "native ao: enabled=$enabled provider=nvidia neutral=1 contact=1").Count -eq 1 -and
+                @($bridge -match 'ngx_core provider resolved=nvidia_registry ').Count -eq 1 -and
+                @($bridge -match 'ngx_out copy .*evidence=ngx_status_only').Count -eq 2 -and $f6.Count -eq 0
+        }
         'ngx-v1-resize' {
             $passed = $passed -and @($bridge -match 'ngx_core create_feature ok=1 ').Count -eq 3
         }

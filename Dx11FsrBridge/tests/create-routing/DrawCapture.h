@@ -3,10 +3,13 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <optional>
+#include <span>
 #include <vector>
 #include "../../runtime/CandidateSignature.h"
 
@@ -17,19 +20,36 @@ enum class CaptureEntry
     draw, indexed, instanced, indexed_instanced, indirect, indexed_indirect, command_list, dispatch
 };
 
+inline constexpr std::uint32_t k_before_sr_scene_color = 0xFF286AA4u;
+inline constexpr std::uint32_t k_before_sr_filtered_color = 0xFFC9512Bu;
+
+struct CaptureExtent
+{
+    UINT width, height;
+};
+
+struct CaptureGuidePixel
+{
+    UINT x, y;
+    std::uint32_t motion;
+    float depth;
+};
+
 struct CaptureFrame
 {
-    UINT render_size = 64;
-    UINT display_size = 128;
-    void (*publish_render)(UINT render, UINT display) = nullptr;
+    CaptureExtent render {64, 64};
+    CaptureExtent display {128, 128};
+    std::function<void()> publish_render;
     bool expect_provider = false;
     UINT color_r10 = 32, color_g10 = 96, color_b10 = 900;
     DXGI_FORMAT color_source_view = DXGI_FORMAT_UNKNOWN;
     std::optional<std::uint32_t> exact_provider_pixel;
+    std::uint32_t alternate_scene_pixel = k_before_sr_scene_color;
+    std::span<const CaptureGuidePixel> guides;
+    bool typeless_depth = false;
+    bool replay_draw = false;
+    bool expect_attenuated_color = false;
 };
-
-inline constexpr std::uint32_t k_before_sr_scene_color = 0xFF286AA4u;
-inline constexpr std::uint32_t k_before_sr_filtered_color = 0xFFC9512Bu;
 
 inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     CaptureEntry entry = CaptureEntry::draw, const CaptureFrame &frame = {},
@@ -71,18 +91,20 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     ID3D11UnorderedAccessView *writes[2] {};
     D3D11_TEXTURE2D_DESC desc {};
     desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
-    auto pixels = frame.publish_render
-        ? std::vector<std::uint32_t>(static_cast<std::size_t>(frame.display_size) * frame.display_size) :
-          std::vector<std::uint32_t> {};
+    std::vector<std::uint32_t> pixels;
     // 非原生分支只可能由场景输入取得蓝色；原生目标一个红、一个绿。
     for (unsigned n = 0; n < textures.size(); ++n)
     {
-        desc.Width = desc.Height = n == 1 ? 16 : n < 5 ? frame.render_size : frame.display_size;
+        const auto size = n == 1 ? CaptureExtent {16, 16} : n < 5 ? frame.render : frame.display;
+        desc.Width = size.width;
+        desc.Height = size.height;
         desc.Format = n == 2 ? DXGI_FORMAT_R32_FLOAT : n == 3 ?
             (frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16_FLOAT) :
             (n == 0 && frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM);
         const bool alternate_color = n == 0 && frame.color_source_view != DXGI_FORMAT_UNKNOWN;
+        const bool typeless_depth = n == 2 && frame.typeless_depth;
         if (alternate_color) desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        if (typeless_depth) desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.BindFlags = n < 7 ? D3D11_BIND_SHADER_RESOURCE :
             (compute ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_RENDER_TARGET);
         D3D11_SUBRESOURCE_DATA init {};
@@ -90,9 +112,19 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         {
             // 0.5/0.5 是 Genshin packed MV 的零运动，颜色让 RT 结果区别于原生像素。
             const auto packed_scene = 0xC0000000u | (frame.color_b10 << 20) | (frame.color_g10 << 10) | frame.color_r10;
-            const auto value = n == 0 ? (alternate_color ? k_before_sr_scene_color : packed_scene) :
+            const auto value = n == 0 ? (alternate_color ? frame.alternate_scene_pixel : packed_scene) :
                 n == 2 ? 0x3f000000u : n == 3 ? (512u << 10) | 512u : 0u;
-            std::fill(pixels.begin(), pixels.begin() + static_cast<std::size_t>(desc.Width) * desc.Height, value);
+            pixels.assign(static_cast<std::size_t>(desc.Width) * desc.Height, value);
+            if (n == 2 || n == 3)
+            {
+                // 2026-11-15（PR #16）：四个不同坐标，才能检测轴互换、旧内容复用以及错误读回行距。
+                for (const auto &probe : frame.guides)
+                {
+                    if (probe.x >= desc.Width || probe.y >= desc.Height) return false;
+                    const auto index = static_cast<std::size_t>(probe.y) * desc.Width + probe.x;
+                    pixels[index] = n == 2 ? std::bit_cast<std::uint32_t>(probe.depth) : probe.motion;
+                }
+            }
             init.pSysMem = pixels.data();
             init.SysMemPitch = desc.Width * sizeof(std::uint32_t);
         }
@@ -100,11 +132,11 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         if (n < 7)
         {
             D3D11_SHADER_RESOURCE_VIEW_DESC view {};
-            view.Format = frame.color_source_view;
+            view.Format = typeless_depth ? DXGI_FORMAT_R32_FLOAT : frame.color_source_view;
             view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             view.Texture2D.MipLevels = 1;
-            if (FAILED(device->CreateShaderResourceView(textures[n].Get(), alternate_color ? &view : nullptr,
-                &views[n]))) return false;
+            const auto *explicit_view = alternate_color || typeless_depth ? &view : nullptr;
+            if (FAILED(device->CreateShaderResourceView(textures[n].Get(), explicit_view, &views[n]))) return false;
             inputs[n] = views[n].Get();
         }
         else if (compute)
@@ -122,6 +154,18 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     if (entry == CaptureEntry::command_list && FAILED(device->CreateDeferredContext(0, &deferred))) return false;
     auto *commands = deferred ? deferred.Get() : context;
     ComPtr<ID3D11Buffer> constants, indices, arguments;
+    const auto bind_graphics = [&]
+    {
+        D3D11_VIEWPORT viewport {0, 0, static_cast<float>(frame.display.width),
+            static_cast<float>(frame.display.height), 0, 1};
+        commands->RSSetViewports(1, &viewport);
+        commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commands->VSSetShader(vs.Get(), nullptr, 0);
+        commands->PSSetShader(ps.Get(), nullptr, 0);
+        commands->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
+        commands->PSSetShaderResources(0, 7, inputs.data());
+        commands->OMSetRenderTargets(2, outputs, nullptr);
+    };
     if (!compute)
     {
         D3D11_BUFFER_DESC cb {};
@@ -130,15 +174,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         std::array<std::uint8_t, neo::graphics::k_min_fsr_constants> zero_constants {};
         const D3D11_SUBRESOURCE_DATA initial_cb {zero_constants.data(), 0, 0};
         if (FAILED(device->CreateBuffer(&cb, &initial_cb, &constants))) return false;
-        const auto size = static_cast<float>(frame.display_size);
-        D3D11_VIEWPORT viewport {0, 0, size, size, 0, 1};
-        commands->RSSetViewports(1, &viewport);
-        commands->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        commands->VSSetShader(vs.Get(), nullptr, 0);
-        commands->PSSetShader(ps.Get(), nullptr, 0);
-        commands->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
-        commands->PSSetShaderResources(0, 7, inputs.data());
-        commands->OMSetRenderTargets(2, outputs, nullptr);
+        bind_graphics();
     }
     if (entry == CaptureEntry::indexed || entry == CaptureEntry::indexed_instanced ||
         entry == CaptureEntry::indexed_indirect)
@@ -161,7 +197,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         const D3D11_SUBRESOURCE_DATA initial {args};
         if (FAILED(device->CreateBuffer(&indirect, &initial, &arguments))) return false;
     }
-    if (frame.publish_render) frame.publish_render(frame.render_size, frame.display_size);
+    if (frame.publish_render) frame.publish_render();
     switch (entry)
     {
     case CaptureEntry::draw:
@@ -186,7 +222,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     case CaptureEntry::dispatch:
         commands->CSSetShader(cs.Get(), nullptr, 0);
         commands->CSSetUnorderedAccessViews(0, 2, writes, nullptr);
-        commands->Dispatch(16, 16, 1);
+        commands->Dispatch((frame.display.width + 7) / 8, (frame.display.height + 7) / 8, 1);
         writes[0] = writes[1] = nullptr;
         commands->CSSetUnorderedAccessViews(0, 2, writes, nullptr);
         break;
@@ -209,8 +245,8 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         context->CopyResource(readback.Get(), textures[n + 7].Get());
         D3D11_MAPPED_SUBRESOURCE mapped {};
         if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
-        const auto center = frame.display_size / 2;
-        const auto *pixel = static_cast<const unsigned char *>(mapped.pData) + center * mapped.RowPitch + center * 4;
+        const auto *pixel = static_cast<const unsigned char *>(mapped.pData) +
+            (frame.display.height / 2) * mapped.RowPitch + (frame.display.width / 2) * 4;
         const bool native_pixel = pixel[n] == 255 && pixel[n ^ 1u] == 0 && pixel[2] == 0 && pixel[3] == 255;
         const auto close_to_input = [](unsigned value, unsigned ten_bit)
         {
@@ -220,7 +256,18 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         };
         std::uint32_t raw {};
         std::memcpy(&raw, pixel, sizeof(raw));
+        const auto attenuated = [&]
+        {
+            if (pixel[3] != (frame.alternate_scene_pixel >> 24)) return false;
+            for (unsigned i = 0; i < 3; ++i)
+            {
+                const unsigned original = (frame.alternate_scene_pixel >> (8u * i)) & 255u;
+                if (pixel[i] + 2u >= original || pixel[i] * 2u < original) return false;
+            }
+            return true;
+        };
         const bool provider_pixel = n == 0 ? pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 :
+            frame.expect_attenuated_color ? attenuated() :
             frame.exact_provider_pixel ? raw == *frame.exact_provider_pixel :
             close_to_input(pixel[0], frame.color_r10) && close_to_input(pixel[1], frame.color_g10) &&
             close_to_input(pixel[2], frame.color_b10);
@@ -230,6 +277,13 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
                 pixel[0], pixel[1], pixel[2], pixel[3], frame.expect_provider ? "provider" : "native", correct);
         context->Unmap(readback.Get(), 0);
         pixels_match &= correct;
+    }
+    if (pixels_match && frame.replay_draw && entry == CaptureEntry::draw)
+    {
+        // 2026-11-15（PR #16）：先验首笔写回。重复 Draw 可能回落原生，另由宿主验 Evaluate 次数。
+        bind_graphics();
+        commands->Draw(3, 0);
+        commands->OMSetRenderTargets(0, nullptr, nullptr);
     }
     return pixels_match && SUCCEEDED(device->GetDeviceRemovedReason());
 }

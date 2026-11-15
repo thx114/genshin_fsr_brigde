@@ -460,6 +460,23 @@ void test_jitter_mode3_range()
     }
 }
 
+void test_jitter_pixel_reference()
+{
+    // 2026-11-15（PR #16）：两个轴和两帧各用不同的相位；只检查绝对值 <= 半像素会漏掉错帧。
+    // 320×192 是合成渲染区域，输出大小无关。以固定的像素偏移为参考，不调用旧公式 oracle。
+    JitterInput in { 0.25f / 320, 0.875f / 192, 320, 192, 3, false, 0.625f / 320, 0.125f / 192 };
+    const auto current = map_jitter(in);
+    CHECK(current.valid);
+    CHECK_BITS(current.px, 0.25f, "current x: render pixels");
+    CHECK_BITS(current.py, -0.375f, "current y: render pixels");
+
+    in.delay_one_frame = true;
+    const auto previous = map_jitter(in);
+    CHECK(previous.valid);
+    CHECK_BITS(previous.px, -0.125f, "previous x: render pixels");
+    CHECK_BITS(previous.py, 0.375f, "previous y: render pixels");
+}
+
 // ===========================================================================
 // [6] map_mv_scale —— 正/负 scale x 不同尺寸，逐位对 oracle
 // ===========================================================================
@@ -925,6 +942,7 @@ int main()
     test_jitter_mode2_raw();
     test_jitter_zero_and_default();
     test_jitter_mode3_range();
+    test_jitter_pixel_reference();
     test_mv_scale();
     test_reset();
     test_reactive_size_ok();

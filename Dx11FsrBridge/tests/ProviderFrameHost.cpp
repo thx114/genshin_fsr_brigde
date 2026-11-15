@@ -1,7 +1,9 @@
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 
 #include "create-routing/DrawCapture.h"
+#include "NgxInputMapFixture.h"
 #include "../game/AnchorPatterns.h"
 #include "../ngx/F6EvalReceiptV1.h"
 #include "../interop/BeforeSrV1.h"
@@ -31,24 +33,82 @@ constexpr auto build_fixture_methods()
 #pragma section(".neort", read, execute)
 __declspec(allocate(".neort")) constinit const auto k_methods = build_fixture_methods();
 
-void publish_render(UINT render, UINT display)
+struct RenderFixture
 {
-    alignas(8) static std::array<std::uint8_t, 0x80> instance {};
-    static std::uint32_t frame = 0;
-    const auto put = [&](std::size_t offset, const auto &value)
+    alignas(8) std::array<std::uint8_t, 0x80> fields {};
+    std::uint32_t frame = 0;
+
+    std::uint64_t key() const { return reinterpret_cast<std::uint64_t>(fields.data()); }
+
+    void publish(CaptureExtent render, CaptureExtent display, float x, float y)
     {
-        std::memcpy(instance.data() + offset, &value, sizeof(value));
-    };
-    const float zero = 0.0f;
-    put(0x24, zero);
-    put(0x28, zero);
-    put(0x50, ++frame);
-    put(0x58, render);
-    put(0x5C, render);
-    put(0x68, display);
-    put(0x6C, display);
-    using Observe = void (*)(void *, void *);
-    reinterpret_cast<Observe>(k_methods.data() + k_render_offset)(instance.data(), nullptr);
+        const auto put = [&](std::size_t offset, const auto &value)
+        {
+            std::memcpy(fields.data() + offset, &value, sizeof(value));
+        };
+        put(0x24, x);
+        put(0x28, y);
+        put(0x50, ++frame);
+        put(0x58, render.width);
+        put(0x5C, render.height);
+        put(0x68, display.width);
+        put(0x6C, display.height);
+        using Observe = void (*)(void *, void *);
+        reinterpret_cast<Observe>(k_methods.data() + k_render_offset)(fields.data(), nullptr);
+    }
+};
+
+CaptureFrame square_frame(UINT size, bool expect_provider, UINT r = 32, UINT g = 96, UINT b = 900,
+    bool same_size = false)
+{
+    static RenderFixture instance;
+    const UINT display_size = same_size ? size : size * 2;
+    const CaptureExtent render { size, size }, display { display_size, display_size };
+    return { render, display, [=] { instance.publish(render, display, 0.f, 0.f); }, expect_provider, r, g, b };
+}
+
+bool run_input_map(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
+    std::FILE *observations, bool delayed)
+{
+    using namespace neo::tests::input_map;
+    const auto configure = reinterpret_cast<Configure>(GetProcAddress(provider, k_configure));
+    const auto evaluate_count = reinterpret_cast<EvaluateCount>(GetProcAddress(provider, k_evaluate_count));
+    if (!configure || !evaluate_count) return false;
+
+    const CaptureExtent render { k_render_width, k_render_height }, display { k_display_width, k_display_height };
+    RenderFixture instances[2];
+    configure(delayed, instances[0].key(), instances[1].key());
+    for (unsigned n = 0; n < std::size(k_frames); ++n)
+    {
+        const auto &test = k_frames[n];
+        auto &instance = instances[test.instance];
+        const float x = test.phase_x / render.width, y = test.phase_y / render.height;
+        std::array<CaptureGuidePixel, k_probes.size()> guides {};
+        for (std::size_t i = 0; i < guides.size(); ++i)
+        {
+            const auto &probe = k_probes[i];
+            const auto &content = guide_at(n, i);
+            guides[i] = { static_cast<UINT>(probe.x), static_cast<UINT>(probe.y), content.packed_mv, content.depth };
+        }
+        CaptureFrame frame { render, display, [&] { instance.publish(render, display, x, y); }, true };
+        frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        frame.alternate_scene_pixel = test.color;
+        frame.exact_provider_pixel = test.color;
+        frame.guides = guides;
+        // 2026-11-15（PR #16）：不同的源/目标存储格式能检测误将源深度直接绑定给 Evaluate。
+        frame.typeless_depth = true;
+        // 最后一帧用同一绑定再次 Draw、不发布 Render；验证不会再进 F6。
+        frame.replay_draw = n + 1 == std::size(k_frames);
+        std::printf("source frame=%u instance=%c key=0x%llX game_frame=%u raw_jitter=(%.9g,%.9g) replay=%d\n",
+            n + 1, 'A' + static_cast<int>(test.instance), static_cast<unsigned long long>(instance.key()),
+            instance.frame + 1,
+            x, y, frame.replay_draw);
+        const bool written = draw_capture(&device, &context, CaptureEntry::draw, frame, observations);
+        const unsigned count = evaluate_count();
+        std::printf("delivery frame=%u eval_count_total=%u exact_output=%d\n", n + 1, count, written);
+        if (!written || count != n + 1) return false;
+    }
+    return true;
 }
 }
 
@@ -153,14 +213,31 @@ int wmain(int argc, wchar_t **argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const std::wstring_view mode = argc > 1 ? argv[1] : L"";
-    const bool receipt = mode == L"ngx-receipt";
+    const bool prewarm_retry = mode == L"ngx-prewarm-retry";
+    const bool prewarm = mode == L"ngx-prewarm" || prewarm_retry;
+    const bool check_prewarm = prewarm || mode == L"ngx-prewarm-off";
+    const bool receipt = check_prewarm || mode == L"ngx-receipt" || mode == L"ngx-receipt-dlaa";
+    const bool same_size = mode == L"ngx-receipt-dlaa" || mode == L"ngx-v1-dlaa" ||
+        mode == L"ngx-nvidia-dlaa";
     const bool before_sr = mode == L"ngx-before-sr";
-    const bool fixture = receipt || before_sr;
-    const wchar_t *fixture_name = receipt ? L"F6ReceiptProvider.dll" : L"BeforeSrProvider.dll";
+    const bool ao_v1 = mode == L"ngx-ao-v1";
+    const bool f6_ao = mode == L"ngx-v1-ao-on" || mode == L"ngx-v1-ao-off";
+    const bool nvidia_ao = mode == L"ngx-nvidia-ao-on" || mode == L"ngx-nvidia-ao-off";
+    const bool present_before_draw = mode == L"ngx-v1-present" || mode == L"ngx-nvidia-present";
+    const bool nvidia = nvidia_ao || mode == L"ngx-nvidia-present" || mode == L"ngx-nvidia-dlaa";
+    const bool ao_enabled = mode == L"ngx-ao" || ao_v1 || mode.ends_with(L"-ao-on");
+    const bool ao_fixture = mode == L"ngx-ao" || mode == L"ngx-ao-off" || ao_v1;
+    const bool test_ao = ao_fixture || f6_ao || nvidia_ao;
+    const bool delayed_input = mode == L"ngx-input-map-delayed";
+    const bool input_map = mode == L"ngx-input-map-current" || delayed_input;
+    const bool fixture = receipt || before_sr || input_map || ao_fixture;
+    const wchar_t *fixture_name = before_sr || (ao_fixture && !ao_v1) ? L"BeforeSrProvider.dll" :
+        L"F6ReceiptProvider.dll";
     if (argc != 2 && (argc != 4 || !fixture))
     {
         std::puts("Usage: ProviderFrameHost <case> (stage DLLs in working directory)");
-        std::puts("       ProviderFrameHost <ngx-receipt|ngx-before-sr> <bridge DLL> <fixture DLL>");
+        std::puts("       ProviderFrameHost <ngx-receipt|ngx-before-sr|ngx-input-map-{current,delayed}|ngx-ao[-off|-v1]> "
+            "<bridge DLL> <fixture DLL>");
         return 2;
     }
     if (argc == 4 && !stage_receipt_fixture(argv[2], argv[3], fixture_name))
@@ -172,9 +249,10 @@ int wmain(int argc, wchar_t **argv)
     const bool fsr4 = mode == L"native-fsr4";
     const bool native_resize = mode == L"native-resize";
     const bool receipt_skip = mode == L"ngx-v1-skip-control";
-    const bool real_receipt = mode == L"ngx-v1" || mode == L"ngx-v1-resize" || receipt_skip;
+    const bool real_receipt = mode == L"ngx-v1" || mode == L"ngx-v1-resize" || receipt_skip || f6_ao ||
+        mode == L"ngx-v1-present" || mode == L"ngx-v1-dlaa";
     const bool resize = mode == L"ngx-resize" || mode == L"ngx-v1-resize" || native_resize;
-    const bool ngx = mode == L"ngx" || mode == L"ngx-resize" || fixture || real_receipt;
+    const bool ngx = mode == L"ngx" || mode == L"ngx-resize" || fixture || real_receipt || nvidia;
     const bool missing = mode == L"native-fallback";
     const bool reject = mode == L"native-reject";
     const bool async = mode == L"native-async" || native_resize || reject || fsr3 || fsr4;
@@ -182,7 +260,7 @@ int wmain(int argc, wchar_t **argv)
     if (!ngx && !fallback && !async && mode != L"native") return 2;
     const auto root = std::filesystem::current_path();
     const auto bridge = root / L"Dx11FsrBridge.dll";
-    const auto provider = root / (fixture ? fixture_name : ngx ? L"OptiScaler.dll" :
+    const auto provider = root / (fixture ? fixture_name : nvidia ? L"nvngx_dlss.dll" : ngx ? L"OptiScaler.dll" :
         reject ? L"FsrRejectProvider.dll" : L"amd_fidelityfx_upscaler_dx12.dll");
     if (!std::filesystem::is_regular_file(bridge) || (!missing && !std::filesystem::is_regular_file(provider))) return 2;
     // SDK 日志可在多个线程写 stdout，不能与机器验收行共享输出流。
@@ -196,12 +274,19 @@ int wmain(int argc, wchar_t **argv)
     std::ofstream config(root / L"Dx11FsrBridge.ini", std::ios::out | std::ios::trunc);
     config << "[Dx11FsrBridge]\nEnabled=1\nRenderScaleMenu=0\nTransparentJitter=0\nFsr2TranslationMode=2\n"
         "Fsr2Mode2OnDemandState=1\nFsr2Il2CppHook=1\nFfx12=1\nFfx12Hdr=0\nFfx12NonLinear=0\n"
-        "Ffx12GpuInterop=1\nFfx12JitterMode=0\nFfx12JitterDelay=0\n"
-        "Ffx12AsyncUpscale=" << async << '\n'
+        "Ffx12GpuInterop=1\nFfx12JitterMode=" << (input_map ? 3 : 0) << "\nFfx12JitterDelay=" << delayed_input
+        << "\nFfx12AsyncUpscale=" << async << '\n'
         << "Fsr2Il2CppRenderRva=0x" << std::hex << ucb + k_render_offset << "\nFsr2Il2CppUcbRva=0x" << ucb << '\n';
     if (ngx)
     {
-        config << "Ffx12Backend=ngx\nNgxProvider=external\nNgxHdr=0\nNgxLogLevel=3\n";
+        config << "Ffx12Backend=ngx\nNgxHdr=0\nNgxLogLevel=3\nNgxProvider="
+            << (nvidia ? "nvidia" : "external") << '\n';
+        if (prewarm) config << "NgxPrewarmAtSwapchain=1\n";
+        if (test_ao)
+            config << "NgxBeforeSrAo=" << ao_enabled << "\nFfx12DepthInverted=1\nFfx12CameraNear=0.5\nFfx12CameraFar=100\n";
+        if (input_map)
+            config << "Fsr2MotionVectorScaleMode=1\nFfx12MotionScale=1.0\nFfx12MotionDecode=1\n"
+                "Ffx12DepthInverted=1\nFsr2MotionVectorsJittered=0\nNgxCrossKeyReuse=1\n";
     }
     else
     {
@@ -212,14 +297,33 @@ int wmain(int argc, wchar_t **argv)
     config.close();
     if (!config) return 2;
     HMODULE provider_module = nullptr;
-    if (ngx)
+    // 2026-11-15：NVIDIA 组由桥按注册表解析核心；宿主只提供 DLSS 模型，不替它加载 OptiScaler。
+    if (ngx && !nvidia)
     {
         provider_module = LoadLibraryW(provider.c_str());
         if (!provider_module || !GetProcAddress(provider_module, "NVSDK_NGX_D3D11_Init_Ext")) return 3;
         const bool has_receipt = GetProcAddress(provider_module, neo::ngx::k_f6_evaluate_v1) != nullptr;
-        const bool expect_receipt = receipt || real_receipt;
+        const bool expect_receipt = receipt || input_map || real_receipt || ao_v1;
         std::fprintf(observations.get(), "provider export: v1=%d expected=%d\n", has_receipt, expect_receipt);
         if (has_receipt != expect_receipt) return 3;
+        if (receipt && same_size)
+        {
+            using ConfigureDisplay = void (*)(unsigned, unsigned) noexcept;
+            const auto configure = reinterpret_cast<ConfigureDisplay>(
+                GetProcAddress(provider_module, "ConfigureReceiptFixtureDisplay"));
+            if (!configure) return 3;
+            configure(512, 512);
+        }
+    }
+    using InitCalls = unsigned (*)();
+    const auto init_calls = check_prewarm ? reinterpret_cast<InitCalls>(GetProcAddress(provider_module,
+        "ReceiptInitCalls")) : nullptr;
+    if (check_prewarm && (!init_calls || init_calls() != 0)) return 3;
+    if (prewarm_retry)
+    {
+        const auto refuse = reinterpret_cast<void (*)()>(GetProcAddress(provider_module, "RefuseEarlyInit"));
+        if (!refuse) return 3;
+        refuse();
     }
     const HMODULE bridge_module = LoadLibraryW(bridge.c_str());
     if (!bridge_module) return 3;
@@ -237,10 +341,101 @@ int wmain(int argc, wchar_t **argv)
         std::printf("D3D11 device failed: %08lX\n", static_cast<unsigned long>(hr));
         return 3;
     }
+    struct FixtureWindow
+    {
+        HWND handle = nullptr;
+        ~FixtureWindow() { if (handle) DestroyWindow(handle); }
+    } window;
+    Microsoft::WRL::ComPtr<IDXGISwapChain1> presentation;
+    if (present_before_draw || check_prewarm)
+    {
+        // 2026-11-16：旧桥普通 Draw 的回执通过，但真实 Present 后首帧捕获丢失；
+        // 必须在读取输出前验证首个 SR，不能靠读 Map 重装后第二帧成功掩盖。
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
+        if (FAILED(device.As(&dxgi_device)) || FAILED(dxgi_device->GetAdapter(&adapter)) ||
+            FAILED(adapter->GetParent(IID_PPV_ARGS(&factory)))) return 3;
+        window.handle = CreateWindowExW(0, L"STATIC", L"Neo provider Present fixture", WS_POPUP,
+            0, 0, 2560, 1600, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        DXGI_SWAP_CHAIN_DESC1 desc {};
+        desc.Width = 2560;
+        desc.Height = 1600;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        desc.SampleDesc.Count = 1;
+        desc.BufferCount = 1;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+        if (!window.handle || FAILED(factory->CreateSwapChainForHwnd(device.Get(), window.handle, &desc,
+            nullptr, nullptr, &presentation))) return 3;
+    }
+    if (check_prewarm && init_calls() != unsigned(prewarm)) return 4;
     const auto capture = [&](CaptureEntry entry, const CaptureFrame &frame)
     {
+        if (presentation)
+        {
+            const HRESULT result = presentation->Present(0, 0);
+            std::fprintf(observations.get(), "present host: hr=%08lX\n", static_cast<unsigned long>(result));
+            if (FAILED(result)) return false;
+        }
         return draw_capture(device.Get(), context.Get(), entry, frame, observations.get());
     };
+    if (input_map)
+    {
+        std::printf("input map: mode=3 delay=%d render=%ux%u display=%ux%u "
+            "source_depth=R32_TYPELESS/R32_FLOAT_SRV source_motion=R10G10B10A2_UNORM\n", delayed_input,
+            neo::tests::input_map::k_render_width, neo::tests::input_map::k_render_height,
+            neo::tests::input_map::k_display_width, neo::tests::input_map::k_display_height);
+        return run_input_map(*device.Get(), *context.Get(), provider_module, observations.get(), delayed_input) ? 0 : 1;
+    }
+    if (test_ao)
+    {
+        using FrameCount = unsigned (*)() noexcept;
+        FrameCount frames = nullptr;
+        if (ao_fixture)
+        {
+            using Configure = void (*)() noexcept;
+            const auto configure = reinterpret_cast<Configure>(
+                GetProcAddress(provider_module, "ConfigureBeforeSrAoFixture"));
+            frames = reinterpret_cast<FrameCount>(GetProcAddress(provider_module, "BeforeSrAoFixtureFrames"));
+            if (!configure || !frames || (ao_v1 && subscribe(unexpected_record) != S_OK)) return 3;
+            configure();
+        }
+        // 同尺寸、同颜色、同实例内先跑平面，再加入左侧的近表面。
+        // 实际 Evaluate 必须读到不同的颜色；不要从 shader 结果钉死测试期望。
+        const auto guide_depth = [](float z)
+        {
+            return 0.5f * (100.f - z) / (z * (100.f - 0.5f));
+        };
+        constexpr unsigned size = 512, center = size / 2;
+        constexpr unsigned zero_motion = (512u << 10) | 512u;
+        const float plane = guide_depth(3.45f);
+        std::vector<CaptureGuidePixel> wall;
+        // 保持中心后景；改变整个半平面的深度，不能依赖一个恰巧相交的 shader 精确半径。
+        for (UINT y = center - 21; y <= center + 21; ++y)
+            for (UINT x = center - 21; x <= center + 21; ++x)
+                wall.push_back({x, y, zero_motion, guide_depth(x < center - 2 ? 3.0f : 3.45f)});
+        std::vector<CaptureGuidePixel> flat = wall;
+        for (auto &pixel : flat) pixel.depth = plane;
+        auto test = square_frame(size, true);
+        test.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        test.exact_provider_pixel = test.alternate_scene_pixel;
+        test.guides = flat;
+        test.typeless_depth = true;
+        const bool neutral = capture(CaptureEntry::draw, test) && (!frames || frames() == 1);
+        test.guides = wall;
+        test.expect_attenuated_color = ao_enabled;
+        const bool contact = capture(CaptureEntry::indexed, test) && (!frames || frames() == 2);
+        const bool external_recorder_excluded = !ao_v1 || (g_contract_ok && g_unregister(unexpected_record) == S_OK);
+        // 2026-11-15：真实 F6 不暴露 mock 计数接口，由外层同时核验 F6 回执与桥的写回。
+        const char *label = nvidia_ao ? "nvidia" : f6_ao ? "f6" : ao_v1 ? "fixture-v1" : "fixture-legacy";
+        std::fprintf(observations.get(), "native ao: enabled=%d provider=%s neutral=%d contact=%d",
+            ao_enabled, label, neutral, contact);
+        if (frames) std::fprintf(observations.get(), " eval_total=%u exclusive=%d", frames(), external_recorder_excluded);
+        std::fputc('\n', observations.get());
+        return neutral && contact && external_recorder_excluded ? 0 : 1;
+    }
     if (before_sr)
     {
         constexpr auto srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
@@ -249,7 +444,7 @@ int wmain(int argc, wchar_t **argv)
         {
             g_record = mode;
             g_expected_view = view;
-            CaptureFrame frame { size, size * 2, publish_render, true };
+            auto frame = square_frame(size, true);
             frame.color_source_view = view;
             frame.exact_provider_pixel = use_replacement ? k_before_sr_filtered_color : k_before_sr_scene_color;
             return capture(CaptureEntry::draw, frame);
@@ -278,8 +473,12 @@ int wmain(int argc, wchar_t **argv)
     }
     if (receipt && subscribe(unexpected_record) != S_OK) return 3;
     // 真实 V1 skip 用例先要求原生像素，再要求不同颜色的提供方输出；不能靠旧输出通过。
-    CaptureFrame first { 512, 1024, publish_render, !fallback && !receipt && !receipt_skip };
-    CaptureFrame second { 512, 1024, publish_render, !fallback && !receipt, 704, 352, 128 };
+    // 2026-11-16（同尺寸入口）：只改变尺寸比，原生红/绿与提供方两帧颜色仍须独立读回。
+    auto first = square_frame(512, !fallback && !receipt && !receipt_skip, 32, 96, 900, same_size);
+    auto second = square_frame(512, !fallback && !receipt, 704, 352, 128, same_size);
+    if (same_size)
+        std::fprintf(observations.get(), "provider dimensions: render=%ux%u display=%ux%u\n",
+            first.render.width, first.render.height, first.display.width, first.display.height);
     if (receipt)
     {
         first.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
@@ -287,11 +486,12 @@ int wmain(int argc, wchar_t **argv)
     }
     const bool draw = capture(CaptureEntry::draw, first);
     const bool indexed = capture(CaptureEntry::indexed, second);
+    if (check_prewarm && init_calls() != (prewarm_retry ? 2u : 1u)) return 4;
     bool changed_size = true, restored_size = true;
     if (resize)
     {
         // 同一个 Render 实例在两个全尺寸池之间切换；不用原生像素或前一帧蓝色蒙混通过。
-        const CaptureFrame smaller { 384, 768, publish_render, true, 192, 704, 352 };
+        const auto smaller = square_frame(384, true, 192, 704, 352);
         changed_size = capture(CaptureEntry::draw, smaller);
         restored_size = capture(CaptureEntry::indexed, first);
     }
@@ -301,7 +501,7 @@ int wmain(int argc, wchar_t **argv)
         const bool wrong_output = capture(CaptureEntry::indexed, second);
         const bool unknown_status = capture(CaptureEntry::draw, first);
         const bool failed_ordered = capture(CaptureEntry::indexed, second);
-        CaptureFrame ordered { 512, 1024, publish_render, true, 192, 704, 352 };
+        auto ordered = square_frame(512, true, 192, 704, 352, same_size);
         ordered.color_source_view = first.color_source_view;
         const bool confirmed = capture(CaptureEntry::draw, ordered);
         ordered.color_source_view = second.color_source_view;

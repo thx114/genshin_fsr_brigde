@@ -457,7 +457,11 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
         add_test(NAME BeforeSrIntegration COMMAND ProviderFrameHost ngx-before-sr
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
-        set_tests_properties(F6EvalReceiptIntegration BeforeSrIntegration PROPERTIES TIMEOUT 45)
+        add_test(NAME NgxInputMapCurrentIntegration COMMAND ProviderFrameHost ngx-input-map-current
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        add_test(NAME NgxInputMapDelayedIntegration COMMAND ProviderFrameHost ngx-input-map-delayed
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        set_tests_properties(F6EvalReceiptIntegration BeforeSrIntegration NgxInputMapCurrentIntegration NgxInputMapDelayedIntegration PROPERTIES TIMEOUT 45)
     endif()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
     target_link_libraries(CreateRouteIntegrationTest PRIVATE d3dcompiler dxgi)

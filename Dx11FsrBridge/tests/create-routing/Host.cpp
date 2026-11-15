@@ -194,7 +194,7 @@ struct ForHwndFixture
     }
 
     void run(HMODULE bridge, Create create, bool device_first, bool returned, bool mixed, bool mirrored,
-        bool multithread)
+        bool multithread, unsigned present_version)
     {
         // 设备先用例只通过另一设备登记同一 factory；不能借此登记待测 context。
         const HRESULT created = create_device(create, !device_first);
@@ -247,6 +247,13 @@ struct ForHwndFixture
                 expect(belongs_to(GetModuleHandleW(L"OptiScaler.dll"),
                     (*reinterpret_cast<void ***>(chain.Get()))[7]),
                     "mixed ForHwnd returns an F6-owned GetDevice implementation");
+            if (present_version != 0)
+            {
+                // 2026-11-16：PID290040 的内部链回执早于 F6 最终返回；不能用内部 Present 代表游戏链。
+                auto **table = *reinterpret_cast<void ***>(chain.Get());
+                expect(belongs_to(bridge, table[8]) && belongs_to(bridge, table[22]),
+                    "final game-facing chain binds both Neo Present routes");
+            }
             ComPtr<ID3D11Device> chain_device;
             const auto get_device = chain->GetDevice(IID_PPV_ARGS(&chain_device));
             std::printf("swapchain GetDevice hr=%08lX device=%p original=%p\n",
@@ -289,6 +296,18 @@ struct ForHwndFixture
 
             auto *draw_context = returned ? fetched.Get() : context.Get();
             auto *draw_device = returned ? chain_device.Get() : device.Get();
+            if (present_version != 0)
+            {
+                // 2026-11-16：PID284936 只见 Present、不见 Draw；原混合夹具未覆盖首次 Present 后的入口。
+                for (unsigned frame = 0; frame < 3; ++frame)
+                {
+                    const DXGI_PRESENT_PARAMETERS parameters {};
+                    const HRESULT result = present_version == 1 ? chain->Present(0, 0) :
+                        chain->Present1(0, 0, &parameters);
+                    expect(SUCCEEDED(result), "real Present succeeds before the first game Draw");
+                    expect(observed(draw_context), "first Present retains both production Draw routes");
+                }
+            }
             if (multithread && draw_context && draw_device)
             {
                 ComPtr<ID3D11Multithread> protection;
@@ -614,7 +633,8 @@ int wmain(int argc, wchar_t **argv)
     }
     else if (for_hwnd)
         hwnd_fixture.run(bridge, cached_device, device_first, returned, mixed, mirrored,
-            mode.find(L"multithread") != std::wstring::npos);
+            mode.find(L"multithread") != std::wstring::npos,
+            mode.ends_with(L"-present1") ? 2 : mode.ends_with(L"-present") ? 1 : 0);
     else if (real_device)
     {
         wchar_t system[MAX_PATH] {};
