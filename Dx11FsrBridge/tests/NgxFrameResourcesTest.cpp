@@ -1,6 +1,9 @@
 #include "../Ffx12Backend.h"
 #include "../ngx/FeatureHandle.h"
 #include "../ngx/FrameResources.h"
+#include "../Ffx12ShaderSource.h"
+#include <d3dcompiler.h>
+#include <d3d11shader.h>
 
 #include <cstdio>
 
@@ -92,6 +95,25 @@ int main()
     unsupported.output_format = DXGI_FORMAT_UNKNOWN;
     CHECK(FAILED(pool.rebuild(*device.Get(), unsupported).hr) && !pool.ready());
     CHECK(SUCCEEDED(pool.rebuild(*device.Get(), *shape).hr) && pool.ready() && pool.shape == *shape);
+    CHECK(!pool.reactive && !pool.reactive_uav);
+    for (bool reactive : { true, false })
+    {
+        auto variant = *shape;
+        variant.reactive_mask = reactive;
+        CHECK(SUCCEEDED(pool.rebuild(*device.Get(), variant).hr));
+        CHECK((pool.reactive != nullptr) == reactive && (pool.reactive_uav != nullptr) == reactive);
+        const D3D_SHADER_MACRO no_reactive[] { { "FFX12_NO_REACTIVE", "1" }, { nullptr, nullptr } };
+        ComPtr<ID3DBlob> code;
+        CHECK(SUCCEEDED(D3DCompile(ffx12::g_motion_decode_d11_hlsl, sizeof(ffx12::g_motion_decode_d11_hlsl) - 1,
+            nullptr, reactive ? nullptr : no_reactive, nullptr, "main", "cs_5_0", 0, 0, code.GetAddressOf(), nullptr)));
+        ComPtr<ID3D11ShaderReflection> reflect;
+        CHECK(SUCCEEDED(D3DReflect(code->GetBufferPointer(), code->GetBufferSize(),
+            __uuidof(ID3D11ShaderReflection), reinterpret_cast<void **>(reflect.GetAddressOf()))));
+        D3D11_SHADER_INPUT_BIND_DESC binding {};
+        CHECK(SUCCEEDED(reflect->GetResourceBindingDescByName("out_mv", &binding)) && binding.BindPoint == 0);
+        CHECK(SUCCEEDED(reflect->GetResourceBindingDescByName("out_reactive", &binding)) == reactive);
+        CHECK(!reactive || binding.BindPoint == 1);
+    }
     const auto before = pool.output;
     CHECK(FAILED(pool.rebuild(*device.Get(), unsupported).hr) && pool.output == before && pool.shape == *shape);
 

@@ -1,6 +1,6 @@
 #pragma once
 // 本头只放 HLSL 源码字符串，供 Ffx12Backend.cpp（native 路径）与 NgxBackend.cpp（ngx 路径）共用。
-// HLSL 内容与迁移前逐字节相同，不得修改；改公式必须两边同时验证。
+// 两端共用运动公式；原生默认保留 reactive，NGX 可按配置编译掉无消费者的输出。
 namespace ffx12 {
 
 // 深度提取：out_depth[id.xy] = in_depth.Load(int3(id.xy,0)).x * g_depth_scale;   （b0.x）
@@ -31,7 +31,9 @@ cbuffer MotionParams : register(b0)
 };
 Texture2D<float4> in_mv : register(t0);
 RWTexture2D<float2> out_mv : register(u0);
+#ifndef FFX12_NO_REACTIVE
 RWTexture2D<float> out_reactive : register(u1);
+#endif
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -54,7 +56,9 @@ void main(uint3 id : SV_DispatchThreadID)
         mv = float2(0.0, 0.0);
     #endif
     out_mv[id.xy] = mv;
+#ifndef FFX12_NO_REACTIVE
     out_reactive[id.xy] = c.b; // motion B 通道（bits 20..29）= reactive 源（历史第 62 轮实证）
+#endif
 }
 )";
 

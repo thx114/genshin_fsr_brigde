@@ -14,6 +14,7 @@ struct FrameShape
     UINT output_width = 0, output_height = 0;
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
+    bool reactive_mask = false;
     bool operator==(const FrameShape &) const = default;
 };
 

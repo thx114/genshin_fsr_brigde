@@ -79,11 +79,14 @@ FrameResources::BuildResult FrameResources::rebuild(ID3D11Device &device, const 
         { "color", next.color_format, pool.color.GetAddressOf(), nullptr, false },
         { "depth", DXGI_FORMAT_R32_FLOAT, pool.depth.GetAddressOf(), pool.depth_uav.GetAddressOf(), false },
         { "motion", DXGI_FORMAT_R16G16_FLOAT, pool.motion.GetAddressOf(), pool.motion_uav.GetAddressOf(), false },
-        { "reactive", DXGI_FORMAT_R8_UNORM, pool.reactive.GetAddressOf(), pool.reactive_uav.GetAddressOf(), false },
+        { "reactive", DXGI_FORMAT_R8_UNORM, next.reactive_mask ? pool.reactive.GetAddressOf() : nullptr,
+            pool.reactive_uav.GetAddressOf(), false },
         { "output", next.output_format, pool.output.GetAddressOf(), nullptr, true },
     };
     for (const auto &spec : specs)
     {
+        // 2026-11-16：关闭 mask 时 provider 收到 nullptr，不为未消费的 u1 分配资源。
+        if (!spec.texture) continue;
         D3D11_TEXTURE2D_DESC desc {};
         desc.Width = spec.output ? next.output_width : next.render_width;
         desc.Height = spec.output ? next.output_height : next.render_height;

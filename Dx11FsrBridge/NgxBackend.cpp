@@ -2620,10 +2620,11 @@ static bool ensure_shaders()
     // motion 解码：**只编默认变体**（FFX12_MOTION_RAW / FFX12_MOTION_DEADZONE 都不定义）
     {
         ID3DBlob *code = nullptr, *err = nullptr;
-        const D3D_SHADER_MACRO macros[] = { { nullptr, nullptr } };   // 空宏表
+        // 2026-11-16：NgxUseReactiveMask 在启动时读取；shader 与资源池必须使用同一配置。
+        const D3D_SHADER_MACRO no_reactive[] { { "FFX12_NO_REACTIVE", "1" }, { nullptr, nullptr } };
         const HRESULT hr = D3DCompile(ffx12::g_motion_decode_d11_hlsl,
                                       sizeof(ffx12::g_motion_decode_d11_hlsl) - 1,
-                                      "ngx_motion_decode", macros, nullptr,
+                                      "ngx_motion_decode", g_use_reactive ? nullptr : no_reactive, nullptr,
                                       "main", "cs_5_0", 0, 0, &code, &err);
         if (FAILED(hr) || !code)
         {
@@ -3034,8 +3035,9 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     D3D11_TEXTURE2D_DESC cdesc {}, odesc {};
     in.color->GetDesc(&cdesc);
     in.output_target->GetDesc(&odesc);
-    const auto shape = neo::ngx::copy_shape(in, cdesc, odesc);
+    auto shape = neo::ngx::copy_shape(in, cdesc, odesc);
     if (!shape) return ffx12::DispatchResult::failed;
+    shape->reactive_mask = g_use_reactive;
 
     ComPtr<ID3D11Device> dev;
     ctx->GetDevice(dev.GetAddressOf());
