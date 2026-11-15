@@ -125,6 +125,7 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
   `RenderScaleMenu=0` 使用游戏原生精度列表；原生精度 `1.1` 不代表桥菜单里的 `0.6`。
   隔离宿主的 `ngx-v1-dlaa` / `ngx-nvidia-dlaa` 已验证真实 F6 和 NVIDIA 直连的两帧输出；
   这不代表游戏内画质或性能已经验收。
+- **NGX 首帧初始化对照**：`[Dx11FsrBridge]` 下 `NgxPrewarmAtSwapchain=0`（默认）在首个超分 draw 初始化；设为 `1` 在首个合格交换链创建时同步尝试。启动可能因此等待。对比日志 `first_init_us` 和 `stage=draw|swapchain`，并分别测量交换链创建和首个超分帧。
 - **原生超分前 AO（实验性）**：在 `[Dx11FsrBridge]` 下显式设 `NgxBeforeSrAo=1`。仅处理 NGX 的 SDR RGBA8 颜色，
   使用同帧深度平滑法线并做空间遮蔽；不加载 ReShade，不使用光流或时域历史。开启时可关闭 ReShade 与 F6 的
   ReShade BeforeSR 效果；两者不要作为同一个 AO 预设叠用。默认 `0`；输入不兼容时保留原图。

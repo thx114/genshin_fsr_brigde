@@ -128,6 +128,7 @@ waits for the next Present to hand off the current frame.
   `RenderScaleMenu=0` uses the game's native scale list; native `1.1` is different from the bridge's `0.6`.
   The isolated `ngx-v1-dlaa` / `ngx-nvidia-dlaa` cases passed two output frames with real F6 and NVIDIA NGX.
   In-game image quality and performance remain unverified.
+- **NGX first-frame initialization:** Under `[Dx11FsrBridge]`, `NgxPrewarmAtSwapchain=0` (default) initializes on the first upscale draw. Set it to `1` to try synchronously when the first eligible swap chain is created. Startup can take longer. Compare `first_init_us` and `stage=draw|swapchain` along with swap-chain creation and first upscale frame times.
 - **Native pre-upscale AO (experimental):** Set `NgxBeforeSrAo=1` under `[Dx11FsrBridge]`.
   Neo applies depth-aware normal smoothing and spatial AO to the render-sized RGBA8 NGX color input.
   This does not load ReShade, install a Present filter, or use optical flow. HDR/PQ and unsupported

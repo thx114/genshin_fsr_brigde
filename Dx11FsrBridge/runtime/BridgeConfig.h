@@ -175,6 +175,7 @@ struct Config
     // Phase 1：进程内 FSR2 2.3.4 后端（ffxApi → amd_fidelityfx_upscaler_dx12.dll）。
     // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
     bool ffx12 = false;
+    bool ngx_prewarm_at_swapchain = false;
     std::wstring ffx12_dll_path;
     bool ffx12_fail_closed = false; // 禁止回退原生（测试/故障显式暴露）
     // 【正式功能】P1 单实例接管（默认**关** = 全量接管）：置 1 时多个 FSR2 上下文并存

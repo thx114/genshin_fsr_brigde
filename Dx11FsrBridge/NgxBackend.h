@@ -70,6 +70,7 @@ void set_cross_key_reuse(bool on);
 void set_provider_mode(int mode);                           // NgxProvider（0=auto 1=nvidia 2=external）
 
 // ---- 查询 ----
+void prewarm(ID3D11Device &device); // 调用方持后端锁；只预热，不创建 feature。
 bool active();          // 已成功初始化且 available==1
 bool available();       // 最近一次探测结果
 bool passthrough();

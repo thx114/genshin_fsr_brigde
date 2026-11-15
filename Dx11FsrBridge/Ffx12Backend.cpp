@@ -284,7 +284,7 @@ bool g_non_linear = true;       // 非线性色彩空间（OptiScaler 日志：F
 bool g_use_pq_chain = false;    // PQ 链开关（2026-08-24 定案：游戏原生直喂 PQ 值 + HDR|NON_LINEAR|AUTO_EXPOSURE
                                 // 标志（initFlags 0x129），不做 PqToLinear/LinearToPq；本开关保留旧链作对照）
 // 后端选择（SDS §3.9A.3(b)）：由桥的 ini 读取点（Ffx12Backend 键）经 set_backend() 设置。
-BackendKind g_backend = BackendKind::Native;   // 初值 Native = 改造前行为（REQ-04）
+std::atomic<BackendKind> g_backend { BackendKind::Native };   // 初值 Native = 改造前行为（REQ-04）
 
 
 // 读取 D3D12 info queue 消息（诊断；正式版不编译）
@@ -1063,8 +1063,8 @@ bool hdr_input() { return g_hdr_input; }
 bool motion_vectors_jittered() { return g_motion_vectors_jittered; }
 bool depth_inverted() { return g_depth_inverted; }
 
-void set_backend(BackendKind k) { g_backend = k; }
-BackendKind backend() { return g_backend; }
+void set_backend(BackendKind k) { g_backend.store(k, std::memory_order_release); }
+BackendKind backend() { return g_backend.load(std::memory_order_acquire); }
 
 // 进程退出标志的对外入口（g_process_exiting 在匿名命名空间内，此处仅转发）。
 // 由桥的 DllMain(DLL_PROCESS_DETACH, lpReserved != nullptr) 调用。
@@ -1502,6 +1502,33 @@ void recover_device_removed_locked()
     g_delivered_count = 0;
 }
 
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+namespace
+{
+// 2026-11-16：provider 可以在 Init/Evaluate 里创建交换链；嵌套创建不能重取同一后端锁。
+thread_local bool g_in_ngx_call = false;
+struct NgxCallScope
+{
+    NgxCallScope() { g_in_ngx_call = true; }
+    ~NgxCallScope() { g_in_ngx_call = false; }
+};
+}
+
+void prewarm_ngx(ID3D11DeviceContext *execution)
+{
+    if (!execution || g_in_ngx_call || g_shutting_down.load(std::memory_order_acquire) ||
+        backend() != BackendKind::Ngx || execution->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
+    // 2026-11-16：早期尝试不等待已开始的派发；已有设备的状态交由 dispatch 保持。
+    std::unique_lock lock(g_mutex, std::try_to_lock);
+    if (!lock || g_shutting_down.load(std::memory_order_acquire)) return;
+    ComPtr<ID3D11Device> device;
+    execution->GetDevice(device.GetAddressOf());
+    if (!device) return;
+    const NgxCallScope scope;
+    ngx::prewarm(*device.Get());
+}
+#endif
+
 DispatchResult dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
 {
     // 【诊断】PerfProbe：本函数 = 每游戏帧一次的 upscale 调用 ⇒ 它就是**帧边界**
@@ -1525,8 +1552,11 @@ DispatchResult dispatch(const FrameInput &input, ID3D11DeviceContext *game_conte
         !input.render_w || !input.render_h || !input.display_w || !input.display_h)
         return DispatchResult::failed;
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
-    if (g_backend == BackendKind::Ngx)
+    if (backend() == BackendKind::Ngx)
+    {
+        const NgxCallScope scope;
         return ngx::dispatch(input, game_context, instance_key);
+    }
 #endif
 #if defined(FFX12_DEBUG_STEPS)
     std::printf("[sdk234] dispatch enter active=%d\n", g_active.load(std::memory_order_relaxed) ? 1 : 0);

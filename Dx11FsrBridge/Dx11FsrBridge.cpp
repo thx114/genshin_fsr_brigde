@@ -13080,6 +13080,14 @@ const neo::graphics::IngressSink k_graphics_ingress {
         }
         if (swapchain_hook_needed())
             install_swapchain_hooks(chain);
+#if defined(DX11FSRBRIDGE_ENABLE_NGX) && defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+        if (execution && g_config.ngx_prewarm_at_swapchain && g_config.ffx12 &&
+            g_config.fsr2_translation_mode != 0 && il2cpp_callsite::active() && !unsafe_dx11_on12_backend_selected())
+        {
+            const ContextPolicyBypass bypass(execution);
+            ffx12::prewarm_ngx(execution);
+        }
+#endif
     },
     &set_output_size,
 };

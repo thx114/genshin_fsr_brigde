@@ -1268,7 +1268,7 @@ static bool soft_fail_init(const std::wstring &detail)
 //   这里只放声明；理由写在此处，免得下一个人把它当成可以随意挪动的顺序。
 static bool ensure_query_params(const char **why);
 
-static bool ensure_init(ID3D11Device *dev)
+static bool ensure_init(ID3D11Device *dev, bool prewarming = false)
 {
     // ---- 幂等契约（§3.4.1 第一行）----
     if (g_inited)
@@ -1284,7 +1284,7 @@ static bool ensure_init(ID3D11Device *dev)
     }
 
     // ---- 首初始化计时（2026-11-09，PR #12 审查次要项 8）----
-    // 为什么在这里：本函数在 draw 钩子内首次被调到（dispatch 第 3 步），
+    // 默认在首个 draw 调用；显式预热时则在交换链创建阶段调用。
     //   第 2 步的 LoadLibraryW 与第 9 步的 Sleep(500) 都发生在**渲染线程**上
     //   ⇒ 首次进游戏会出现一次可见卡顿。本计时就是为了把这个卡顿变成**数字**，
     //   而不是靠"应该会卡一下"的推断（AGENTS.md §一.6 / §二.5）。
@@ -1309,6 +1309,7 @@ static bool ensure_init(ID3D11Device *dev)
         log_ngx_error(L"ngx_core missing_entry names=%hs", hit.missing_entries.c_str());
     if (!hit.source)
     {
+        if (prewarming) return false; // provider 可能晚于交换链到场，不消耗 draw 的重试预算。
         return hit.retryable ? soft_fail_init(hit.detail) : fail_init(hit.failure, hit.error);
     }
     g_provider = hit.api;
@@ -1330,14 +1331,14 @@ static bool ensure_init(ID3D11Device *dev)
     // ---- 第 5 步：InApplicationDataPath（§3.4.4）+ CreateDirectoryW ----
     const std::wstring &appdata = resolve_appdata_path();
     if (appdata.empty())
-        return fail_init(L"no_appdata", static_cast<unsigned>(GetLastError()));
+        return prewarming ? false : fail_init(L"no_appdata", static_cast<unsigned>(GetLastError()));
     log_ngx_error(L"ngx_core appdata=%s", appdata.c_str());
 
     // ---- 第 6 步：Init_Ext(app_id, appdata, dev, NVSDK_NGX_Version_API, &fc) ← 第 5 参是 fc ----
     const NVSDK_NGX_Result init_rc =
         g_provider.init(g_app_id, appdata.c_str(), dev, NVSDK_NGX_Version_API, &fc);
     if (init_rc != NVSDK_NGX_Result_Success)
-        return fail_init(L"init", static_cast<unsigned>(init_rc));
+        return prewarming ? false : fail_init(L"init", static_cast<unsigned>(init_rc));
 
     // ---- 第 7 步：GetCapabilityParameters（全局一份，**不调 Reset()**）----
     NVSDK_NGX_Parameter *params = nullptr;
@@ -1431,8 +1432,8 @@ static bool ensure_init(ID3D11Device *dev)
     //   所以漏掉的只是"初始化失败时的耗时"，不影响本行要量的那个卡顿。
     // ★ 2026-11-10（B154）：追加 sleep_ms 字段 —— 外部 provider 跳过 500 ms 后，
     //   两个构型的 first_init_us 不再可直接对比；写明这一段睡了多少才谈得上对比。
-    log_ngx_error(L"ngx_core init_slow first_init_us=%.1f sleep_ms=%d",
-                  static_cast<double>(qpc_us() - init_t0), sleep_ms);
+    log_ngx_error(L"ngx_core init_slow first_init_us=%.1f sleep_ms=%d stage=%s",
+                  static_cast<double>(qpc_us() - init_t0), sleep_ms, prewarming ? L"swapchain" : L"draw");
     return true;
 }
 
@@ -2964,6 +2965,16 @@ void set_cross_key_reuse(bool on)
 // 查询
 // ============================================================================
 // T-1 审核 MINOR-2：SDS §3.2 的语义是"已成功初始化 **且** 当前可用 **且** 没有全局放手"。
+void prewarm(ID3D11Device &device)
+{
+    // 2026-11-16：归档首个 draw 初始化 4.913 秒；这里只搬移一次调用，真机收益未验证。
+    static bool attempted = false;
+    if (attempted || g_inited || g_passthrough || should_release_all() || g_init_retry_after_us != 0) return;
+    attempted = true;
+    const bool ready = ensure_init(&device, true);
+    log_ngx_core(blog::Level::Info, L"ngx_core prewarm stage=swapchain ready=%d", ready ? 1 : 0);
+}
+
 bool active()
 {
     return g_inited && g_available && !g_release_all.load(std::memory_order_relaxed);

@@ -130,6 +130,7 @@ $configValues = [ordered]@{
     'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
     'NgxPassthrough'            = '0'
     'NgxProvider'               = 'auto' # NGX 实现来源：auto（默认）/ nvidia / external（非 N 卡经 OptiScaler）
+    'NgxPrewarmAtSwapchain'     = '0'   # 单变量实测首帧与交换链创建耗时。
     'NgxBeforeSrAo'             = '0'   # 原生超分前 AO；只有测试配置主动打开。
     'NgxCrossKeyReuse'          = '1'   # 1 = key 变化但尺寸/格式全等时复用实例（消除角色界面切换 ~500ms 卡顿）；0 = 每次切换都销毁重建
     # ---- 日志（[Log] 段）/ Logging ----

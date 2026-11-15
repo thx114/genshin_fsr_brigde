@@ -408,6 +408,8 @@ ConfigLoad read_config(const std::filesystem::path &module_dir)
     const int ngx_pt =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPassthrough", 0, config_path.c_str());
     ngx::set_passthrough(ngx_pt != 0);
+    config.ngx_prewarm_at_swapchain =
+        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPrewarmAtSwapchain", 0, config_path.c_str()) == 1;
     ngx::set_before_sr_ao(GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxBeforeSrAo", 0, config_path.c_str()) == 1);
 
     // ---- 键 10：NgxProvider（2026-11-10 增，B154；默认 auto）----
