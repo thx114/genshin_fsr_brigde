@@ -49,9 +49,9 @@ void publish_creation(HRESULT result, const CreatedGraphics &created, const Ingr
         context = recovered_context.Get();
     }
 
+    ComPtr<ID3D11DeviceContext> execution;
     if (device || context)
     {
-        ComPtr<ID3D11DeviceContext> execution;
         if (context)
             execution.Attach(interface_layout::execution_context(context));
         // 保留包装器的 BeforeDraw/AfterDraw，只在执行端接管；不递归追逐代理 QI。
@@ -69,6 +69,6 @@ void publish_creation(HRESULT result, const CreatedGraphics &created, const Ingr
     }
     if (size.width != 0 && size.height != 0)
         sink.set_extent(size.width, size.height, source_name(created.path));
-    sink.bind_chain(created.chain);
+    sink.bind_chain(created.chain, execution ? execution.Get() : context);
 }
 }

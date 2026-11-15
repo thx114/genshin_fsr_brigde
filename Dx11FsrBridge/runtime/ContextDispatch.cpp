@@ -4,6 +4,27 @@
 
 namespace neo::graphics
 {
+namespace
+{
+constexpr GUID k_present_execution { 0xe8bf63c2, 0x2ea5, 0x4196, { 0xb8, 0x27, 0x53, 0xa9, 0xdd, 0x14, 0x70, 0xc1 } };
+}
+
+HRESULT bind_present_execution(IDXGISwapChain *chain, ID3D11DeviceContext *context)
+{
+    if (!chain || !context) return E_INVALIDARG;
+    return chain->SetPrivateDataInterface(k_present_execution, context);
+}
+
+Microsoft::WRL::ComPtr<ID3D11DeviceContext> present_execution(IDXGISwapChain *chain)
+{
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    if (!chain) return context;
+    UINT size = sizeof(ID3D11DeviceContext *);
+    const HRESULT result = chain->GetPrivateData(k_present_execution, &size, context.GetAddressOf());
+    if (FAILED(result)) context.Reset();
+    return context;
+}
+
 bool bind_execution_dispatch(ID3D11DeviceContext *context, std::span<const com_vtable::MethodPatch> methods,
     com_vtable::MethodPatch protection_setter)
 {

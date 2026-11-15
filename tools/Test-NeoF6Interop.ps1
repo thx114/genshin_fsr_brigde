@@ -26,7 +26,9 @@ function Read-Log([string]$Path)
 
 $rows = @()
 foreach ($mode in @('hardware-for-hwnd-bridge-first-multithread', 'hardware-for-hwnd-bridge-first-returned',
-                   'hardware-for-hwnd-device-first-multithread', 'hardware-for-hwnd-device-first-returned'))
+                   'hardware-for-hwnd-device-first-multithread', 'hardware-for-hwnd-device-first-returned',
+                   'hardware-for-hwnd-bridge-first-present', 'hardware-for-hwnd-device-first-present',
+                   'hardware-for-hwnd-bridge-first-present1', 'hardware-for-hwnd-device-first-present1'))
 {
     $out = "$root\$mode.stdout.log"
     $err = "$root\$mode.stderr.log"

@@ -126,6 +126,8 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
   ReShade BeforeSR 效果；两者不要作为同一个 AO 预设叠用。默认 `0`；输入不兼容时保留原图。
   隔离对照：NVIDIA 直连用 `ngx-nvidia-ao-on` / `ngx-nvidia-ao-off`；真 F6 用 `ngx-v1-ao-on` /
   `ngx-v1-ao-off`，测试用的 F6 配置需关闭 HoYoShade。
+- **呈现后的绘制接入**：运行时 Present / Present1 恢复上下文方法表后，桥在返回游戏前恢复绘制入口。
+  `ngx-v1-present` 和 `ngx-nvidia-present` 验证呈现后首个 Draw / DrawIndexed 的实际超分回执与输出像素。
 - **开发验证**：用 `ctest --test-dir <构建目录> --output-on-failure` 运行 WARP/设备接入、归属、版本和 F6 回执夹具。
   `tools/Test-NeoProviders.ps1` 与 `tools/Test-NeoF6Interop.ps1` 额外使用指定的 FFX/F6 DLL 和测试配置来跑隔离宿主，
   不部署到游戏。带 `-Cases` 的调用请在 PowerShell 中直接执行脚本，以保留数组参数。

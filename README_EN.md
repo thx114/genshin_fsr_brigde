@@ -130,6 +130,9 @@ waits for the next Present to hand off the current frame.
   inputs bypass the pass. Leave F6/ReShade BeforeSR AO off to avoid stacking effects. In the isolated host,
   compare `ngx-nvidia-ao-on` / `ngx-nvidia-ao-off` for direct NVIDIA NGX or `ngx-v1-ao-on` /
   `ngx-v1-ao-off` for F6 with HoYoShade disabled in the fixture.
+- **Draw capture after presentation:** If Present / Present1 restores the runtime context table, the bridge
+  restores its Draw routes before returning to the game. `ngx-v1-present` and `ngx-nvidia-present` check
+  actual provider receipts and output pixels from the first Draw / DrawIndexed after presentation.
 - **Development tests:** `ctest --test-dir <build directory> --output-on-failure` runs device and WARP tests,
   frame attribution, version discovery, and the F6 receipt fixture. `tools/Test-NeoProviders.ps1` and
   `tools/Test-NeoF6Interop.ps1` run isolated hardware hosts with pinned DLLs and test settings, not a game

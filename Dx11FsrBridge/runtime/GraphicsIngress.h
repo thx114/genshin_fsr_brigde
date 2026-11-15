@@ -32,7 +32,7 @@ struct CreatedGraphics
 struct IngressSink
 {
     void (*bind_device)(ID3D11Device *device, ID3D11DeviceContext *execution);
-    void (*bind_chain)(IDXGISwapChain *chain);
+    void (*bind_chain)(IDXGISwapChain *chain, ID3D11DeviceContext *execution);
     void (*set_extent)(UINT width, UINT height, const char *source);
 };
 

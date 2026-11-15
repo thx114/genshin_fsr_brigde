@@ -121,6 +121,7 @@ constexpr std::size_t k_idx_cs_set_shader = k_context_base_methods + 62;
 constexpr std::size_t k_idx_cs_set_constant_buffers = k_context_base_methods + 64;
 constexpr std::size_t k_swapchain_base_methods = 8;
 constexpr std::size_t k_idx_present = k_swapchain_base_methods + 0;
+constexpr std::size_t k_idx_present1 = 22;
 constexpr std::size_t k_idx_set_fullscreen_state = k_swapchain_base_methods + 2;
 constexpr std::size_t k_idx_get_fullscreen_state = k_swapchain_base_methods + 3;
 constexpr std::size_t k_idx_resize_buffers = k_swapchain_base_methods + 5;
@@ -727,6 +728,7 @@ using create_pixel_shader_fn = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, cons
 using create_compute_shader_fn = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, const void *, SIZE_T, ID3D11ClassLinkage *, ID3D11ComputeShader **);
 
 using present_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT);
+using present1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain1 *, UINT, UINT, const DXGI_PRESENT_PARAMETERS *);
 using vs_set_constant_buffers_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, ID3D11Buffer *const *);
 using vs_set_shader_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11VertexShader *, ID3D11ClassInstance *const *, UINT);
 using ps_set_shader_resources_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, ID3D11ShaderResourceView *const *);
@@ -871,6 +873,11 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
 ComMethodRoutes<factory2_create_swap_chain_for_hwnd_fn, &hooked_factory2_create_swap_chain_for_hwnd, k_idx_factory2_create_swap_chain_for_hwnd> g_original_factory2_create_swap_chain_for_hwnd;
 HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags);
 ComMethodRoutes<present_fn, &hooked_present, k_idx_present, true> g_original_present;
+HRESULT STDMETHODCALLTYPE hooked_present1(IDXGISwapChain1 *swapchain, UINT sync_interval, UINT flags,
+    const DXGI_PRESENT_PARAMETERS *parameters);
+ComMethodRoutes<present1_fn, &hooked_present1, k_idx_present1, true> g_original_present1;
+bool swapchain_present_observation_needed();
+bool swapchain_capture_repair_needed();
 
 
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
@@ -6316,13 +6323,10 @@ void tone_map_hdr_backbuffer_to_sdr(IDXGISwapChain *swapchain, std::uint64_t fra
     device->Release();
 }
 
-HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags)
+void observe_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags)
 {
-    // 【诊断】PerfProbe：Present 钩子整体 + 帧边界。
-    // ⚠️ 本机 ffx12 直连模式下 `swapchain_present_hook_needed()` 默认**为假**
-    // （见该函数：只有 hook_present / final_scene_* / hdr_composite_probe /
-    // ffx12_present_probe 才需要 Present 钩子）⇒ 这一段在日志里会是 `present=0`，
-    // 那本身就是一条结论："Present 路径上的每帧工作不可能是元凶"。
+    // 2026-11-16：恢复执行入口不需要逐帧 GetDesc、状态锁或诊断计时。
+    if (!swapchain_present_observation_needed()) return;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::Scope perf_scope(perf_probe::Segment::present);
     perf_probe::note_frame(perf_probe::FrameSource::present);
@@ -6430,7 +6434,49 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     }
 #endif
     tone_map_hdr_backbuffer_to_sdr(swapchain, frame_index);
-    return g_original_present(swapchain, sync_interval, flags);
+}
+
+void repair_present_execution(IDXGISwapChain *swapchain)
+{
+    if (!swapchain_capture_repair_needed()) return;
+    const auto execution = neo::graphics::present_execution(swapchain);
+    if (!execution || (g_original_draw.bound_on(execution.Get()) &&
+        g_original_draw_indexed.bound_on(execution.Get()))) return;
+
+    const bool installed = install_context_hooks(execution.Get());
+    static std::atomic_uint32_t receipts { 0 };
+    if (receipts.fetch_add(1, std::memory_order_relaxed) < 8)
+        LOG_INFO(blog::cat::hook, "present_context_reinstalled patch_ok=" + std::to_string(installed));
+}
+
+// 两种公开 Present 可能互相转发；只在最外层返回游戏之前恢复同一执行 context。
+thread_local bool g_present_active = false;
+template <typename Present>
+HRESULT route_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags, Present &&present)
+{
+    if (g_present_active) return present();
+    g_present_active = true;
+    struct Restore
+    {
+        ~Restore() { g_present_active = false; }
+    } restore;
+    observe_present(swapchain, sync_interval, flags);
+    const HRESULT result = present();
+    repair_present_execution(swapchain);
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags)
+{
+    return route_present(swapchain, sync_interval, flags,
+        [&] { return g_original_present(swapchain, sync_interval, flags); });
+}
+
+HRESULT STDMETHODCALLTYPE hooked_present1(IDXGISwapChain1 *swapchain, UINT sync_interval, UINT flags,
+    const DXGI_PRESENT_PARAMETERS *parameters)
+{
+    return route_present(swapchain, sync_interval, flags,
+        [&] { return g_original_present1(swapchain, sync_interval, flags, parameters); });
 }
 
 HRESULT STDMETHODCALLTYPE hooked_set_fullscreen_state(IDXGISwapChain *swapchain, BOOL fullscreen, IDXGIOutput *target)
@@ -12773,12 +12819,26 @@ void update_swapchain_backbuffer_resources(IDXGISwapChain *swapchain)
 // 历史上两处各写一份条件，外层含 hdr_composite_probe、内层不含，导致
 // “只开 HdrCompositeProbe 时外层放行、内层 return，Present 钩子从未安装”。
 // 任何新增开关都必须只改这里。
-bool swapchain_present_hook_needed()
+bool swapchain_present_observation_needed()
 {
     return g_config.hook_present || g_config.final_scene_probe || g_config.final_scene_snapshot ||
         g_config.hdr_composite_probe ||
         // 呈现诊断需要 Present 钩子才能观测 sync_interval/flags/帧间隔
         g_config.ffx12_present_probe;
+}
+
+bool swapchain_capture_repair_needed()
+{
+#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
+    return g_config.fsr2_translation_mode != 0;
+#else
+    return false;
+#endif
+}
+
+bool swapchain_present_hook_needed()
+{
+    return swapchain_present_observation_needed() || swapchain_capture_repair_needed();
 }
 
 bool swapchain_control_hook_needed()
@@ -12885,7 +12945,11 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
     const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
     std::vector<com_vtable::MethodPatch> patches;
     if (should_hook_present)
+    {
         patches.push_back(route_slot(g_original_present));
+        if (hook_method_count >= 29)
+            patches.push_back(route_slot(g_original_present1));
+    }
     if (should_hook_general_swapchain_controls)
     {
         patches.push_back(route_slot(g_original_set_fullscreen_state));
@@ -13020,8 +13084,14 @@ void bind_created_graphics(ID3D11Device *device, ID3D11DeviceContext *execution)
 
 const neo::graphics::IngressSink k_graphics_ingress {
     &bind_created_graphics,
-    [](IDXGISwapChain *chain)
+    [](IDXGISwapChain *chain, ID3D11DeviceContext *execution)
     {
+        if (swapchain_capture_repair_needed() && execution)
+        {
+            const HRESULT result = neo::graphics::bind_present_execution(chain, execution);
+            if (FAILED(result))
+                LOG_WARN(blog::cat::hook, "present_context_bind_failed hr=" + hex64(static_cast<std::uint32_t>(result)));
+        }
         if (swapchain_hook_needed())
             install_swapchain_hooks(chain);
     },

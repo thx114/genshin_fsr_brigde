@@ -521,6 +521,10 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         warp-for-hwnd-bridge-first-multithread hardware-for-hwnd-bridge-first-multithread
         warp-for-hwnd-device-first-multithread hardware-for-hwnd-device-first-multithread
         warp-for-hwnd-bridge-first-mirrored hardware-for-hwnd-device-first-mirrored
+        warp-for-hwnd-bridge-first-present hardware-for-hwnd-bridge-first-present
+        warp-for-hwnd-device-first-present hardware-for-hwnd-device-first-present
+        warp-for-hwnd-bridge-first-present1 hardware-for-hwnd-bridge-first-present1
+        warp-for-hwnd-device-first-present1 hardware-for-hwnd-device-first-present1
         wrapping-boundary wrapping-boundary-combined wrapping-boundary-retry)
         add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest
             "$<TARGET_FILE:Dx11FsrBridge>"
