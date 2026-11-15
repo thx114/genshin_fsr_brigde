@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ComVtableMethods.h"
 #include "CreateFunctionRoutes.h"
 #include "D3D11CreationScope.h"
 #include <d3d11.h>
@@ -68,6 +69,8 @@ public:
         return reinterpret_cast<void *>(entry);
     }
 
+    static constexpr com_vtable::MethodPatch slot() { return { Method, &bind }; }
+
     static Function original_for(Object *object)
     {
         for (auto *frame = active_; frame != nullptr; frame = frame->previous)
@@ -88,6 +91,23 @@ public:
             return static_cast<Result>(E_UNEXPECTED);
     }
 
+    static bool bound_on(Object *object)
+    {
+        if (!object) return false;
+        auto **table = *reinterpret_cast<void ***>(object);
+        if (!table) return false;
+        const auto entry = reinterpret_cast<Function>(std::atomic_ref<void *>(table[Method]).load(
+            std::memory_order_acquire));
+        return entry && Routes::target(entry) != entry;
+    }
+
     bool operator==(std::nullptr_t) const { return !installed_.load(std::memory_order_acquire); }
     bool operator!=(std::nullptr_t) const { return installed_.load(std::memory_order_acquire); }
 };
+
+// 槽索引、原函数类型和观察器绑定在同一个实例上，省去运行时按回调地址反查。
+template <typename Route>
+constexpr com_vtable::MethodPatch route_slot(const Route &)
+{
+    return Route::slot();
+}

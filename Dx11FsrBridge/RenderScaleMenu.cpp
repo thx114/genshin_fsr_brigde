@@ -20,6 +20,7 @@
 
 #include "detours.h"
 #include "RenderScaleMenu.h"
+#include "game/VersionDiscovery.h"
 #include "PerfProbe.h"
 
 namespace
@@ -42,30 +43,6 @@ constexpr std::array<const wchar_t *, 9> k_bridge_labels {
 
 constexpr std::array<float, 9> k_native_scales {
     0.6f, 0.8f, 0.9f, 1.0f, 1.1f, 1.2f, 1.3f, 1.4f, 1.5f
-};
-
-// These signatures are unique among the executable sections of the current 7.0 game binary.
-constexpr std::array<std::uint8_t, 24> k_build_cmd_buffers_signature {
-    0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57,
-    0x55, 0x53, 0x48, 0x81, 0xEC, 0xD8, 0x01, 0x00, 0x00, 0x48,
-    0x89, 0xCE, 0x0F, 0x57
-};
-
-// PostProcessLayer::UpdateInnerTarget. This is the point that consumes both
-// m_InnerResolutionScale (+0x88) and its DRS ratio to create the inner RT.
-// It runs before BuildCmdBuffers, including the train-door camera path.
-constexpr std::array<std::uint8_t, 48> k_update_inner_target_signature {
-    0x56, 0x57, 0x55, 0x53, 0x48, 0x81, 0xEC, 0xC8, 0x00, 0x00, 0x00, 0x44,
-    0x0F, 0x29, 0x84, 0x24, 0xB0, 0x00, 0x00, 0x00, 0x0F, 0x29, 0xBC, 0x24,
-    0xA0, 0x00, 0x00, 0x00, 0x0F, 0x29, 0xB4, 0x24, 0x90, 0x00, 0x00, 0x00,
-    0x48, 0x89, 0xCE, 0x80, 0xB9, 0x68, 0x01, 0x00, 0x00, 0x00, 0x74, 0x17
-};
-
-constexpr std::array<std::uint8_t, 32> k_get_text_signature {
-    0x48, 0x8B, 0x81, 0xE0, 0x00, 0x00, 0x00, 0xC3,
-    0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x56, 0x57, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x89,
-    0xCE, 0x48, 0x85, 0xD2, 0x0F, 0x84, 0xC2, 0x00
 };
 
 struct Il2CppStringSnapshot
@@ -128,7 +105,6 @@ struct WritableCacheKeyHash
 };
 std::unordered_map<WritableCacheKey, bool, WritableCacheKeyHash> g_writable_cache;
 
-bool is_executable_address(const void *address);
 bool read_float_value(const void *address, float &value);
 
 struct ScaleFieldInstruction
@@ -139,13 +115,6 @@ struct ScaleFieldInstruction
     bool writes_field = false;
 };
 
-struct ModuleFingerprint
-{
-    std::uint32_t timestamp = 0;
-    std::uint32_t image_size = 0;
-    std::uint32_t checksum = 0;
-};
-
 std::filesystem::path module_directory(HMODULE module)
 {
     wchar_t path[MAX_PATH] {};
@@ -153,76 +122,45 @@ std::filesystem::path module_directory(HMODULE module)
     return std::filesystem::path(std::wstring(path, path + length)).parent_path();
 }
 
-bool get_module_fingerprint(HMODULE module, ModuleFingerprint &fingerprint)
-{
-    if (module == nullptr)
-        return false;
-    const auto *base = reinterpret_cast<const std::uint8_t *>(module);
-    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
-    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        return false;
-    fingerprint.timestamp = nt->FileHeader.TimeDateStamp;
-    fingerprint.image_size = nt->OptionalHeader.SizeOfImage;
-    fingerprint.checksum = nt->OptionalHeader.CheckSum;
-    return true;
-}
+using neo::game::ImageFingerprint;
+using neo::game::MenuRvas;
 
-bool read_feature_cache(HMODULE module, const ModuleFingerprint &fingerprint,
-    const std::array<std::uint8_t, 24> &build_signature,
-    const std::array<std::uint8_t, 32> &get_text_signature,
-    void *&build_target, void *&get_text_target)
+MenuRvas read_feature_cache(const ImageFingerprint &fingerprint)
 {
     std::ifstream input(module_directory(g_bridge_module) / L"Dx11FsrBridge.features.cache");
-    if (!input)
-        return false;
-
+    if (!input) return {};
+    std::uint64_t timestamp = 0, image_size = 0, checksum = 0;
+    std::uint64_t build = 0, text = 0, update = 0;
     std::string key;
-    std::uint64_t timestamp = 0;
-    std::uint64_t image_size = 0;
-    std::uint64_t checksum = 0;
-    std::uint64_t build_rva = 0;
-    std::uint64_t get_text_rva = 0;
     while (input >> key)
     {
         if (key == "timestamp") input >> timestamp;
         else if (key == "image_size") input >> image_size;
         else if (key == "checksum") input >> checksum;
-        else if (key == "build_rva") input >> build_rva;
-        else if (key == "get_text_rva") input >> get_text_rva;
+        else if (key == "build_rva") input >> build;
+        else if (key == "get_text_rva") input >> text;
+        else if (key == "update_rva") input >> update;
         else { std::string ignored; input >> ignored; }
     }
-    if (timestamp != fingerprint.timestamp || image_size != fingerprint.image_size ||
-        checksum != fingerprint.checksum || build_rva == 0 || get_text_rva == 0)
-        return false;
-
-    const auto base = reinterpret_cast<std::uintptr_t>(module);
-    auto *cached_build = reinterpret_cast<std::uint8_t *>(base + build_rva);
-    auto *cached_get_text = reinterpret_cast<std::uint8_t *>(base + get_text_rva);
-    if (!is_executable_address(cached_build) || !is_executable_address(cached_get_text) ||
-        std::memcmp(cached_build, build_signature.data(), build_signature.size()) != 0 ||
-        std::memcmp(cached_get_text, get_text_signature.data(), get_text_signature.size()) != 0)
-        return false;
-    build_target = cached_build;
-    get_text_target = cached_get_text;
-    return true;
+    if (!input.eof() || timestamp != fingerprint.timestamp || image_size != fingerprint.image_size ||
+        checksum != fingerprint.checksum || build == 0 || text == 0 ||
+        build >= image_size || text >= image_size || update >= image_size)
+        return {};
+    return {static_cast<std::uint32_t>(build), static_cast<std::uint32_t>(text),
+        static_cast<std::uint32_t>(update)};
 }
 
-void write_feature_cache(HMODULE module, const ModuleFingerprint &fingerprint,
-    const void *build_target, const void *get_text_target)
+void write_feature_cache(const ImageFingerprint &fingerprint, MenuRvas anchors)
 {
-    const auto base = reinterpret_cast<std::uintptr_t>(module);
     std::ofstream output(module_directory(g_bridge_module) / L"Dx11FsrBridge.features.cache", std::ios::trunc);
-    if (!output)
-        return;
-    output << "version 1\n"
+    if (!output) return;
+    output << "version 2\n"
         << "timestamp " << fingerprint.timestamp << "\n"
         << "image_size " << fingerprint.image_size << "\n"
         << "checksum " << fingerprint.checksum << "\n"
-        << "build_rva " << (reinterpret_cast<std::uintptr_t>(build_target) - base) << "\n"
-        << "get_text_rva " << (reinterpret_cast<std::uintptr_t>(get_text_target) - base) << "\n";
+        << "build_rva " << anchors.build << "\n"
+        << "get_text_rva " << anchors.text << "\n"
+        << "update_rva " << anchors.update << "\n";
 }
 
 void log_line(const std::string &message)
@@ -278,72 +216,6 @@ void load_selection_cache()
     g_selected_index.store(index, std::memory_order_release);
     log_line("startup_selection_cache_hit index=" + std::to_string(index) +
         " scale=" + std::to_string(k_render_scales[static_cast<std::size_t>(index)]));
-}
-
-bool is_executable_address(const void *address)
-{
-    MEMORY_BASIC_INFORMATION memory {};
-    return VirtualQuery(address, &memory, sizeof(memory)) == sizeof(memory) &&
-        memory.State == MEM_COMMIT &&
-        (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
-}
-
-template <std::size_t Length>
-void *find_unique_executable_signature(HMODULE module, const std::array<std::uint8_t, Length> &signature,
-    std::uint32_t *match_count = nullptr)
-{
-    if (match_count != nullptr)
-        *match_count = 0;
-    if (module == nullptr)
-        return nullptr;
-
-    const auto *base = reinterpret_cast<const std::uint8_t *>(module);
-    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return nullptr;
-    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        return nullptr;
-
-    // Some game code is brought online after the bridge has been loaded. Scan
-    // committed executable pages instead of assuming every PE section is fully
-    // readable at that instant.
-    const auto module_begin = reinterpret_cast<std::uintptr_t>(base);
-    const auto module_end = module_begin + nt->OptionalHeader.SizeOfImage;
-    void *result = nullptr;
-    auto address = module_begin;
-    while (address < module_end)
-    {
-        MEMORY_BASIC_INFORMATION memory {};
-        if (VirtualQuery(reinterpret_cast<const void *>(address), &memory, sizeof(memory)) != sizeof(memory) ||
-            memory.RegionSize == 0)
-            break;
-
-        const auto region_begin = std::max(address, reinterpret_cast<std::uintptr_t>(memory.BaseAddress));
-        const auto region_end = std::min(module_end,
-            reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-        address = region_end;
-
-        const auto executable = (memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
-            PAGE_EXECUTE_WRITECOPY)) != 0;
-        if (memory.State != MEM_COMMIT || !executable || memory.Protect == PAGE_NOACCESS ||
-            region_end <= region_begin || region_end - region_begin < Length)
-            continue;
-
-        const auto *begin = reinterpret_cast<const std::uint8_t *>(region_begin);
-        const auto size = static_cast<std::size_t>(region_end - region_begin);
-        for (std::size_t offset = 0; offset <= size - Length; ++offset)
-        {
-            if (std::memcmp(begin + offset, signature.data(), Length) != 0)
-                continue;
-            if (match_count != nullptr)
-                ++*match_count;
-            if (result != nullptr)
-                return nullptr;
-            result = const_cast<std::uint8_t *>(begin + offset);
-        }
-    }
-    return result;
 }
 
 bool snapshot_il2cpp_string(void *object, Il2CppStringSnapshot &snapshot)
@@ -773,62 +645,44 @@ void __fastcall hooked_build_cmd_buffers(void *instance)
 DWORD WINAPI initialize_menu(void *)
 {
     load_selection_cache();
-    const auto game_module = GetModuleHandleW(nullptr);
-    void *build_target = nullptr;
-    void *update_target = nullptr;
-    void *get_text_target = nullptr;
-    std::uint32_t build_matches = 0;
-    std::uint32_t update_matches = 0;
-    std::uint32_t get_text_matches = 0;
-    ModuleFingerprint fingerprint {};
-    const bool fingerprint_ready = get_module_fingerprint(game_module, fingerprint);
-    if (fingerprint_ready && read_feature_cache(game_module, fingerprint,
-        k_build_cmd_buffers_signature, k_get_text_signature, build_target, get_text_target))
+    const auto module = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const auto fingerprint = neo::game::module_fingerprint(module);
+    const auto cached = fingerprint ? read_feature_cache(*fingerprint) : MenuRvas {};
+    neo::game::MenuDiscovery discovery;
+    for (int attempt = 1; attempt <= 60; ++attempt)
     {
-        log_line("feature_cache_hit");
-    }
-    else
-    {
-        for (int attempt = 0; attempt != 60; ++attempt)
+        discovery = neo::game::discover_menu(module, cached);
+        if (discovery.ready()) break;
+        if (attempt == 1 || attempt % 10 == 0)
         {
-            build_target = find_unique_executable_signature(game_module, k_build_cmd_buffers_signature, &build_matches);
-            get_text_target = find_unique_executable_signature(game_module, k_get_text_signature, &get_text_matches);
-            if (build_target != nullptr && get_text_target != nullptr &&
-                is_executable_address(build_target) && is_executable_address(get_text_target))
-                break;
-
-            if (attempt == 0 || (attempt + 1) % 10 == 0)
-            {
-                log_line("feature_query_retry attempt=" + std::to_string(attempt + 1) +
-                    " build_matches=" + std::to_string(build_matches) +
-                    " get_text_matches=" + std::to_string(get_text_matches));
-            }
-            Sleep(500);
+            log_line("feature_query_retry attempt=" + std::to_string(attempt) +
+                " build_matches=" + std::to_string(discovery.build.matches) +
+                " get_text_matches=" + std::to_string(discovery.text.matches));
         }
-
-        if (build_target != nullptr && get_text_target != nullptr && fingerprint_ready)
-            write_feature_cache(game_module, fingerprint, build_target, get_text_target);
+        if (attempt < 60) Sleep(500);
     }
-
-    if (build_target == nullptr || get_text_target == nullptr ||
-        !is_executable_address(build_target) || !is_executable_address(get_text_target))
+    if (!discovery.ready())
     {
-        log_line("feature_query_failed build_matches=" + std::to_string(build_matches) +
-            " get_text_matches=" + std::to_string(get_text_matches));
+        log_line("feature_query_failed build_matches=" + std::to_string(discovery.build.matches) +
+            " get_text_matches=" + std::to_string(discovery.text.matches));
         return 0;
     }
 
-    update_target = find_unique_executable_signature(game_module, k_update_inner_target_signature, &update_matches);
-    if (update_target == nullptr || !is_executable_address(update_target))
+    if (discovery.cache_hit) log_line("feature_cache_hit");
+    const auto anchors = discovery.rvas();
+    if (fingerprint && (!discovery.cache_hit || cached.update != anchors.update))
+        write_feature_cache(*fingerprint, anchors);
+    auto *const build_target = reinterpret_cast<void *>(module + anchors.build);
+    auto *const get_text_target = reinterpret_cast<void *>(module + anchors.text);
+    auto *const update_target = anchors.update ? reinterpret_cast<void *>(module + anchors.update) : nullptr;
+    if (!update_target)
     {
-        log_line("update_inner_target_feature_query_failed matches=" + std::to_string(update_matches) +
+        log_line("update_inner_target_feature_query_failed matches=" + std::to_string(discovery.update.matches) +
             "; continuing with late build fallback");
-        update_target = nullptr;
     }
     else
     {
-        log_line("update_inner_target_hook_target rva=0x" + hex_address(
-            reinterpret_cast<std::uintptr_t>(update_target) - reinterpret_cast<std::uintptr_t>(game_module)));
+        log_line("update_inner_target_hook_target rva=0x" + hex_address(anchors.update));
     }
 
     if (DetourTransactionBegin() != NO_ERROR || DetourUpdateThread(GetCurrentThread()) != NO_ERROR)

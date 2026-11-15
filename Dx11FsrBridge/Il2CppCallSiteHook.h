@@ -8,6 +8,7 @@
 //   Fsr2TranslationMode=2 同开；仅用于隔离测试）。
 // 安装前验证 Render/UpdateCommandBuffer 序言字节，不匹配则放弃（回退 draw 层家族跳过）。
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -45,6 +46,21 @@ struct RenderToken
     std::uint64_t capture_tick = 0;
 };
 
+inline constexpr std::size_t k_render_instance_capacity = 8;
+
+struct RenderSnapshot
+{
+    struct Entry
+    {
+        std::uint64_t instance = 0;
+        RenderToken pending {}; // generation=0：有实例，但当前尺寸没有可消费的 token。
+    };
+
+    std::array<Entry, k_render_instance_capacity> entries {};
+    std::size_t count = 0;
+    std::uint64_t observed_tick = 0;
+};
+
 // 安装钩子。失败时原代码未改动（调用方应回退到 draw 层家族跳过）。
 //
 // ⚠️ 2026-09-23：**失败原因通过 `out_reason` 如实报出**。
@@ -72,12 +88,10 @@ bool last_params(CapturedParams &out);
 // 参数与代次，避免 UI 实例污染主实例的 dispatch（参数错用 + 代次门控阻塞 = 交替输出）。
 // instance=0 时返回全局最新（兼容旧调用方）。
 bool last_params_for(std::uint64_t instance, CapturedParams &out, std::uint64_t &generation);
-// Return the newest unconsumed Render token for this exact instance and render
-// size.  A successful SDK dispatch must subsequently retire that generation
-// and every older pending token for the same instance.
-bool latest_pending_render_token_for(std::uint64_t instance,
-                                     std::uint32_t render_w, std::uint32_t render_h,
-                                     RenderToken &out);
+// 每个实例返回匹配尺寸的最早未消费帧。一次读取实例集合和 pending 状态，
+// 避免 Render 写线程在 Draw 的归属判定中途改变证据。
+RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t render_h);
+// 退休该实例的已采用代次及更早的帧；不能消费另一实例或更新的帧。
 bool consume_render_token_for(std::uint64_t instance, std::uint64_t generation);
 // 2026-09-19：pending 环形槽每实例只有 4 个，写满时**覆盖最旧** token。
 // 旧实现是静默的——桥侧只会看到"某个 Render 代次永远等不到 token"，
@@ -109,11 +123,4 @@ std::size_t projection_matrix(float *out, std::size_t capacity, std::uint64_t *c
 std::vector<std::uint32_t> scan_render_candidates(std::uint64_t exe_base,
                                                   std::uint32_t render_rva, std::uint32_t ucb_rva);
 
-// 特征识别（优先于硬编码 RVA）：g_MethodPointers 全量指针 + FFX_FSR2 30 方法
-// 尺寸序列 gap 匹配（唯一命中——国服/国际服/版本更新通用）。成功输出
-// render/ucb/camera RVA（VA-exe_base）；失败返回 false（调用方用配置兜底）。
-bool detect_ffx12_method_rvas(std::uint64_t exe_base,
-                              std::uint32_t &render_rva,
-                              std::uint32_t &ucb_rva,
-                              std::uint32_t &camera_rva);
 } // namespace il2cpp_callsite

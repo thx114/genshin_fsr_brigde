@@ -108,6 +108,7 @@
 #include <Windows.h>
 
 #include <atomic>
+#include <utility>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -158,8 +159,8 @@ enum class Segment : std::uint32_t
     interop_signal,       // ctx4->Signal（D3D11 侧提交段）
     interop_queue_wait,   // g_queue->Wait（D3D12 队列插入等待，CPU 侧应≈0）
     interop_submit,       // D3D12 侧提交（含 ring 槽位阻塞等待）
-    finish_wait,          // finish_pending：等共享 fence（ctx4->Wait）
-    finish_copy,          // finish_pending：输出 CopyResource
+    finish_wait,          // 交付：ctx4->Wait 调用开销
+    finish_copy,          // 交付：输出 CopyResource
     count
 };
 
@@ -1362,13 +1363,16 @@ public:
         detail::g_scope_calls.fetch_add(1, std::memory_order_relaxed);
     }
 
-    ~Scope()
+    ~Scope() { finish(); }
+
+    void finish()
     {
-        if (m_start == 0)
+        const std::int64_t start = std::exchange(m_start, 0);
+        if (start == 0)
             return;
         const std::int64_t now = detail::qpc_ticks();
-        if (now > m_start)
-            detail::add_ns(m_segment, detail::ticks_to_ns(now - m_start));
+        if (now > start)
+            detail::add_ns(m_segment, detail::ticks_to_ns(now - start));
     }
 
     Scope(const Scope &) = delete;

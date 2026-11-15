@@ -2,6 +2,7 @@
 #include "Ffx12ShaderSource.h"   // 两份 HLSL 正文（T-1 迁出；native 与 ngx 共用）
 #include "NgxBackend.h"          // ngx::dispatch / ngx::should_release_all（T-6 分流点）
 #include "PerfProbe.h"
+#include "native/InteropQueue.h"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -70,78 +71,12 @@ std::atomic<bool> g_shutting_down { false };
 ComPtr<ID3D11Device> g_d11dev;
 ComPtr<ID3D11On12Device2> g_on12dev;
 ComPtr<ID3D12Device> g_d12dev;
-ComPtr<ID3D12CommandQueue> g_queue;
-ComPtr<ID3D12CommandAllocator> g_allocator;
-ComPtr<ID3D12GraphicsCommandList> g_cmdlist;
-ComPtr<ID3D12Fence> g_fence;
-HANDLE g_fence_event = nullptr;
-UINT64 g_fence_value = 0;
+neo::native::InteropQueue g_interop;
 bool g_dx11on12_available = false;
 bool g_gpu_only_transport_available = false;
-bool g_uses_on12_queue = false;   // 恒 false：On12 引导路径已移除（保留供 interop 上报）
-
-// 异步交叠（async upscale）：
-//   true（默认）= dispatch 只提交 FFX（不等待），Present 前 finish_pending
-//                  等待并拷贝输出——FFX 与游戏后续 GPU 工作并行（跨帧交叠）
-//   false        = dispatch 内提交+等待+拷贝（同步，输出目标始终与 Present 一致）
-// 注意：异步要求输出目标在 dispatch 与 Present 之间不变。AMD RDNA2（RX 6000 系）
-// 在游戏 HDR 渲染下输出目标逐帧双缓冲交替，会与单槽 pending 错位（黑屏与正常
-// 画面交替）——安装器/芙芙启动器按显卡写入 ini Ffx12AsyncUpscale=0（RDNA2）或
-// =1（其他显卡）；此处缺省值为非 RDNA2 的默认。
+// async 不在 Present 补交付：只省显式 Flush，仍先在消费该纹理的即时 context 排入 Wait/Copy。
 bool g_async_upscale = true;
-// 挂起的异步 FFX：P2 起 pending 槽**按实例**存放（见 InstanceRes::pending*）——
-// 原先的全局单槽会让甲实例的提交被乙实例的 dispatch 顺手落地，两路输出互相借道，
-// 而且 Present 前只能收一个实例。仍仅 g_async_upscale 时使用；由 dispatch（提交）、
-// finish_instance（同实例完成）、finish_pending（Present 前收全部实例）串行访问，
-// 受 g_mutex 保护（见 dispatch 入口）。
-
-// The CPU bridge owns one command list and therefore must wait before each
-// reuse.  The On12 path returns resources to the translation layer with a
-// fence, so it uses a small ring instead: CPU never waits unless it laps the
-// GPU by all ring entries.
-struct On12CommandSlot
-{
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12GraphicsCommandList> list;
-    UINT64 fence_value = 0;
-};
-std::array<On12CommandSlot, 3> g_on12_command_slots {};
-std::uint32_t g_on12_command_slot_cursor = 0;
-std::atomic_uint64_t g_on12_direct_dispatch_count { 0 };
-
-// 每帧耗时统计（诊断 GPU 空载：QPC 计时，节流输出）
-//  - prep_wait_us：dispatch 内 Wait(v_prev)（等上一轮 D3D12 完成）
-//  - prep_cs_us  ：D3D11 输入准备（深度/运动 CS + CopyResource 输入）
-//  - prep_flush_us：Flush 提交段（去 Flush 后应≈0）
-//  - signal_us   ：ctx4->Signal(v1)（隐含提交 D3D11 命令批——跨 API 交接成本）
-//  - wait12_us   ：g_queue->Wait(v1)（D3D12 队列插入等待——CPU 侧应≈0）
-//  - submit_us   ：D3D12 侧（Reset + barrier + FFX dispatch + Execute + 双 Signal）
-//  - wait_us     ：finish_pending 的 ctx4->Wait 阻塞（= FFX 未提前完成的时间）
-//  - copy_us     ：输出拷贝调用本身（去 Flush 后应≈0）
-//  - total_us    ：dispatch 调用总耗时
-struct FrameTimingStats
-{
-    std::atomic_uint64_t prep_wait_us { 0 };
-    std::atomic_uint64_t prep_cs_us { 0 };
-    std::atomic_uint64_t prep_flush_us { 0 };
-    std::atomic_uint64_t prep_us { 0 };
-    std::atomic_uint64_t signal_us { 0 };
-    std::atomic_uint64_t wait12_us { 0 };
-    std::atomic_uint64_t submit_us { 0 };
-    std::atomic_uint64_t wait_us { 0 };
-    std::atomic_uint64_t copy_us { 0 };
-    std::atomic_uint64_t total_us { 0 };
-    std::atomic_uint32_t frames { 0 };
-};
-FrameTimingStats g_timing {};
-
-static std::uint64_t qpc_us()
-{
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return f.QuadPart ? (std::uint64_t)((double)c.QuadPart * 1000000.0 / (double)f.QuadPart) : 0;
-}
+std::uint64_t g_delivered_count = 0;
 
 // ffx-api runtime entry points.  Keeping the module loaded for the lifetime of
 // every context is required because the provider owns the temporal history.
@@ -163,8 +98,6 @@ struct SharedTex
 {
     ComPtr<ID3D11Texture2D> d11;
     ComPtr<ID3D12Resource> d12;
-    HANDLE handle = nullptr;
-    std::uint32_t w = 0, h = 0;
 };
 
 // P2：每个 ffxContext（= 每个 instance_key）独占一整套 GPU 互操作资源。
@@ -175,19 +108,17 @@ struct SharedTex
 // 消失，反证根因就在这份共享层，而不是 provider 内部。
 //
 // 因此这里把原全局单份逐项落到实例上：
-//   · 6 张共享纹理 + 各自的 UAV/SRV（颜色/原始运动/深度/解码运动/reactive/输出）；
+//   · 5 张共享纹理及视图（颜色/深度/解码运动/reactive/输出）；
 //   · 尺寸池判等键（rw/rh/dw/dh —— 甲实例改尺寸不再重建乙实例的纹理）；
 //   · 调用方 game_context 与 ctx4（★ 写入用调用方 context，Signal/Wait 也必须用**同一个**，
 //     否则 D3D12 会在输入拷贝尚未提交时就等到 v1，读到上一实例留在共享纹理里的旧帧）；
 //   · b0 常数缓冲（depth 提取与 motion 解码共用 b0.x，全局一份会让两实例互相刷值）；
-//   · 单槽 pending（异步交叠）。
 // fence 仍是全局单条：它是"全局单调时间线"，只要 Signal 严格递增、Wait 指向已/将产生的
 // 值，多实例交替 Signal 同一 fence 的等待语义依然成立（协议见 dispatch_gpu_shared 注释）。
 struct InstanceRes
 {
-    // ---- 共享纹理：render 尺寸 5 张 + display 尺寸输出 1 张 ----
+    // render 尺寸四张输入 + display 尺寸输出。
     SharedTex tex_color;            // 游戏颜色（同格式；D3D11 CopyResource 写入）
-    SharedTex tex_motion;           // 游戏运动 raw（同格式）——只建不用（保留旧行为）
     SharedTex tex_depth_share;      // R32_FLOAT 深度提取输出（D3D11 CS 写 → D3D12 直读）
     SharedTex tex_motion_cvt_share; // R16G16_FLOAT 运动解码输出（同上）
     SharedTex tex_reactive_share;   // R8_UNORM reactive（motion B 通道，同 CS 的 u1）
@@ -202,10 +133,8 @@ struct InstanceRes
     ID3D11Texture2D *depth_src_last = nullptr;
     ComPtr<ID3D11ShaderResourceView> motion_src_srv; // 游戏 motion SRV（按纹理缓存）
     ID3D11Texture2D *motion_src_last = nullptr;
-    // ---- b0 常数缓冲：depth 提取写 b0.x=g_depth_scale，motion 解码写 b0.x=g_motion_flip ----
-    // 两个"已上传值"缓存必须各自一份：共用一个变量时两个值不同就会每帧互相判定"变了"
-    // 而反复上传（比不缓存更糟）。NaN 哨兵保证首帧必定上传一次。
-    ComPtr<ID3D11Buffer> motion_cb;
+    // 两个 shader 的 b0 值独立；共用同一物理 buffer 会在参数不等时读到另一 pass 的值。
+    ComPtr<ID3D11Buffer> depth_cb, motion_cb;
     float cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
     float cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
     // ---- 输出落地格式（UAV 不能用 TYPELESS；按本实例的输出纹理定）----
@@ -221,11 +150,6 @@ struct InstanceRes
     // 新 context 误判成旧的、继续拿已失效的 ctx4 去 Signal），也让 ctx4 永远来自同一对象。
     ComPtr<ID3D11DeviceContext> ctx_src;
     ComPtr<ID3D11DeviceContext4> game_ctx4;
-    // ---- 单槽 pending（异步交叠；每实例一份）----
-    bool pending = false;
-    UINT64 pending_v2 = 0;
-    ComPtr<ID3D11Texture2D> pending_output_target;
-    ComPtr<ID3D11DeviceContext> pending_context; // 提交时的游戏 context（AddRef）
     // ---- ★ P2：该实例的调用方 context 属于**另一个 D3D11 设备**（已知不可用）----
     // 本后端的共享纹理都建在 g_d11dev（首次 init 的那个设备）上；跨设备时
     // CreateShaderResourceView / CopyResource 会静默失败（D3D11 不报错），结果是垃圾
@@ -240,7 +164,8 @@ struct SdkContext
     ffxContext ctx = nullptr;
     bool created = false;
     std::uint64_t key = 0;
-    std::uint32_t rw = 0, rh = 0, dw = 0, dh = 0; // **context 创建尺寸**（决定 maxRenderSize）
+    UINT64 last_submission = 0;
+    bool reuse_needs_wait = false;
     bool first = true;
     std::uint64_t last_use = 0;
     InstanceRes res; // P2：该实例独占的 GPU 互操作资源（尺寸池判等键在 res.rw/rh/dw/dh）
@@ -250,7 +175,8 @@ std::vector<SdkContext> g_sdk_ctxs;
 // 前向声明：这两个 helper 要用到下方才声明的全局（g_d11dev / g_shared_fence11 / 诊断镜像），
 // 但实例槽位的 LRU 驱逐路径（ctx_for_key）必须先落地挂起帧、再整套释放该实例的资源。
 void release_instance_res(SdkContext &sc);
-bool finish_instance(SdkContext &sc);
+bool retire_instance(SdkContext &sc);
+void destroy_context(SdkContext &sc);
 std::string g_version_name = "ffx12";
 // 实际匹配到的 provider 版本名（如 "4.1.1"/"4.0.2c"/"3.1.5"）——日志如实上报。
 std::string g_sdk_matched_name = "?";
@@ -278,7 +204,6 @@ bool g_debug_layer = false;           // D3D12 debug layer + info queue
 std::uint32_t g_dump_frames = 0;      // 2026-08-25：dump 前 N 帧 FSR4 输出（诊断边缘抖动）
 ComPtr<ID3D12InfoQueue> g_info_queue;
 #endif
-std::atomic_uint64_t g_dispatch_counter { 0 };
 void sdk_message_cb(std::uint32_t type, const wchar_t *message)
 {
     if (message == nullptr)
@@ -300,17 +225,12 @@ void sdk_message_cb(std::uint32_t type, const wchar_t *message)
     }
 }
 
-// 遗留共享纹理 + P2 诊断镜像（见上）
-SharedTex g_tex_depth; // 遗留：legacy SHARED 深度（live 路径无写入点，保留以免动旧释放路径）
 // P2：原先的 g_tex_color/g_tex_motion/g_tex_output 全局单份已搬进 SdkContext::res。
 // 下面两个是**诊断镜像**（debug_output_texture / debug_color_texture 用），指向"最近一次
 // 派发"那个实例的纹理；持引用，避免实例被 LRU 驱逐后留下悬空指针。
 ComPtr<ID3D11Texture2D> g_mirror_color_tex;
 ComPtr<ID3D11Texture2D> g_mirror_output_tex;
-// 尺寸与输入格式的全局镜像 = "最近一次 dispatch 的实例"。真实值在 InstanceRes 上按实例保存
-// （池判等键在 res.rw/rh/dw/dh）——这里只为既有诊断/dead path 保留一份可读值。
-std::uint32_t g_render_w = 0, g_render_h = 0;
-std::uint32_t g_display_w = 0, g_display_h = 0;
+// 保存最近一次的格式给诊断；尺寸以各实例的资源池为准。
 bool g_last_reset = false;
 std::uint64_t g_ctx_recreates = 0;
 constexpr int kFfxDispatchNotReached = -2147483647;
@@ -332,18 +252,6 @@ DXGI_FORMAT g_input_output_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
 //   D3D11→D3D12 方向为跨 API 共享的普遍可行方向。
 bool g_gpu_interop = false;        // 配置请求
 bool g_gpu_interop_ready = false;  // 初始化成功（D3D11.4 + 共享 fence + CS 编译）
-ComPtr<ID3D11Device5> g_d11_5;
-// ★ P2a：g_game_ctx4（原先全局唯一、只在首次 dispatch 时 QI 一次）已搬进 InstanceRes。
-// 意义：写入走调用方传入的 game_context，而 Signal/Wait 必须落在**同一个** context 上；
-// 全局缓存会把"第二个实例的 context"错当成第一个，Signal 插进别人的命令流 ⇒ D3D12 在
-// 输入拷贝尚未提交时就等到 v1，读到上一实例留在共享纹理里的旧帧。
-ComPtr<ID3D12Fence> g_shared_fence;       // 共享 fence（D3D12 创建）
-ComPtr<ID3D11Fence> g_shared_fence11;     // 同一 fence 的 D3D11 视图
-HANDLE g_shared_fence_handle = nullptr;
-// 共享 fence 值：**全局单条时间线**（P2 刻意不改）。理由见 dispatch_gpu_shared 的协议注释：
-// 全程由 g_mutex 串行 + 每次 Signal 严格 +1 ⇒ 多实例交替 Signal 时每个 Wait(v) 仍指向
-// "该 v 由正确的生产者产生"，等待语义成立。
-std::uint64_t g_shared_fence_value = 0;   // 单调（D3D11/D3D12 共用）
 // 深度提取：游戏 R32G8X24_TYPELESS 不可共享 → D3D11 CS 提取到共享 R32_FLOAT（FFX 期望格式）
 // P2：深度/运动/reactive 三张共享纹理、其 UAV/SRV、b0 常数缓冲均已搬进 InstanceRes。
 ComPtr<ID3D11ComputeShader> g_depth_extract_cs;
@@ -432,175 +340,12 @@ static void drain_info_queue()
 }
 #endif
 
-// ---- motion 解码 compute pass（R10G10B10A2 平方编码 → R16G16_FLOAT）----
-// 游戏 FSR2 accumulate shader（0x78057A29AF6C2D99）的 motion 解码（反汇编实证）：
-//   d = raw - 0.498039;  mv = -sign(d) * 4 * d^2     （平方编码：小运动压缩、大运动放大）
-// 之前用线性解码 c.rg*2-1 在中速运动时补偿约 5 倍过大 → 历史采样超前 → 边缘闪烁。
-// mvscale 保持负号（游戏重投影 = UV - mv；FSR2 = UV + mv*scale，两者经 scale 归一化后等价）。
-static const char *g_mv_decode_hlsl = R"(
-RWTexture2D<float2> out_mv : register(u0);
-Texture2D<float4> in_mv  : register(t0);
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    #if defined(FFX12_MOTION_DECODE_TEST)
-    out_mv[id.xy] = float2(0.5, 0.5); // 金丝雀：常数输出，忽略输入——判 pass 是否执行
-    #else
-    float4 c = in_mv.Load(int3(id.xy, 0));
-    float2 d = c.rg - 0.498039;
-    out_mv[id.xy] = -sign(d) * (4.0 * d * d);
-    #endif
-}
-)";
-
-ComPtr<ID3D12Resource> g_tex_motion_cvt;        // R16G16_FLOAT render 尺寸（UAV）
-ComPtr<ID3D12Resource> g_up_motion_cvt;         // CPU 解码后的 R16G16_FLOAT upload buffer
-void *g_up_motion_cvt_ptr = nullptr;
-UINT g_up_motion_cvt_pitch = 0;
-ComPtr<ID3D12DescriptorHeap> g_mv_heap;         // [SRV(motion源), UAV(cvt)]，shader-visible
-UINT g_mv_heap_inc = 0;
-// 2026-09-19：删除 g_mv_rs —— 声明后从未创建或使用，
-// 仅在两行注释里被当作"布局参考"提及。该 heap 的实际布局在创建处（下方）明确指定。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+// 旧 CPU/PQ 样本从未由 GPU 互操作路径填充，诊断接口保留无样本语义。
 bool g_motion_decode_test = false;
+bool g_output_mark = false;
+bool g_decode_test = false;
 #endif
-D3D12_RESOURCE_STATES g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;  // 共享源（D3D11 互操作）
-
-// ---- PQ 颜色空间（游戏 color 为 HDR10 PQ 编码，FSR2 需线性 HDR）----
-// 输入：PqToLinear 解码 → FSR2（HDR flag）；输出：LinearToPq 编码 → r1。
-ComPtr<ID3D12Resource> g_tex_color_linear;     // R16G16B16A16_FLOAT render 尺寸（PQ 解码结果）
-ComPtr<ID3D12Resource> g_tex_output_linear;    // R16G16B16A16_FLOAT display 尺寸（FSR2 线性输出）
-ComPtr<ID3D12DescriptorHeap> g_pq_in_heap;     // [SRV(color源), UAV(color_linear)]
-ComPtr<ID3D12DescriptorHeap> g_pq_out_heap;    // [SRV(output_linear), UAV(输出共享)]
-// 2026-09-19：删除 g_pq_rs（声明后从未创建/使用）与 g_pq_encode_pso
-// （仅声明 + 在 shutdown 里 Reset，从未创建）。PQ 编解码已改为不使用独立根签名/PSO。
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-bool g_output_mark = false;                    // 输出标记开关（诊断）
-bool g_decode_test = false;                    // 解码常数注入测试（诊断：判断 pass 执行 vs SRV 读）
-#endif
-D3D12_RESOURCE_STATES g_color_linear_state = D3D12_RESOURCE_STATE_COMMON;
-D3D12_RESOURCE_STATES g_output_linear_state = D3D12_RESOURCE_STATE_COMMON;
-UINT g_pq_heap_inc = 0;
-
-// ---- 输出落地修复（P0-1 根因，2026-08-24 逆向实证）----
-// 游戏侧累计读回全 0 的根因：g_tex_output 是 D3D11 legacy SHARED（非 NT handle）纹理，
-// 在 D3D12 侧仅支持 COMMON 状态访问；原先 PQ 编码 pass 将其 barrier 到 UNORDERED_ACCESS
-// 做 UAV 写 → 写不落地（连 OutputMark 无条件红标记区都读 0，执行链审计通过 → 写目标异常）。
-// 修复：PQ 编码改写到 D3D12 自有 UAV 纹理 g_tex_output_enc（合法）→ readback buffer →
-// CPU → D3D11 UpdateSubresource 写入共享纹理 g_tex_output.d11（跨 API 无状态风险）。
-ComPtr<ID3D12Resource> g_tex_output_enc;        // D3D12 自有，格式=共享输出格式（UAV 合法）
-ComPtr<ID3D12Resource> g_output_readback;       // READBACK heap（rowPitch×height）
-UINT g_output_readback_row_pitch = 0;
-D3D12_RESOURCE_STATES g_output_enc_state = D3D12_RESOURCE_STATE_COMMON;
-DXGI_FORMAT g_output_enc_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-// E1 诊断 + 链中点二分采样（正式版不编译：OutputSamples/ChainSamples/readback 全部移除）
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-struct OutputSamples
-{
-    std::uint32_t raw[5] = {};
-    std::uint32_t w = 0, h = 0;
-    bool valid = false;
-};
-OutputSamples g_out_samples;
-std::mutex g_out_samples_mutex;
-
-// ---- 链中点二分采样（2026-08-24 enc 全 0 + sdk_msgs=none → 定位 D3D12 链断点）----
-// 4 个 D3D12 自有纹理各采样中央像素：
-//   motion_cvt（金丝雀：motion 输入非 0 → 若 cvt≠0 则 cmdlist 执行 + 自有纹理 UAV 写正常）
-//   color_linear（PQ 解码输出：若=0 → 解码 pass 或共享输入 SRV 读断裂）
-//   output_linear（ffxDispatch 输出：若=0 → 派发断裂）
-//   enc（PQ 编码输出：若=0 → 编码 pass 断裂；mark=1 时 p0 应为红）
-struct ChainSamples
-{
-    float motion_cvt[2] = {0, 0};    // R16G16_FLOAT 中央
-    float color_linear[3] = {0, 0, 0}; // R16G16B16A16_FLOAT 中央（half→float）
-    float output_linear[3] = {0, 0, 0};
-    std::uint32_t canary = 0;        // 金丝雀 64×64 R8G8B8A8 中央原始值（0xFFC08040=写成功）
-    // 自有输入纹理中央（验证 CPU 中转是否送达 D3D12 链）
-    std::uint32_t color_own = 0;     // R10G10B10A2 中央原始值（PQ 颜色 ≈0x2xxxxxxx 非 0）
-    float depth_own = 0.0f;          // R32_FLOAT 中央（游戏逆深度 0=far）
-    std::uint32_t motion_own = 0;    // R10G10B10A2 中央原始值
-    bool valid = false;
-};
-ChainSamples g_chain_samples;
-ComPtr<ID3D12Resource> g_rb_motion_cvt;    // readback（render 尺寸 R16G16_FLOAT）
-ComPtr<ID3D12Resource> g_rb_color_linear;  // readback（render 尺寸 R16G16B16A16_FLOAT）
-ComPtr<ID3D12Resource> g_rb_output_linear; // readback（display 尺寸 R16G16B16A16_FLOAT）
-ComPtr<ID3D12Resource> g_rb_color_own;     // readback（render 尺寸 R10G10B10A2）
-ComPtr<ID3D12Resource> g_rb_depth_own;     // readback（render 尺寸 R32_FLOAT）
-ComPtr<ID3D12Resource> g_rb_motion_own;    // readback（render 尺寸 R10G10B10A2）
-UINT g_rb_motion_cvt_pitch = 0;
-UINT g_rb_color_linear_pitch = 0;
-UINT g_rb_output_linear_pitch = 0;
-UINT g_rb_color_own_pitch = 0;
-UINT g_rb_depth_own_pitch = 0;
-UINT g_rb_motion_own_pitch = 0;
-#endif
-
-// 标记目标纹理的 D3D12 侧（enc）状态跟踪。原版本标记 PSO/HLSL 已移除
-// （它们从未被创建，marker_pso_for_version 也无调用点），但**堆仍在用**：
-// ensure_marker_heap_for 会为 enc 建 shader-visible 描述符堆。
-// 2026-09-19：删除 g_marker_enc_state —— 只有赋值、**从未被读取**，
-// 是随 PSO/HLSL 一并移除后的残留状态跟踪。
-ComPtr<ID3D12DescriptorHeap> g_marker_heap;
-
-// 版本标记堆创建（起 CPU/On12/GPU-interop 共用；定义在
-// ensure_output_landing_resources 之后）。enc 为标记目标纹理的 D3D12 侧。
-bool ensure_marker_heap_for(ID3D12Resource *enc);
-
-// ---- 金丝雀（2026-08-24 ）：常数 compute 写 64×64 自有纹理（正式版不编译）----
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-// 不依赖任何输入；读回 0xFFC08040（R=64,G=128,B=192,A=255 小端）= cmdlist 执行 + 自有 UAV + readback 全通。
-static const char *g_canary_hlsl = R"(
-RWTexture2D<float4> out_c : register(u0);
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    out_c[id.xy] = float4(0.25, 0.5, 0.75, 1.0);
-}
-)";
-ComPtr<ID3D12Resource> g_canary_tex;       // 64×64 R8G8B8A8_UNORM（UAV）
-ComPtr<ID3D12Resource> g_canary_rb;        // readback
-ComPtr<ID3D12DescriptorHeap> g_canary_heap; // [UAV(canary)]
-ComPtr<ID3D12PipelineState> g_canary_pso;
-D3D12_RESOURCE_STATES g_canary_state = D3D12_RESOURCE_STATE_COMMON;
-UINT g_canary_pitch = 0;
-#endif
-
-// enc 清除金丝雀：编码前 ClearUnorderedAccessViewFloat(enc, 灰) ——读回灰色=clear 执行但编码未写；
-// 红色（mark）=编码写了；0=clear 都没执行（cmdlist 空转/未执行）。
-D3D12_GPU_DESCRIPTOR_HANDLE g_pq_out_uav_gpu {};
-D3D12_CPU_DESCRIPTOR_HANDLE g_pq_out_uav_cpu {};
-ComPtr<ID3D12DescriptorHeap> g_pq_out_cpu_heap; // 非 shader-visible（CPU 可读）：clear 的 CPU 句柄必须来自此类堆
-
-// ---- 输入 CPU 中转（2026-08-24 legacy 共享 SRV 读返回 0 实证）----
-// 金丝雀证明自有纹理 UAV/SRV/readback 全通；解码输出全 0 的唯一解释 = 共享纹理在 D3D12 读为 0。
-// 修复：输入不再经 D3D12 读共享纹理——D3D11 staging 读游戏输入（samples 已证明可行）
-// → CPU → D3D12 upload buffer → CopyTextureRegion 到自有输入纹理 → 链全部消费自有纹理。
-// 深度特别处理（2026-08-24 ）：R32G8X24_TYPELESS 的 D3D12 拷贝 footprint 为 4BPP
-// （深度平面；G8X24 是独立 stencil 平面）——若按 8BPP 行距 memcpy 会越界写（已实证 AV）。
-// 深度走提取路径：staging 保持 R32G8X24（匹配游戏），memcpy 每像素取前 4B 深度 → R32_FLOAT
-// 自有纹理/上传（4BPP，与 D3D12 footprint 一致）。
-ComPtr<ID3D12Resource> g_tex_color_own;      // 自有输入（R10G10B10A2，游戏格式）
-ComPtr<ID3D12Resource> g_tex_depth_own;      // 自有输入（R32_FLOAT，深度提取后 4BPP）
-ComPtr<ID3D12Resource> g_tex_motion_own;     // 自有输入（R10G10B10A2，游戏格式）
-// reactive 只由 CPU 从 motion.z 提取并作为 SRV 上传；不要再接入 motion decode 的 UAV/root-signature 路径。
-ComPtr<ID3D12Resource> g_tex_reactive_own;   // R8_UNORM，render-size
-ComPtr<ID3D12Resource> g_tex_transparency_own; // R8_UNORM，render-size
-ComPtr<ID3D12Resource> g_up_color, g_up_depth, g_up_motion, g_up_reactive, g_up_transparency; // upload buffers
-void *g_up_color_ptr = nullptr, *g_up_depth_ptr = nullptr, *g_up_motion_ptr = nullptr,
-     *g_up_reactive_ptr = nullptr, *g_up_transparency_ptr = nullptr;
-UINT g_up_color_pitch = 0, g_up_depth_pitch = 0, g_up_motion_pitch = 0, g_up_reactive_pitch = 0,
-     g_up_transparency_pitch = 0;
-ComPtr<ID3D11Texture2D> g_stage_color, g_stage_depth, g_stage_motion, g_stage_transparency; // D3D11 staging（CPU 读）
-UINT g_stage_color_pitch = 0, g_stage_depth_pitch = 0, g_stage_motion_pitch = 0, g_stage_transparency_pitch = 0;
-D3D12_RESOURCE_STATES g_color_own_state = D3D12_RESOURCE_STATE_COMMON;
-D3D12_RESOURCE_STATES g_depth_own_state = D3D12_RESOURCE_STATE_COMMON;
-D3D12_RESOURCE_STATES g_motion_own_state = D3D12_RESOURCE_STATE_COMMON;
-D3D12_RESOURCE_STATES g_reactive_own_state = D3D12_RESOURCE_STATE_COMMON;
-D3D12_RESOURCE_STATES g_transparency_own_state = D3D12_RESOURCE_STATE_COMMON;
-// cmdlist 开关状态（N1 良性噪音修复：1004 行防御性 Close 每帧对已关闭列表调 Close → E_FAIL + 调试消息）
-bool g_cmdlist_open = false;
 
 // SDK 诊断注记（追加到 g_sdk_messages，随 sdk_msgs 上日志）
 static void sdk_note(const wchar_t *fmt, ...)
@@ -700,6 +445,7 @@ static void sdk234_info(const char *fmt, ...)
 #endif
 }
 
+#if defined(FFX12_DEBUG_STEPS)
 static LONG WINAPI sdk234_exception_filter(EXCEPTION_POINTERS *ep)
 {
     // 与 sdk234_step/sdk234_info 统一用模块目录绝对路径。
@@ -732,107 +478,7 @@ static LONG WINAPI sdk234_exception_filter(EXCEPTION_POINTERS *ep)
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
-
-static const char *g_pq_decode_hlsl = R"(
-RWTexture2D<float4> out_linear : register(u0);
-Texture2D<float4> in_pq     : register(t0);
-float3 PqToLinear(float3 value)
-{
-    const float m1 = 2610.0 / 16384.0;
-    const float m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0;
-    const float c2 = 2413.0 / 128.0;
-    const float c3 = 2392.0 / 128.0;
-    const float3 powered = pow(max(value, 0.0), 1.0 / m2);
-    return pow(max(powered - c1, 0.0) / max(c2 - c3 * powered, 1e-6), 1.0 / m1);
-}
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    #if defined(FFX12_DECODE_TEST)
-    // 常数注入测试：输出固定 0.5 —— 若 cl 读回 0.5 则 decode pass 执行正常（问题在 SRV 读取）
-    out_linear[id.xy] = float4(0.5, 0.5, 0.5, 1.0);
-    #else
-    float4 c = in_pq.Load(int3(id.xy, 0));
-    out_linear[id.xy] = float4(PqToLinear(c.rgb), c.a);
-    #endif
-}
-)";
-
-static const char *g_pq_encode_hlsl = R"(
-RWTexture2D<float4> out_pq : register(u0);
-Texture2D<float4> in_linear : register(t0);
-float3 LinearToPq(float3 value)
-{
-    const float m1 = 2610.0 / 16384.0;
-    const float m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0;
-    const float c2 = 2413.0 / 128.0;
-    const float c3 = 2392.0 / 128.0;
-    const float3 powered = pow(max(value, 0.0), m1);
-    return pow((c1 + c2 * powered) / (1.0 + c3 * powered), m2);
-}
-[numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID)
-{
-    float4 c = in_linear.Load(int3(id.xy, 0));
-    float3 pq = LinearToPq(c.rgb);
-    bool mark = false;
-    #if defined(FFX12_OUTPUT_MARK)
-    {
-        uint2 dims;
-        out_pq.GetDimensions(dims.x, dims.y);
-        const uint2 center = dims / 2u;
-        mark = (id.x < dims.x / 8u && id.y < dims.y / 8u) ||
-               (abs(int(id.x) - int(center.x)) < int(dims.x / 16u) &&
-                abs(int(id.y) - int(center.y)) < int(dims.y / 16u));
-    }
-    #endif
-    if (mark)
-        out_pq[id.xy] = float4(1.0, 0.0, 0.0, 1.0);
-    else
-        out_pq[id.xy] = float4(LinearToPq(c.rgb * 0.5), c.a); // 整体亮度减半（无法忽视的标记）
-}
-)";
-
-ComPtr<ID3D11Texture2D> make_shared_texture(UINT w, UINT h, DXGI_FORMAT fmt, UINT bind_flags)
-{
-    D3D11_TEXTURE2D_DESC d {};
-    d.Width = w;
-    d.Height = h;
-    d.MipLevels = 1;
-    d.ArraySize = 1;
-    d.Format = fmt;
-    d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_DEFAULT;
-    d.BindFlags = bind_flags;
-    // An On12 game device already shares ownership with g_d12dev through its
-    // queue.  Legacy shared handles are not valid/needed there; the texture is
-    // only the D3D11 landing target for the transitional CPU path.
-    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-    ComPtr<ID3D11Texture2D> t;
-    if (FAILED(g_d11dev->CreateTexture2D(&d, nullptr, &t)))
-        return nullptr;
-    return t;
-}
-
-bool open_on_d3d12(SharedTex &st)
-{
-    if (st.d12)
-        return true;
-    if (!st.d11)
-        return false;
-    ComPtr<IDXGIResource> dxgi;
-    if (FAILED(st.d11.As(&dxgi)))
-        return false;
-    HANDLE h = nullptr;
-    if (FAILED(dxgi->GetSharedHandle(&h)))
-        return false;
-    st.handle = h;
-    if (FAILED(g_d12dev->OpenSharedHandle(h, IID_PPV_ARGS(&st.d12))))
-        return false;
-    return true;
-}
+#endif
 
 // NT 共享纹理（SHARED|SHARED_NTHANDLE）——D3D12 可正确打开的跨 API
 // 共享机制（legacy GetSharedHandle 在 D3D12 读零，见 GpuInteropProbe 实证）。
@@ -872,881 +518,151 @@ bool open_shared_nt(SharedTex &st)
     return SUCCEEDED(hr) && st.d12;
 }
 
-void release_shared_nt(SharedTex &st)
-{
-    st.d12.Reset();
-    st.d11.Reset();
-    st.w = st.h = 0;
-}
-
-void release_shared(SharedTex &st)
-{
-    st.d12.Reset();
-    st.d11.Reset();
-    if (st.handle)
-    {
-        CloseHandle(st.handle);
-        st.handle = nullptr;
-    }
-    st.w = st.h = 0;
-}
-
-void release_motion_decode()
-{
-    if (g_up_motion_cvt && g_up_motion_cvt_ptr)
-        g_up_motion_cvt->Unmap(0, nullptr);
-    g_up_motion_cvt_ptr = nullptr;
-    g_up_motion_cvt.Reset();
-    g_tex_motion_cvt.Reset();
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_rb_motion_cvt.Reset();
-    g_rb_motion_cvt_pitch = 0;
-#endif
-    g_mv_heap.Reset();
-    g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;
-}
-
-void release_input_staging(); // 定义在尾部（ensure_input_staging 旁）
-
-void release_pq_resources()
-{
-    g_tex_color_linear.Reset();
-    g_tex_output_linear.Reset();
-    g_tex_output_enc.Reset();
-    g_output_readback.Reset();
-    g_output_readback_row_pitch = 0;
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_rb_color_linear.Reset();
-    g_rb_output_linear.Reset();
-    g_rb_color_linear_pitch = 0;
-    g_rb_output_linear_pitch = 0;
-#endif
-    g_output_enc_state = D3D12_RESOURCE_STATE_COMMON;
-    g_pq_in_heap.Reset();
-    g_pq_out_heap.Reset();
-    g_pq_out_cpu_heap.Reset();
-    g_pq_out_uav_gpu.ptr = 0;
-    g_pq_out_uav_cpu.ptr = 0;
-    g_color_linear_state = D3D12_RESOURCE_STATE_COMMON;
-    g_output_linear_state = D3D12_RESOURCE_STATE_COMMON;
-    release_input_staging();
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // 金丝雀 + 链采样（诊断）
-    g_canary_tex.Reset();
-    g_canary_rb.Reset();
-    g_canary_heap.Reset();
-    g_marker_heap.Reset();
-    g_canary_pitch = 0;
-    g_canary_state = D3D12_RESOURCE_STATE_COMMON;
-    {
-        std::lock_guard lock(g_out_samples_mutex);
-        g_out_samples = OutputSamples {};
-        g_chain_samples = ChainSamples {};
-    }
-#endif
-}
-
-// 为 D3D12 自有纹理建 readback buffer（GetCopyableFootprints 对齐 rowPitch）
-bool create_readback_for_texture(ID3D12Resource *tex, ComPtr<ID3D12Resource> &rb, UINT &row_pitch)
-{
-    if (!tex || !g_d12dev)
-        return false;
-    D3D12_RESOURCE_DESC desc = tex->GetDesc();
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
-    g_d12dev->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
-    const UINT64 size = footprint.Footprint.RowPitch * static_cast<UINT64>(desc.Height);
-    row_pitch = footprint.Footprint.RowPitch;
-    D3D12_RESOURCE_DESC rd_buf {};
-    rd_buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd_buf.Width = size;
-    rd_buf.Height = 1;
-    rd_buf.DepthOrArraySize = 1;
-    rd_buf.MipLevels = 1;
-    rd_buf.SampleDesc.Count = 1;
-    rd_buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES hp {};
-    hp.Type = D3D12_HEAP_TYPE_READBACK;
-    return SUCCEEDED(g_d12dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd_buf,
-                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                       IID_PPV_ARGS(&rb)));
-}
-
-// 输入 CPU 中转资源：D3D12 自有输入纹理 + upload buffer + D3D11 staging。
-// 格式沿用游戏输入（color/motion R10G10B10A2、depth R32G8X24）；upload 持久 Map。
-bool ensure_input_staging()
-{
-    if (g_tex_color_own && g_tex_depth_own && g_tex_motion_own && g_tex_reactive_own &&
-        g_tex_transparency_own && g_up_color && g_up_depth && g_up_motion && g_up_reactive &&
-        g_up_transparency && g_stage_color && g_stage_depth && g_stage_motion && g_stage_transparency)
-        return true;
-    if (g_render_w == 0 || g_render_h == 0 || !g_d12dev || !g_d11dev)
-        return false;
-    sdk234_step("input_staging begin");
-    const DXGI_FORMAT color_fmt = g_input_color_fmt;
-    const DXGI_FORMAT depth_fmt = g_input_depth_fmt;
-    const DXGI_FORMAT motion_fmt = g_input_motion_fmt;
-    const DXGI_FORMAT transparency_fmt = g_input_transparency_fmt;
-
-    const auto make_own = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource> &own) -> bool
-    {
-        D3D12_HEAP_PROPERTIES hp {};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = g_render_w;
-        rd.Height = g_render_h;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.Format = fmt;
-        rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_NONE; // 仅 SRV 读
-        return SUCCEEDED(g_d12dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                           IID_PPV_ARGS(&own)));
-    };
-    const auto make_upload = [&](ID3D12Resource *own, ComPtr<ID3D12Resource> &up,
-                                 void *&ptr, UINT &pitch) -> bool
-    {
-        D3D12_RESOURCE_DESC desc = own->GetDesc();
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-        g_d12dev->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
-        const UINT64 size = fp.Footprint.RowPitch * static_cast<UINT64>(desc.Height);
-        pitch = fp.Footprint.RowPitch;
-        D3D12_RESOURCE_DESC rd_buf {};
-        rd_buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd_buf.Width = size;
-        rd_buf.Height = 1;
-        rd_buf.DepthOrArraySize = 1;
-        rd_buf.MipLevels = 1;
-        rd_buf.SampleDesc.Count = 1;
-        rd_buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_HEAP_PROPERTIES hp {};
-        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-        if (FAILED(g_d12dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd_buf,
-                                                     D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                     IID_PPV_ARGS(&up))))
-            return false;
-        D3D12_RANGE range {0, 0}; // 只写不读
-        return SUCCEEDED(up->Map(0, &range, &ptr));
-    };
-    // staging 只建纹理，不在创建期 Map（启动期对游戏 context 做探测 Map 是闪退嫌疑；
-    // RowPitch 在首次真实拷贝的 Map 里用 m.RowPitch 直接取，无需缓存）
-    const auto make_stage = [&](DXGI_FORMAT fmt, ComPtr<ID3D11Texture2D> &stg) -> bool
-    {
-        D3D11_TEXTURE2D_DESC d {};
-        d.Width = g_render_w;
-        d.Height = g_render_h;
-        d.MipLevels = 1;
-        d.ArraySize = 1;
-        d.Format = fmt;
-        d.SampleDesc.Count = 1;
-        d.Usage = D3D11_USAGE_STAGING;
-        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(g_d11dev->CreateTexture2D(&d, nullptr, &stg)))
-        {
-            sdk_note(L"create staging failed fmt=%d stage=input", static_cast<int>(fmt));
-            return false;
-        }
-        return true;
-    };
-
-    // 深度自有纹理用 R32_FLOAT（4BPP）：staging 仍为 R32G8X24（匹配游戏），拷贝时提取深度分量
-    if (!make_own(color_fmt, g_tex_color_own) ||
-        !make_own(DXGI_FORMAT_R32_FLOAT, g_tex_depth_own) ||
-        !make_own(motion_fmt, g_tex_motion_own) ||
-        !make_own(DXGI_FORMAT_R8_UNORM, g_tex_reactive_own) ||
-        !make_own(DXGI_FORMAT_R8_UNORM, g_tex_transparency_own))
-    {
-        sdk_note(L"create own input texture failed stage=input");
-        return false;
-    }
-    if (!make_upload(g_tex_color_own.Get(), g_up_color, g_up_color_ptr, g_up_color_pitch) ||
-        !make_upload(g_tex_depth_own.Get(), g_up_depth, g_up_depth_ptr, g_up_depth_pitch) ||
-        !make_upload(g_tex_motion_own.Get(), g_up_motion, g_up_motion_ptr, g_up_motion_pitch) ||
-        !make_upload(g_tex_reactive_own.Get(), g_up_reactive, g_up_reactive_ptr, g_up_reactive_pitch) ||
-        !make_upload(g_tex_transparency_own.Get(), g_up_transparency, g_up_transparency_ptr,
-                     g_up_transparency_pitch))
-    {
-        sdk_note(L"create upload buffer failed stage=input");
-        return false;
-    }
-    if (!make_stage(color_fmt, g_stage_color) || !make_stage(depth_fmt, g_stage_depth) ||
-        !make_stage(motion_fmt, g_stage_motion) || !make_stage(transparency_fmt, g_stage_transparency))
-    {
-        sdk_note(L"create staging failed stage=input");
-        return false;
-    }
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // 自有输入 readback（链输入送达验证，诊断）
-    if (!create_readback_for_texture(g_tex_color_own.Get(), g_rb_color_own, g_rb_color_own_pitch) ||
-        !create_readback_for_texture(g_tex_depth_own.Get(), g_rb_depth_own, g_rb_depth_own_pitch) ||
-        !create_readback_for_texture(g_tex_motion_own.Get(), g_rb_motion_own, g_rb_motion_own_pitch))
-    {
-        sdk_note(L"create own-input readback failed stage=input");
-        return false;
-    }
-#endif
-    g_color_own_state = g_depth_own_state = g_motion_own_state =
-        g_reactive_own_state = g_transparency_own_state = D3D12_RESOURCE_STATE_COMMON;
-    sdk234_step("input_staging ok");
-    return true;
-}
-
-void release_input_staging()
-{
-    if (g_up_color && g_up_color_ptr)
-        g_up_color->Unmap(0, nullptr);
-    if (g_up_depth && g_up_depth_ptr)
-        g_up_depth->Unmap(0, nullptr);
-    if (g_up_motion && g_up_motion_ptr)
-        g_up_motion->Unmap(0, nullptr);
-    if (g_up_reactive && g_up_reactive_ptr)
-        g_up_reactive->Unmap(0, nullptr);
-    if (g_up_transparency && g_up_transparency_ptr)
-        g_up_transparency->Unmap(0, nullptr);
-    g_up_color_ptr = g_up_depth_ptr = g_up_motion_ptr = g_up_reactive_ptr = g_up_transparency_ptr = nullptr;
-    g_tex_color_own.Reset();
-    g_tex_depth_own.Reset();
-    g_tex_motion_own.Reset();
-    g_tex_reactive_own.Reset();
-    g_tex_transparency_own.Reset();
-    g_up_color.Reset();
-    g_up_depth.Reset();
-    g_up_motion.Reset();
-    g_up_reactive.Reset();
-    g_up_transparency.Reset();
-    g_stage_color.Reset();
-    g_stage_depth.Reset();
-    g_stage_motion.Reset();
-    g_stage_transparency.Reset();
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_rb_color_own.Reset();
-    g_rb_depth_own.Reset();
-    g_rb_motion_own.Reset();
-    g_rb_color_own_pitch = g_rb_depth_own_pitch = g_rb_motion_own_pitch = 0;
-#endif
-    g_up_color_pitch = g_up_depth_pitch = g_up_motion_pitch = g_up_reactive_pitch =
-        g_up_transparency_pitch = 0;
-    g_stage_color_pitch = g_stage_depth_pitch = g_stage_motion_pitch = g_stage_transparency_pitch = 0;
-    g_color_own_state = g_depth_own_state = g_motion_own_state =
-        g_reactive_own_state = g_transparency_own_state = D3D12_RESOURCE_STATE_COMMON;
-}
-
-// 输出落地资源（P0-1 修复）：D3D12 自有 UAV 纹理 + readback buffer。
-// legacy SHARED 纹理在 D3D12 侧仅 COMMON 状态 → 不能直接 UAV 写；
-// 改由自有纹理承接编码/ffxDispatch 写，再 readback → D3D11 UpdateSubresource 落地共享纹理。
-// 无条件创建（非 PQ 路径的 ffxDispatch 输出也走它）。
-bool ensure_output_landing_resources()
-{
-    if (g_tex_output_enc && g_output_readback)
-        return true;
-    if (g_display_w == 0 || g_display_h == 0 || !g_d12dev)
-        return false;
-    if (g_tex_output_enc)
-        g_tex_output_enc.Reset();
-    if (g_output_readback)
-    {
-        g_output_readback.Reset();
-        g_output_readback_row_pitch = 0;
-    }
-    {
-        switch (g_input_output_fmt)
-        {
-            case DXGI_FORMAT_R10G10B10A2_TYPELESS: g_output_enc_format = DXGI_FORMAT_R10G10B10A2_UNORM; break;
-            case DXGI_FORMAT_R8G8B8A8_TYPELESS: g_output_enc_format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
-            case DXGI_FORMAT_B8G8R8A8_TYPELESS: g_output_enc_format = DXGI_FORMAT_B8G8R8A8_UNORM; break;
-            default: g_output_enc_format = g_input_output_fmt; break;
-        }
-        D3D12_HEAP_PROPERTIES hp {};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = g_display_w;
-        rd.Height = g_display_h;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.Format = g_output_enc_format;
-        rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(g_d12dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                     IID_PPV_ARGS(&g_tex_output_enc))))
-            return false;
-        // readback buffer（GetCopyableFootprints 对齐 rowPitch）
-        D3D12_RESOURCE_DESC enc_desc = g_tex_output_enc->GetDesc();
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
-        g_d12dev->GetCopyableFootprints(&enc_desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
-        const UINT64 buf_size = footprint.Footprint.RowPitch * static_cast<UINT64>(enc_desc.Height);
-        g_output_readback_row_pitch = footprint.Footprint.RowPitch;
-        D3D12_RESOURCE_DESC rd_buf {};
-        rd_buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rd_buf.Width = buf_size;
-        rd_buf.Height = 1;
-        rd_buf.DepthOrArraySize = 1;
-        rd_buf.MipLevels = 1;
-        rd_buf.SampleDesc.Count = 1;
-        rd_buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_HEAP_PROPERTIES hp_ro {};
-        hp_ro.Type = D3D12_HEAP_TYPE_READBACK;
-        if (FAILED(g_d12dev->CreateCommittedResource(&hp_ro, D3D12_HEAP_FLAG_NONE, &rd_buf,
-                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                     IID_PPV_ARGS(&g_output_readback))))
-            return false;
-        g_output_enc_state = D3D12_RESOURCE_STATE_COMMON;
-    }
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // 金丝雀：64×64 R8G8B8A8_UNORM 自有纹理 + readback + UAV 堆（执行链证明，诊断）
-    if (!g_canary_tex)
-    {
-        D3D12_HEAP_PROPERTIES hp {};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = 64;
-        rd.Height = 64;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(g_d12dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                     IID_PPV_ARGS(&g_canary_tex))))
-            return false;
-        if (!create_readback_for_texture(g_canary_tex.Get(), g_canary_rb, g_canary_pitch))
-            return false;
-        D3D12_DESCRIPTOR_HEAP_DESC hd {};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 2; // 根签名声明 SRV(t0)+UAV(u0) 两 range：t0 放 canary 自身 SRV（shader 不用），u0 放 UAV
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(g_d12dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_canary_heap))))
-            return false;
-        const UINT inc = g_d12dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = g_canary_heap->GetCPUDescriptorHandleForHeapStart();
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu0;
-        cpu1.ptr += inc;
-        // UAV 在前（本驱动描述符表 UAV range → offset 0）；SRV(canary)@1（两者同资源，兼容两种映射）
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
-        uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        g_d12dev->CreateUnorderedAccessView(g_canary_tex.Get(), nullptr, &uav, cpu0);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
-        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        g_d12dev->CreateShaderResourceView(g_canary_tex.Get(), &srv, cpu1);
-        g_canary_state = D3D12_RESOURCE_STATE_COMMON;
-    }
-#endif
-    // 版本标记堆：[UAV(enc)@0, SRV(enc)@1]（UAV 在前，本驱动映射；SRV 供表布局占位，shader 不用）
-    if (!ensure_marker_heap_for(g_tex_output_enc.Get()))
-        return false;
-    return true;
-}
-
-// 版本标记堆创建（起供 CPU / On12 / GPU-interop 三路径共用）。
-// heap 内布局：[SRV(enc)@0, UAV(enc)@1]（t0=desc0/u0=desc1）。
-// 旧实现把 UAV 放 0、SRV 放 1（与上述布局相反），u0 会绑定到 SRV 描述符
-// → 驱动层崩溃（进场闪退根因；该标记路径此前从未被真实启用过）。
-// 调用方在画标记时把 UAV 覆盖为当前输出纹理。
-bool ensure_marker_heap_for(ID3D12Resource *enc)
-{
-    if (g_marker_heap)
-        return true;
-    if (!enc || !g_d12dev)
-        return false;
-    D3D12_DESCRIPTOR_HEAP_DESC hd {};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 2;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_d12dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_marker_heap))))
-        return false;
-    const UINT inc = g_d12dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = g_marker_heap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu0;
-    cpu1.ptr += inc;
-    // desc0 = t0（SRV 占位，marker shader 不用；root table 引用必须有效）
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
-    srv.Format = g_output_enc_format;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels = 1;
-    g_d12dev->CreateShaderResourceView(enc, &srv, cpu0);
-    // desc1 = u0（UAV，marker shader 的 RWTexture2D img）
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
-    uav.Format = g_output_enc_format;
-    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    g_d12dev->CreateUnorderedAccessView(enc, nullptr, &uav, cpu1);
-    return true;
-}
-
-bool ensure_pq_resources()
-{
-    if (g_tex_color_linear && g_tex_output_linear && g_pq_in_heap && g_pq_out_heap)
-        return true;
-    if (g_render_w == 0 || g_render_h == 0 || g_display_w == 0 || g_display_h == 0 || !g_d12dev)
-        return false;
-    if (!g_tex_output_enc || !g_output_readback)
-        return false; // 落地资源必须先于 PQ 堆创建（UAV 指向 enc）
-    // color_linear：R16G16B16A16_FLOAT render 尺寸（UAV）
-    {
-        D3D12_HEAP_PROPERTIES hp {};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = g_render_w;
-        rd.Height = g_render_h;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(g_d12dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                     IID_PPV_ARGS(&g_tex_color_linear))))
-            return false;
-    }
-    // output_linear：R16G16B16A16_FLOAT display 尺寸（UAV）
-    {
-        D3D12_HEAP_PROPERTIES hp {};
-        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC rd {};
-        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        rd.Width = g_display_w;
-        rd.Height = g_display_h;
-        rd.DepthOrArraySize = 1;
-        rd.MipLevels = 1;
-        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        rd.SampleDesc.Count = 1;
-        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (FAILED(g_d12dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                     IID_PPV_ARGS(&g_tex_output_linear))))
-            return false;
-    }
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // 链中点采样 readback（color_linear / output_linear，诊断）
-    if (!create_readback_for_texture(g_tex_color_linear.Get(), g_rb_color_linear, g_rb_color_linear_pitch))
-        return false;
-    if (!create_readback_for_texture(g_tex_output_linear.Get(), g_rb_output_linear, g_rb_output_linear_pitch))
-        return false;
-#endif
-    g_pq_heap_inc = g_d12dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    // PQ 解码堆：[UAV(color_linear)@0, SRV(color_own)@1]
-    // 2026-08-24 离线复现定案：本驱动（AMD RDNA4）描述符表把 UAV range 排到 offset 0
-    // （与声明顺序无关）——堆内描述符必须 UAV 在前，否则 pass 写到 SRV 槽位资源（co=0.5 灰实证）。
-    {
-        D3D12_DESCRIPTOR_HEAP_DESC hd {};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 2;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(g_d12dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_pq_in_heap))))
-            return false;
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = g_pq_in_heap->GetCPUDescriptorHandleForHeapStart();
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu0;
-        cpu1.ptr += g_pq_heap_inc;
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
-        uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        g_d12dev->CreateUnorderedAccessView(g_tex_color_linear.Get(), nullptr, &uav, cpu0);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
-        srv.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        g_d12dev->CreateShaderResourceView(g_tex_color_own.Get(), &srv, cpu1);
-    }
-    // PQ 编码堆：[UAV(输出落地纹理 g_tex_output_enc)@0, SRV(output_linear)@1]
-    {
-        D3D12_DESCRIPTOR_HEAP_DESC hd {};
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 2;
-        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(g_d12dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_pq_out_heap))))
-            return false;
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = g_pq_out_heap->GetCPUDescriptorHandleForHeapStart();
-        D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu0;
-        cpu1.ptr += g_pq_heap_inc;
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
-        uav.Format = g_output_enc_format;
-        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        g_d12dev->CreateUnorderedAccessView(g_tex_output_enc.Get(), nullptr, &uav, cpu0);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
-        srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srv.Texture2D.MipLevels = 1;
-        g_d12dev->CreateShaderResourceView(g_tex_output_linear.Get(), &srv, cpu1);
-        // enc 清除金丝雀句柄（UAV 在 offset 0；CPU 句柄必须来自非 shader-visible 堆）
-        g_pq_out_uav_cpu = cpu0;
-        g_pq_out_uav_gpu = g_pq_out_heap->GetGPUDescriptorHandleForHeapStart(); // offset 0 = UAV
-        // CPU 句柄必须来自非 shader-visible（CPU 可读）堆：另建 1 描述符堆放同一 UAV
-        if (!g_pq_out_cpu_heap)
-        {
-            D3D12_DESCRIPTOR_HEAP_DESC hd_cpu {};
-            hd_cpu.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            hd_cpu.NumDescriptors = 1;
-            hd_cpu.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-            if (FAILED(g_d12dev->CreateDescriptorHeap(&hd_cpu, IID_PPV_ARGS(&g_pq_out_cpu_heap))))
-                return false;
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uav_cpu {};
-            uav_cpu.Format = g_output_enc_format;
-            uav_cpu.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            g_d12dev->CreateUnorderedAccessView(g_tex_output_enc.Get(), nullptr, &uav_cpu,
-                                                g_pq_out_cpu_heap->GetCPUDescriptorHandleForHeapStart());
-        }
-    }
-    return true;
-}
-
-bool ensure_motion_decode_resources()
-{
-    if (g_tex_motion_cvt && g_mv_heap && g_up_motion_cvt && g_up_motion_cvt_ptr)
-        return true;
-    if (g_render_w == 0 || g_render_h == 0 || !g_d12dev)
-        return false;
-    // cvt：R16G16_FLOAT，render 尺寸，UAV
-    D3D12_HEAP_PROPERTIES heap_props {};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC res_desc {};
-    res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    res_desc.Width = g_render_w;
-    res_desc.Height = g_render_h;
-    res_desc.DepthOrArraySize = 1;
-    res_desc.MipLevels = 1;
-    res_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
-    res_desc.SampleDesc.Count = 1;
-    res_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    if (FAILED(g_d12dev->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &res_desc,
-                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                 IID_PPV_ARGS(&g_tex_motion_cvt))))
-        return false;
-    // 旧 interop 需要这份 CPU 解码的 upload buffer（On12 分支已移除，恒走此路径）。
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp {};
-    g_d12dev->GetCopyableFootprints(&res_desc, 0, 1, 0, &fp, nullptr, nullptr, nullptr);
-    g_up_motion_cvt_pitch = fp.Footprint.RowPitch;
-    D3D12_RESOURCE_DESC ub {};
-    ub.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    ub.Width = fp.Footprint.RowPitch * static_cast<UINT64>(g_render_h);
-    ub.Height = 1;
-    ub.DepthOrArraySize = 1;
-    ub.MipLevels = 1;
-    ub.SampleDesc.Count = 1;
-    ub.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    D3D12_HEAP_PROPERTIES uhp {};
-    uhp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    if (FAILED(g_d12dev->CreateCommittedResource(&uhp, D3D12_HEAP_FLAG_NONE, &ub,
-                                                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                  IID_PPV_ARGS(&g_up_motion_cvt))))
-        return false;
-    D3D12_RANGE ur {0, 0};
-    if (FAILED(g_up_motion_cvt->Map(0, &ur, &g_up_motion_cvt_ptr)) || !g_up_motion_cvt_ptr)
-        return false;
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // 链中点采样 readback（金丝雀：motion 输入非 0 → cvt 非 0 即证明 cmdlist 执行 + 自有 UAV 写正常，诊断）
-    if (!create_readback_for_texture(g_tex_motion_cvt.Get(), g_rb_motion_cvt, g_rb_motion_cvt_pitch))
-        return false;
-#endif
-    // 描述符堆：[SRV(motion源), UAV(cvt)]，shader-visible
-    D3D12_DESCRIPTOR_HEAP_DESC hd {};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 2;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_d12dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_mv_heap))))
-        return false;
-    g_mv_heap_inc = g_d12dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu0 = g_mv_heap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu0;
-    cpu1.ptr += g_mv_heap_inc;
-    // 描述符顺序必须与 root signature ranges 一致：ranges[0]=SRV(t0) → offset 0，ranges[1]=UAV(u0) → offset 1。
-    // （2026-08-25 修复：此前 UAV@0/SRV@1 是反的 → u0 写到 motion 源、t0 读到从未写入的 cvt
-    //   纹理 → FSR2 motion 输入全垃圾 → 重投影失败 → 累积死 → 无 AA；mv_cvt 读回 -65504 实证。）
-    D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
-    uav.Format = DXGI_FORMAT_R16G16_FLOAT;
-    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
-    srv.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels = 1;
-    // On12 descriptors are filled with the per-frame unwrapped resource.
-    // A null descriptor here is intentional until the first direct dispatch.
-    g_d12dev->CreateShaderResourceView(g_tex_motion_own.Get(), &srv, cpu0);   // SRV(motion 源)@0
-    g_d12dev->CreateUnorderedAccessView(g_tex_motion_cvt.Get(), nullptr, &uav, cpu1); // UAV(cvt)@1
-    return true;
-}
-
 // P2：尺寸池**按实例**判等与重建 —— 甲实例的尺寸变化不再重建乙实例的纹理。
 // （顺带消掉原先"两实例尺寸不同 ⇒ 每次 dispatch 都重建整套共享纹理"的反复分配。）
-bool ensure_pool(const FrameInput &input, SdkContext &sc)
+bool simple_copy_shape(const D3D11_TEXTURE2D_DESC &desc, UINT width, UINT height)
 {
-    InstanceRes &r = sc.res;
-    const bool pool_ok =
-        r.tex_color.d11 != nullptr &&
-        (!g_gpu_interop_ready ||
-         (r.tex_motion.d11 != nullptr && r.tex_depth_share.d11 != nullptr && r.tex_output.d11 != nullptr)) &&
-        r.rw == input.render_w && r.rh == input.render_h &&
-        r.dw == input.display_w && r.dh == input.display_h;
-    if (pool_ok)
-        return true;
-    // 诊断（默认关）：重建频率/原因。size change ⇒ 下一帧 FSR context 也会被重建
-    // （见 dispatch 的尺寸检查），历史清零 + reset ⇒ 可能表现为隔几秒一次的画面变化。
-    if (instance_diag_note_allowed())
-    {
-        sdk_note(L"inst pool rebuild inst=%llu old=%ux%u->%ux%u new=%ux%u->%ux%u first=%d",
-                 static_cast<unsigned long long>(sc.key),
-                 r.rw, r.rh, r.dw, r.dh,
-                 input.render_w, input.render_h, input.display_w, input.display_h,
-                 r.tex_color.d11 == nullptr ? 1 : 0);
-    }
-    // 先释放该实例的整套资源（内部会把挂起帧落地或丢弃；释放后尺寸键才归零）
-    release_instance_res(sc);
-    g_render_w = g_render_h = g_display_w = g_display_h = 0;
-
-    // 池格式 = 输入纹理的实际格式（CopyResource 要求格式一致；游戏多为 TYPELESS）
-    DXGI_FORMAT color_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-    DXGI_FORMAT depth_fmt = DXGI_FORMAT_R32_FLOAT;
-    DXGI_FORMAT motion_fmt = DXGI_FORMAT_R16G16_FLOAT;
-    DXGI_FORMAT transparency_fmt = DXGI_FORMAT_R8_UNORM;
-    DXGI_FORMAT output_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-    D3D11_TEXTURE2D_DESC td {};
-    if (input.color && (input.color->GetDesc(&td), td.Format != DXGI_FORMAT_UNKNOWN))
-        color_fmt = td.Format;
-    if (input.depth && (input.depth->GetDesc(&td), td.Format != DXGI_FORMAT_UNKNOWN))
-        depth_fmt = td.Format;
-    if (input.motion && (input.motion->GetDesc(&td), td.Format != DXGI_FORMAT_UNKNOWN))
-        motion_fmt = td.Format;
-    if (input.transparency && (input.transparency->GetDesc(&td), td.Format != DXGI_FORMAT_UNKNOWN))
-        transparency_fmt = td.Format;
-    if (input.output_target && (input.output_target->GetDesc(&td), td.Format != DXGI_FORMAT_UNKNOWN))
-        output_fmt = td.Format;
-
-    // 原生 D3D11 纯 GPU 传输池（NT 共享句柄纹理；无 CPU staging）。
-    // 游戏保持原生 D3D11 设备；自建 D3D12 设备经共享句柄读取同一 GPU 内存。
-    if (g_gpu_interop_ready)
-    {
-        r.in_color_fmt = color_fmt;
-        r.in_depth_fmt = depth_fmt;
-        r.in_motion_fmt = motion_fmt;
-        r.in_transparency_fmt = transparency_fmt;
-        r.in_output_fmt = output_fmt;
-        r.rw = input.render_w;
-        r.rh = input.render_h;
-        r.dw = input.display_w;
-        r.dh = input.display_h;
-        // 全局镜像（诊断/dead path 用；live 路径一律读 r.*）
-        g_input_color_fmt = color_fmt;
-        g_input_depth_fmt = depth_fmt;
-        g_input_motion_fmt = motion_fmt;
-        g_input_transparency_fmt = transparency_fmt;
-        g_input_output_fmt = output_fmt;
-        g_render_w = input.render_w;
-        g_render_h = input.render_h;
-        g_display_w = input.display_w;
-        g_display_h = input.display_h;
-        // 共享输入（游戏同格式；颜色/运动 R10G10B10A2_TYPELESS，probe 验证可共享）
-        r.tex_color.d11 = make_shared_texture_nt(input.render_w, input.render_h, color_fmt,
-                                                 D3D11_BIND_SHADER_RESOURCE);
-        r.tex_motion.d11 = make_shared_texture_nt(input.render_w, input.render_h, motion_fmt,
-                                                  D3D11_BIND_SHADER_RESOURCE);
-        // 共享深度：R32_FLOAT（游戏 R32G8X24 不可共享 → 每帧 D3D11 CS 提取到这里）
-        r.tex_depth_share.d11 = make_shared_texture_nt(input.render_w, input.render_h,
-                                                       DXGI_FORMAT_R32_FLOAT,
-                                                       D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
-        // 共享解码 motion（R16G16_FLOAT；D3D11 CS 解码写 → D3D12 直读给 FFX）
-        r.tex_motion_cvt_share.d11 = make_shared_texture_nt(input.render_w, input.render_h,
-                                                            DXGI_FORMAT_R16G16_FLOAT,
-                                                            D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
-        // 共享 reactive（R8_UNORM；motion B 通道提取，同 CS 输出）
-        r.tex_reactive_share.d11 = make_shared_texture_nt(input.render_w, input.render_h,
-                                                          DXGI_FORMAT_R8_UNORM,
-                                                          D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
-        // 共享输出（FFX UAV 输出目标；随后 D3D11 GPU CopyResource 回游戏输出）
-        r.tex_output.d11 = make_shared_texture_nt(input.display_w, input.display_h, output_fmt,
-                                                  D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
-        r.tex_color.w = r.tex_motion.w = r.tex_depth_share.w = r.tex_motion_cvt_share.w = r.tex_reactive_share.w = input.render_w;
-        r.tex_color.h = r.tex_motion.h = r.tex_depth_share.h = r.tex_motion_cvt_share.h = r.tex_reactive_share.h = input.render_h;
-        r.tex_output.w = input.display_w;
-        r.tex_output.h = input.display_h;
-        if (!r.tex_color.d11 || !r.tex_motion.d11 || !r.tex_depth_share.d11 ||
-            !r.tex_motion_cvt_share.d11 || !r.tex_reactive_share.d11 || !r.tex_output.d11)
-            return false;
-        if (!open_shared_nt(r.tex_color) || !open_shared_nt(r.tex_motion) ||
-            !open_shared_nt(r.tex_depth_share) || !open_shared_nt(r.tex_motion_cvt_share) ||
-            !open_shared_nt(r.tex_reactive_share) || !open_shared_nt(r.tex_output))
-            return false;
-        // 共享深度 UAV（CS 输出目标；纹理固定，视图建一次）
-        if (!r.depth_share_uav)
-        {
-            D3D11_UNORDERED_ACCESS_VIEW_DESC uav {};
-            uav.Format = DXGI_FORMAT_R32_FLOAT;
-            uav.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-            if (FAILED(g_d11dev->CreateUnorderedAccessView(r.tex_depth_share.d11.Get(), &uav,
-                                                           &r.depth_share_uav)) ||
-                !r.depth_share_uav)
-                return false;
-        }
-        // 共享解码 motion UAV（D3D11 CS 输出目标）
-        if (!r.motion_cvt_share_uav)
-        {
-            D3D11_UNORDERED_ACCESS_VIEW_DESC uav {};
-            uav.Format = DXGI_FORMAT_R16G16_FLOAT;
-            uav.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-            if (FAILED(g_d11dev->CreateUnorderedAccessView(r.tex_motion_cvt_share.d11.Get(), &uav,
-                                                           &r.motion_cvt_share_uav)) ||
-                !r.motion_cvt_share_uav)
-                return false;
-        }
-        // 共享 reactive UAV（同 CS 的 u1 输出目标）
-        if (!r.reactive_share_uav)
-        {
-            D3D11_UNORDERED_ACCESS_VIEW_DESC uav {};
-            uav.Format = DXGI_FORMAT_R8_UNORM;
-            uav.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-            if (FAILED(g_d11dev->CreateUnorderedAccessView(r.tex_reactive_share.d11.Get(), &uav,
-                                                           &r.reactive_share_uav)) ||
-                !r.reactive_share_uav)
-                return false;
-        }
-        // b0 常数缓冲（depth 提取 / motion 解码共用）：P2 起**每实例一份**。
-        // 原先在 init_locked 建全局一份；全局一份时两实例会互相把 b0.x 刷成对方的值
-        // （各自"已上传值"缓存判据失效），而 b0.x 恰好同时被两条路径使用。
-        if (!r.motion_cb)
-        {
-            D3D11_BUFFER_DESC mcb {};
-            mcb.ByteWidth = 16;
-            mcb.Usage = D3D11_USAGE_DEFAULT;
-            mcb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-            const float mcb_init[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-            D3D11_SUBRESOURCE_DATA mcb_data { mcb_init, 0, 0 };
-            if (FAILED(g_d11dev->CreateBuffer(&mcb, &mcb_data, &r.motion_cb)) || !r.motion_cb)
-                return false;
-            r.cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
-            r.cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
-        }
-        // FFX 输出格式映射（UAV 不能用 TYPELESS 格式，须用 typed 变体；与
-        // ensure_output_landing_resources 同规则）。资源本体保持游戏 Typeless 以便
-        // D3D11 CopyResource(游戏输出 ← 共享输出) 格式一致。
-        DXGI_FORMAT enc_fmt = output_fmt;
-        if (output_fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS)
-            enc_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;
-        else if (output_fmt == DXGI_FORMAT_R8G8B8A8_TYPELESS)
-            enc_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-        else if (output_fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS)
-            enc_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
-        r.output_enc_format = enc_fmt;
-        g_output_enc_format = enc_fmt; // 全局镜像（dead path / 诊断）
-        g_motion_src_state = D3D12_RESOURCE_STATE_COMMON;
-        if (g_use_pq_chain)
-        {
-            sdk_note(L"gpu interop path rejects legacy PQ conversion stage=pool");
-            return false;
-        }
-        return true;
-    }
-
-    // 清理：CPU staging 回退路径已移除——GPU 互操作未就绪时直接失败，
-    // 由 dispatch 返回 false 让游戏走原有原生 FSR 路径（fail-open 不损画质）。
-    sdk_note(L"gpu interop not ready stage=pool");
-    return false;
+    return desc.Width == width && desc.Height == height && desc.MipLevels == 1 && desc.ArraySize == 1 &&
+        desc.SampleDesc.Count == 1 && desc.SampleDesc.Quality == 0;
 }
 
-void wait_gpu()
+DXGI_FORMAT typed_color(DXGI_FORMAT format)
 {
-    ++g_fence_value;
-    g_queue->Signal(g_fence.Get(), g_fence_value);
-    if (g_fence->GetCompletedValue() < g_fence_value)
+    switch (format)
     {
-        g_fence->SetEventOnCompletion(g_fence_value, g_fence_event);
-        // 【诊断】PerfProbe：无限等待只出现在初始化/停机路径；计数出来即可确认
-        // 它**不在**每帧路径上（若 waitobj 每秒有值 ⇒ 才需要继续查）。
-        perf_probe::wait_single_object_counted(g_fence_event, INFINITE);
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+    default: return format;
     }
+}
+
+bool ensure_pool(const FrameInput &input, SdkContext &sc)
+{
+    const InstanceRes &old = sc.res;
+    D3D11_TEXTURE2D_DESC color {}, output {};
+    input.color->GetDesc(&color);
+    input.output_target->GetDesc(&output);
+    if (!simple_copy_shape(color, input.render_w, input.render_h) ||
+        !simple_copy_shape(output, input.display_w, input.display_h) || output.Usage == D3D11_USAGE_IMMUTABLE ||
+        g_use_pq_chain)
+        return false;
+    if (old.rw == input.render_w && old.rh == input.render_h &&
+        old.dw == input.display_w && old.dh == input.display_h &&
+        old.in_color_fmt == color.Format && old.in_output_fmt == output.Format)
+        return true;
+
+    // 全部对象创建成功才替换池；中途失败不会让尺寸相同的半成品被当作已初始化。
+    InstanceRes prepared;
+    prepared.in_color_fmt = color.Format;
+    prepared.in_output_fmt = output.Format;
+    prepared.output_enc_format = typed_color(output.Format);
+    prepared.rw = input.render_w;
+    prepared.rh = input.render_h;
+    prepared.dw = input.display_w;
+    prepared.dh = input.display_h;
+    constexpr UINT k_shader = D3D11_BIND_SHADER_RESOURCE;
+    constexpr UINT k_uav = k_shader | D3D11_BIND_UNORDERED_ACCESS;
+    const auto make = [](SharedTex &tex, UINT w, UINT h, DXGI_FORMAT format, UINT bind)
+    {
+        tex.d11 = make_shared_texture_nt(w, h, format, bind);
+        return open_shared_nt(tex);
+    };
+    const auto view = [](SharedTex &tex, DXGI_FORMAT format, auto &uav)
+    {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC desc {};
+        desc.Format = format;
+        desc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        return SUCCEEDED(g_d11dev->CreateUnorderedAccessView(tex.d11.Get(), &desc, uav.GetAddressOf()));
+    };
+    const auto constant_buffer = [](auto &target)
+    {
+        D3D11_BUFFER_DESC desc {};
+        desc.ByteWidth = 16;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        return SUCCEEDED(g_d11dev->CreateBuffer(&desc, nullptr, target.GetAddressOf()));
+    };
+    if (!make(prepared.tex_color, prepared.rw, prepared.rh, color.Format, k_shader) ||
+        !make(prepared.tex_output, prepared.dw, prepared.dh, output.Format, k_uav) ||
+        !make(prepared.tex_depth_share, prepared.rw, prepared.rh, DXGI_FORMAT_R32_FLOAT, k_uav) ||
+        !make(prepared.tex_motion_cvt_share, prepared.rw, prepared.rh, DXGI_FORMAT_R16G16_FLOAT, k_uav) ||
+        !make(prepared.tex_reactive_share, prepared.rw, prepared.rh, DXGI_FORMAT_R8_UNORM, k_uav) ||
+        !view(prepared.tex_depth_share, DXGI_FORMAT_R32_FLOAT, prepared.depth_share_uav) ||
+        !view(prepared.tex_motion_cvt_share, DXGI_FORMAT_R16G16_FLOAT, prepared.motion_cvt_share_uav) ||
+        !view(prepared.tex_reactive_share, DXGI_FORMAT_R8_UNORM, prepared.reactive_share_uav) ||
+        !constant_buffer(prepared.depth_cb) || !constant_buffer(prepared.motion_cb) || !retire_instance(sc))
+        return false;
+
+    if (instance_diag_note_allowed())
+        sdk_note(L"inst pool rebuild inst=%llu old=%ux%u->%ux%u new=%ux%u->%ux%u",
+            static_cast<unsigned long long>(sc.key), old.rw, old.rh, old.dw, old.dh,
+            prepared.rw, prepared.rh, prepared.dw, prepared.dh);
+    if (sc.created)
+    {
+        destroy_context(sc);
+        ++g_ctx_recreates;
+    }
+    release_instance_res(sc);
+    sc.res = std::move(prepared);
+    sc.first = true;
+    return true;
+}
+
+bool retire_instance(SdkContext &sc)
+{
+    if (!g_interop.retire(sc.last_submission)) return false;
+    sc.last_submission = 0;
+    sc.reuse_needs_wait = false;
+    return true;
 }
 
 void destroy_context(SdkContext &sc)
 {
     if (sc.created && g_runtime.destroy != nullptr)
-        g_runtime.destroy(&sc.ctx, nullptr);
+    {
+        try
+        {
+            g_runtime.destroy(&sc.ctx, nullptr);
+        }
+        catch (...)
+        {
+            sdk_note(L"ffxDestroyContext threw C++ exception stage=ctx");
+        }
+    }
     sc.ctx = nullptr;
     sc.created = false;
 }
 
-// 按 instance_key 查找/创建 SdkContext（上限 4 个，LRU 驱逐）
+// 2026-11-15：淘汰只在该实例最后一次 GPU work 退役之后发生；尺寸变化也走相同顺序。
 SdkContext *ctx_for_key(std::uint64_t key)
 {
+    SdkContext *victim = nullptr;
     for (SdkContext &sc : g_sdk_ctxs)
     {
-        if (sc.created && sc.key == key)
+        if (sc.key == key)
         {
             sc.last_use = GetTickCount64();
             return &sc;
         }
+        if (!victim || sc.last_use < victim->last_use) victim = &sc;
     }
-    // 新实例：优先复用已销毁的空槽，否则 LRU 驱逐最旧
-    SdkContext *slot = nullptr;
-    for (SdkContext &sc : g_sdk_ctxs)
-    {
-        if (!sc.created && sc.key == 0)
-        {
-            slot = &sc;
-            break;
-        }
-    }
-    if (!slot && g_sdk_ctxs.size() < 4)
+    if (g_sdk_ctxs.size() < 4)
     {
         g_sdk_ctxs.emplace_back();
-        slot = &g_sdk_ctxs.back();
+        victim = &g_sdk_ctxs.back();
     }
-    if (!slot)
+    if (!retire_instance(*victim)) return nullptr;
+    if (victim->created)
     {
-        // 驱逐最久未用。
-        // P2 起每个实例独占一整套共享纹理（1080p render + 4K display 约 68MB）
-        // ⇒ 驱逐必须**先落地挂起帧、再整套释放**，否则 LRU 轮换会持续泄漏显存。
-        // 优先挑"没有挂起帧"的实例：有挂起帧的那一路这一帧的输出还没回游戏纹理，
-        // 现在落地它其实最正确（fence 通常早已 Signal，代价≈0）；全都有挂起帧时才退化。
-        SdkContext *victim = nullptr;
-        std::uint64_t oldest = ~0ull;
-        for (SdkContext &sc : g_sdk_ctxs)
-        {
-            if (sc.res.pending)
-                continue;
-            if (sc.last_use < oldest)
-            {
-                oldest = sc.last_use;
-                victim = &sc;
-            }
-        }
-        if (victim == nullptr)
-        {
-            oldest = ~0ull;
-            for (SdkContext &sc : g_sdk_ctxs)
-            {
-                if (sc.last_use < oldest)
-                {
-                    oldest = sc.last_use;
-                    victim = &sc;
-                }
-            }
-        }
-        slot = victim;
-        if (slot && slot->created)
-        {
-            destroy_context(*slot);
-            ++g_ctx_recreates;
-        }
+        destroy_context(*victim);
+        ++g_ctx_recreates;
     }
-    if (!slot)
-        return nullptr;
-    // 槽位必须是干净的：释放上一轮遗留的整套互操作资源（含挂起帧落地；驱逐路径已释放过，
-    // 这里是幂等保险）。不释放就是每实例约 68MB 的显存泄漏。
-    release_instance_res(*slot);
-    slot->key = key;
-    slot->last_use = GetTickCount64();
-    slot->rw = slot->rh = slot->dw = slot->dh = 0;
-    slot->first = true;
-    return slot;
+    release_instance_res(*victim);
+    victim->key = key;
+    victim->last_use = GetTickCount64();
+    victim->first = true;
+    return victim;
 }
 
 bool create_context(SdkContext &sc)
@@ -1787,20 +703,7 @@ bool create_context(SdkContext &sc)
                  // 未带 jitter 的矢量重复施加补偿，表现为静止画面细微抖动。
                  (g_motion_vectors_jittered ? FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION : 0u);
     g_create_flags = desc.flags; // 供日志按真值输出（旧日志此处是硬编码字符串）
-    // 异常保护（2026-09-19，接入 Ffx12BackendTest 后实测发现）：
-    // `g_runtime.create` 是**第三方 FFX SDK 的入口**，其 D3D12 后端路径在设备/适配器
-    // 条件不满足时会**抛出异常**（实测：测试环境走到此处抛出非 std::exception 的异常；
-    // 未捕获时表现为 std::terminate + 退出码 0xE06D7363，既无消息也无转储）。
-    //
-    // 在游戏里这意味着：任何让 SDK 内部抛异常的边缘条件（驱动差异、适配器切换、
-    // 显存不足等）都会**崩溃整个游戏进程**，而不是回退原生 FSR。
-    // 本后端的既有约定是 **fail-open**（见 `ensure_pool` 末尾："GPU 互操作未就绪时
-    // 直接失败，由 dispatch 返回 false 让游戏走原有原生 FSR 路径，不损画质"）——
-    // 这里必须遵守同一约定。
-    //
-    // 注：`/EHsc` 只在 Debug 配置开启（见 CMakeLists）；Release 下 catch 仍能捕获
-    // SDK 抛出的 C++ 异常（编译器仍生成 catch 处理，只是不做栈展开清理），
-    // 这正是"防御性 catch"的预期用法。
+    // 外部运行时失败不能穿过 Draw hook；本 TU 在 Release 也启用正常的 C++ 展开。
     ffxReturnCode_t rc = FFX_API_RETURN_ERROR;
     try
     {
@@ -1833,7 +736,17 @@ bool create_context(SdkContext &sc)
         config.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
         config.key = FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR;
         config.ptr = &velocity;
-        g_runtime.configure(&sc.ctx, reinterpret_cast<ffxConfigureDescHeader *>(&config));
+        try
+        {
+            g_runtime.configure(&sc.ctx, reinterpret_cast<ffxConfigureDescHeader *>(&config));
+        }
+        catch (...)
+        {
+            // 速度因子是可选项；不能将 configure 成功写进日志，也不能继续使用不明状态的 context。
+            sdk_note(L"ffxConfigure threw C++ exception stage=ctx");
+            destroy_context(sc);
+            return false;
+        }
     }
     return true;
 }
@@ -1863,7 +776,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
                          SdkContext &sc, bool reset)
 {
     InstanceRes &r = sc.res;
-    if (!g_gpu_interop_ready || !g_shared_fence || !g_shared_fence11 || !game_context)
+    if (!g_interop.available() || !game_context || game_context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
         return false;
     // ★ P2a：**每个实例记住自己的调用方 context**（原先是全局唯一、只 QI 第一次见到的那个）。
     // 为什么必须按调用方：下面所有 D3D11 命令（深度提取 / motion 解码 CS、颜色 CopyResource）
@@ -1876,7 +789,8 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     if (r.ctx_src.Get() != game_context || !r.game_ctx4)
     {
         r.game_ctx4.Reset();
-        r.ctx_src = game_context; // AddRef：判等可靠（对象不会被释放后地址被复用）
+        r.ctx_src = game_context; // 保留原接口身份；避免把同地址的新包装器误认成旧对象。
+        sc.reuse_needs_wait = sc.last_submission != 0;
         r.ctx_wrong_device = false;
         // 跨设备保护（见 InstanceRes::ctx_wrong_device）：本后端的共享纹理都建在
         // g_d11dev 上，另一个设备的 context 用不了它们（D3D11 静默失败 ⇒ 旧内容/垃圾）。
@@ -1910,207 +824,106 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     // （原先是全局单份池）。持引用，实例被 LRU 驱逐后不会留下悬空指针。
     g_mirror_color_tex = r.tex_color.d11;
     g_mirror_output_tex = r.tex_output.d11;
-    // 尺寸/格式镜像同样按"最近一次派发"刷新：池命中时不会走 ensure_pool 的赋值路径，
-    // 而别的实例建池又会覆盖这些全局值 ⇒ 只在这里刷新才与"最近一次 dispatch"一致。
-    g_render_w = r.rw;
-    g_render_h = r.rh;
-    g_display_w = r.dw;
-    g_display_h = r.dh;
+    // 诊断只看当前实例，不能读到另一个相机的尺寸和格式。
     g_input_color_fmt = r.in_color_fmt;
+    g_input_output_fmt = r.in_output_fmt;
+    // 常态同一即时 context 的上一次 Wait/Copy 已排队，无需每帧再等。只有上一轮未能交付，
+    // 或接口发生变化时，才必须补依赖以保护共享输入/输出不被提前复用。
+    if (sc.reuse_needs_wait && !g_interop.order_before_use(*r.game_ctx4.Get(), sc.last_submission))
+        return false;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    perf_probe::Scope prep(perf_probe::Segment::interop_prep);
+#endif
+    // 两份 guide 都必须能绑定；不以池里上一帧恰好还在的深度或 MV 代替。
+    const auto bind_guide = [&](ID3D11Texture2D *texture, ID3D11Texture2D *&last, auto &view,
+                                DXGI_FORMAT &actual, bool depth)
+    {
+        if (texture == last && view) return true;
+        D3D11_TEXTURE2D_DESC desc {};
+        texture->GetDesc(&desc);
+        if (desc.Width < r.rw || desc.Height < r.rh || desc.SampleDesc.Count != 1 || desc.ArraySize != 1)
+            return false;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
+        srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        srv.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        if (depth)
+        {
+            switch (desc.Format)
+            {
+            case DXGI_FORMAT_R24G8_TYPELESS:
+            case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+                srv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+                break;
+            case DXGI_FORMAT_R32G8X24_TYPELESS:
+            case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+                srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+                break;
+            default:
+                srv.Format = DXGI_FORMAT_R32_FLOAT;
+                break;
+            }
+        }
+        ComPtr<ID3D11ShaderResourceView> prepared;
+        if (FAILED(g_d11dev->CreateShaderResourceView(texture, &srv, prepared.GetAddressOf())))
+            return false;
+        view = std::move(prepared);
+        last = texture;
+        actual = desc.Format;
+        return true;
+    };
+    if (!bind_guide(input.depth, r.depth_src_last, r.depth_src_srv, r.in_depth_fmt, true) ||
+        !bind_guide(input.motion, r.motion_src_last, r.motion_src_srv, r.in_motion_fmt, false))
+        return false;
+
+    const auto prepare_guide = [&](ID3D11ComputeShader *shader, ID3D11ShaderResourceView *srv,
+                                   UINT num_uav, ID3D11UnorderedAccessView *const *uavs,
+                                   ID3D11Buffer *buffer, float value, float &uploaded)
+    {
+        if (uploaded != value)
+        {
+            const float constants[4] = {value, 0.0f, 0.0f, 0.0f};
+            game_context->UpdateSubresource(buffer, 0, nullptr, constants, 0, 0);
+            uploaded = value;
+        }
+        game_context->CSSetConstantBuffers(0, 1, &buffer);
+        game_context->CSSetShader(shader, nullptr, 0);
+        game_context->CSSetShaderResources(0, 1, &srv);
+        game_context->CSSetUnorderedAccessViews(0, num_uav, uavs, nullptr);
+        game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
+        ID3D11UnorderedAccessView *null_uavs[2] {};
+        game_context->CSSetUnorderedAccessViews(0, num_uav, null_uavs, nullptr);
+        srv = nullptr;
+        game_context->CSSetShaderResources(0, 1, &srv);
+    };
+    ID3D11UnorderedAccessView *depth_uav = r.depth_share_uav.Get();
+    prepare_guide(g_depth_extract_cs.Get(), r.depth_src_srv.Get(), 1, &depth_uav,
+        r.depth_cb.Get(), g_depth_scale, r.cb_uploaded_depth);
+    ID3D11ComputeShader *motion_shader = g_motion_decode_cs.Get();
+    if (!g_decode_motion && g_motion_raw_cs) motion_shader = g_motion_raw_cs.Get();
+    else if (g_motion_deadzone && g_motion_decode_dz_cs) motion_shader = g_motion_decode_dz_cs.Get();
+    ID3D11UnorderedAccessView *motion_uavs[] = {r.motion_cvt_share_uav.Get(), r.reactive_share_uav.Get()};
+    prepare_guide(motion_shader, r.motion_src_srv.Get(), 2, motion_uavs,
+        r.motion_cb.Get(), g_motion_flip, r.cb_uploaded_flip);
+    game_context->CSSetShader(nullptr, nullptr, 0);
+    game_context->CopyResource(r.tex_color.d11.Get(), input.color);
     g_input_depth_fmt = r.in_depth_fmt;
     g_input_motion_fmt = r.in_motion_fmt;
+    if (input.transparency)
+    {
+        D3D11_TEXTURE2D_DESC details {};
+        input.transparency->GetDesc(&details);
+        r.in_transparency_fmt = details.Format;
+    }
     g_input_transparency_fmt = r.in_transparency_fmt;
-    g_input_output_fmt = r.in_output_fmt;
-    // 上一轮 D3D12 对共享输入/输出的使用必须已完成（否则 D3D11 复用会踩未完结的 GPU 工作）。
-    // P2 起这里等的是**全局最近一次** D3D12 完成（可能来自另一实例）——比"只等自己那个"
-    // 更保守（更安全，代价是跨实例少一点并行；它们本来就在同一队列上串行）。
-    const std::uint64_t t_prep_wait_start = qpc_us();
-    if (g_shared_fence_value != 0 &&
-        FAILED(r.game_ctx4->Wait(g_shared_fence11.Get(), g_shared_fence_value)))
-        return false;
-    g_timing.prep_wait_us.fetch_add(qpc_us() - t_prep_wait_start, std::memory_order_relaxed);
-    // 【诊断】PerfProbe：复用上面已有的 qpc_us 测量（**不额外取时间**）。
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::interop_queue_wait, qpc_us() - t_prep_wait_start);
+    prep.finish();
+    perf_probe::Scope submit(perf_probe::Segment::interop_submit);
 #endif
-    const std::uint64_t t_prep_start = qpc_us();
-
-    // ---- ① D3D11 侧：深度提取（CS）＋ 输入 GPU 拷贝 ----
-    if (input.depth && g_depth_extract_cs && r.depth_share_uav)
-    {
-        if (!r.depth_src_srv || r.depth_src_last != input.depth)
-        {
-            r.depth_src_srv.Reset();
-            // 按深度纹理实际格式选视图（绑定深度曾全 0；
-            // DSV 深度可能为 D24 族或 D32 族——Load().x 统一得到 0..1）
-            DXGI_FORMAT srv_fmt = DXGI_FORMAT_R32_FLOAT;
-            ID3D11Texture2D *dtex = nullptr;
-            if (SUCCEEDED(input.depth->QueryInterface(__uuidof(ID3D11Texture2D),
-                                                      reinterpret_cast<void **>(&dtex))))
-            {
-                D3D11_TEXTURE2D_DESC td {};
-                dtex->GetDesc(&td);
-                switch (td.Format)
-                {
-                    case DXGI_FORMAT_R24G8_TYPELESS:
-                    case DXGI_FORMAT_D24_UNORM_S8_UINT:
-                    case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-                        srv_fmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-                        break;
-                    case DXGI_FORMAT_R32G8X24_TYPELESS:
-                    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-                    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-                        // 官方约定：D32S8/R32G8X24 深度需用 R32_FLOAT_X8X24 视图读深度分量
-                        // （普通 R32_FLOAT 视图读不到——实测深度全 0）
-                        srv_fmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-                        break;
-                    default:
-                        srv_fmt = DXGI_FORMAT_R32_FLOAT;
-                        break;
-                }
-                dtex->Release();
-            }
-            D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
-            srv.Format = srv_fmt;
-            srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srv.Texture2D.MipLevels = 1;
-            if (FAILED(g_d11dev->CreateShaderResourceView(input.depth, &srv, &r.depth_src_srv)))
-                r.depth_src_srv.Reset();
-            r.depth_src_last = r.depth_src_srv ? input.depth : nullptr;
-        }
-        if (r.depth_src_srv)
-        {
-            if (r.motion_cb)
-            {
-                // 复用 16B 常数缓冲（b0）：depth 提取用 g_depth_scale（XeSS 激活时归一化 [0,1]）
-                if (r.cb_uploaded_depth != g_depth_scale)
-                {
-                    const float dscale[4] = {g_depth_scale, 0.0f, 0.0f, 0.0f};
-                    game_context->UpdateSubresource(r.motion_cb.Get(), 0, nullptr, dscale, 0, 0);
-                    r.cb_uploaded_depth = g_depth_scale;
-                }
-                ID3D11Buffer *cbs[] = {r.motion_cb.Get()};
-                game_context->CSSetConstantBuffers(0, 1, cbs);
-            }
-            game_context->CSSetShader(g_depth_extract_cs.Get(), nullptr, 0);
-            ID3D11ShaderResourceView *srvs[] = { r.depth_src_srv.Get() };
-            game_context->CSSetShaderResources(0, 1, srvs);
-            ID3D11UnorderedAccessView *uavs[] = { r.depth_share_uav.Get() };
-            game_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-            // 派发尺寸取**本实例**池尺寸（原先取全局镜像 ⇒ 多实例下会按别人尺寸派发）
-            game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
-            ID3D11UnorderedAccessView *null_uavs[] = { nullptr };
-            game_context->CSSetUnorderedAccessViews(0, 1, null_uavs, nullptr);
-            ID3D11ShaderResourceView *null_srvs[] = { nullptr };
-            game_context->CSSetShaderResources(0, 1, null_srvs);
-            game_context->CSSetShader(nullptr, nullptr, 0);
-        }
-    }
-    // D3D11 侧 motion 解码——游戏 motion（R10G10B10A2 平方编码）→
-    // 共享 R16G16_FLOAT。绕过原 D3D12 decode pass（金丝雀证实从不写 cvt）。
-    if (input.motion && g_motion_decode_cs && r.motion_cvt_share_uav)
-    {
-        if (!r.motion_src_srv || r.motion_src_last != input.motion)
-        {
-            r.motion_src_srv.Reset();
-            D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
-            srv.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-            srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srv.Texture2D.MipLevels = 1;
-            if (FAILED(g_d11dev->CreateShaderResourceView(input.motion, &srv, &r.motion_src_srv)))
-                r.motion_src_srv.Reset();
-            r.motion_src_last = r.motion_src_srv ? input.motion : nullptr;
-        }
-        if (r.motion_src_srv)
-        {
-            if (r.motion_cb)
-            {
-                if (r.cb_uploaded_flip != g_motion_flip)
-                {
-                    const float flip[4] = {g_motion_flip, 0.0f, 0.0f, 0.0f};
-                    game_context->UpdateSubresource(r.motion_cb.Get(), 0, nullptr, flip, 0, 0);
-                    r.cb_uploaded_flip = g_motion_flip;
-                }
-                ID3D11Buffer *cbs[] = {r.motion_cb.Get()};
-                game_context->CSSetConstantBuffers(0, 1, cbs);
-            }
-            // 变体选择（让 Ffx12MotionDecode 真正生效——此前它是空开关）：
-            //   decode_motion=false → raw 变体（不解码）；true 且 deadzone → dz 变体；否则 decode
-            ID3D11ComputeShader *motion_cs = nullptr;
-            if (!g_decode_motion && g_motion_raw_cs)
-                motion_cs = g_motion_raw_cs.Get();
-            else if (g_motion_deadzone && g_motion_decode_dz_cs)
-                motion_cs = g_motion_decode_dz_cs.Get();
-            else
-                motion_cs = g_motion_decode_cs.Get();
-            game_context->CSSetShader(motion_cs, nullptr, 0);
-            ID3D11ShaderResourceView *srvs[] = { r.motion_src_srv.Get() };
-            game_context->CSSetShaderResources(0, 1, srvs);
-            // u0 = 解码 motion（R16G16），u1 = reactive（R8，motion B 通道）
-            ID3D11UnorderedAccessView *uavs[] = { r.motion_cvt_share_uav.Get(), r.reactive_share_uav.Get() };
-            game_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-            game_context->Dispatch((r.rw + 7u) / 8u, (r.rh + 7u) / 8u, 1u);
-            ID3D11UnorderedAccessView *null_uavs[2] = { nullptr, nullptr };
-            game_context->CSSetUnorderedAccessViews(0, 2, null_uavs, nullptr);
-            ID3D11ShaderResourceView *null_srvs[] = { nullptr };
-            game_context->CSSetShaderResources(0, 1, null_srvs);
-            game_context->CSSetShader(nullptr, nullptr, 0);
-        }
-    }
-    if (input.color)
-        game_context->CopyResource(r.tex_color.d11.Get(), input.color);
-    // motion 不再拷贝进共享 raw 纹理——解码 CS 已直接读游戏纹理，
-    // 解码结果（共享 R16G16）才是 FFX 的 motion 输入。
-    const std::uint64_t t_cs_end = qpc_us();
-    g_timing.prep_cs_us.fetch_add(t_cs_end - t_prep_start, std::memory_order_relaxed);
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::interop_prep, t_cs_end - t_prep_start);
-#endif
-    // 实验：不显式 Flush——测试 ctx4->Signal(v1) 是否隐含提交排队命令
-    // （D3D11 输入 CS + 拷贝）。若驱动在 Signal 时提交，pflush 222us 归零。
-    // 风险：Signal 不隐含提交 → D3D12 Wait(v1) 超时（1s 保护）→ dispatch 失败
-    // fail-open 回退原生 FSR（不崩游戏）。有异常立即恢复 Flush。
-    const std::uint64_t t_prep_end = qpc_us();
-    g_timing.prep_flush_us.fetch_add(t_prep_end - t_cs_end, std::memory_order_relaxed);
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::interop_prep, t_prep_end - t_cs_end);
-#endif
-    g_timing.prep_us.fetch_add(t_prep_end - t_prep_start, std::memory_order_relaxed);
-    const std::uint64_t v1 = g_shared_fence_value + 1;
-    const std::uint64_t t_sig_start = qpc_us();
-    if (FAILED(r.game_ctx4->Signal(g_shared_fence11.Get(), v1)))
-        return false;
-    g_timing.signal_us.fetch_add(qpc_us() - t_sig_start, std::memory_order_relaxed);
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::interop_signal, qpc_us() - t_sig_start);
-#endif
-    g_shared_fence_value = v1;
-    const std::uint64_t t_w12_start = qpc_us();
-    if (FAILED(g_queue->Wait(g_shared_fence.Get(), v1)))
-        return false;
-    g_timing.wait12_us.fetch_add(qpc_us() - t_w12_start, std::memory_order_relaxed);
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::interop_queue_wait, qpc_us() - t_w12_start);
-#endif
-
-    // ---- ② D3D12 侧：motion 解码 + FFX（共享纹理直读） ----
-    const std::uint64_t t_submit_start = qpc_us();
-    On12CommandSlot &slot = g_on12_command_slots[
-        g_on12_command_slot_cursor++ % static_cast<std::uint32_t>(g_on12_command_slots.size())];
-    if (!slot.allocator || !slot.list)
-        return false;
-    if (slot.fence_value != 0 && g_fence->GetCompletedValue() < slot.fence_value)
-    {
-        // 超时保护：GPU 卡死时不再无限挂起（1s 后失败返回，上层 fail-open）。
-        // 【诊断】PerfProbe：这是**唯一一处会真正阻塞 CPU** 的 fence 等待
-        // （ring 槽位被上一轮占用）。计数器 `waitobj` 与 `wso_max_us` 就是它的实测。
-        if (FAILED(g_fence->SetEventOnCompletion(slot.fence_value, g_fence_event)) ||
-            perf_probe::wait_single_object_counted(g_fence_event, 1000) != WAIT_OBJECT_0)
-            return false;
-    }
-    if (FAILED(slot.allocator->Reset()) || FAILED(slot.list->Reset(slot.allocator.Get(), nullptr)))
-        return false;
-    ID3D12GraphicsCommandList *const cmd = slot.list.Get();
+    ID3D12GraphicsCommandList *const cmd = g_interop.begin();
+    if (!cmd) return false;
     const auto barrier = [&](ID3D12Resource *resource, D3D12_RESOURCE_STATES before,
                              D3D12_RESOURCE_STATES after)
     {
@@ -2142,7 +955,7 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     dispatch.commandList = cmd;
     dispatch.color = ffxApiGetResourceDX12(r.tex_color.d12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    dispatch.color.description.format = FFX_API_SURFACE_FORMAT_R10G10B10A2_TYPELESS;
+    dispatch.color.description.format = ffxApiGetSurfaceFormatDX12(r.in_color_fmt);
     dispatch.depth = ffxApiGetResourceDX12(r.tex_depth_share.d12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch.depth.description.format = FFX_API_SURFACE_FORMAT_R32_FLOAT;
     dispatch.motionVectors =
@@ -2170,178 +983,74 @@ bool dispatch_gpu_shared(const FrameInput &input, ID3D11DeviceContext *game_cont
     dispatch.cameraFar = input.camera_far;
     dispatch.cameraFovAngleVertical = input.camera_fov_vertical;
     dispatch.viewSpaceToMetersFactor = 1.0f;
-    const ffxReturnCode_t rc = g_runtime.dispatch(
-        &sc.ctx, reinterpret_cast<const ffxDispatchDescHeader *>(&dispatch));
+    ffxReturnCode_t rc = FFX_API_RETURN_ERROR;
+    try
+    {
+        rc = g_runtime.dispatch(&sc.ctx, reinterpret_cast<const ffxDispatchDescHeader *>(&dispatch));
+    }
+    catch (...)
+    {
+        sdk_note(L"ffxDispatch threw C++ exception stage=record");
+    }
     g_last_ffx_dispatch_rc.store(static_cast<int>(rc), std::memory_order_relaxed);
     if (rc != FFX_API_RETURN_OK)
-        sdk_note(L"gpu ffxDispatch rc=%d stage=direct", static_cast<int>(rc));
+    {
+        // 失败的 SDK 可能已录入一部分指令；不能执行或把池内旧输出复制到当前帧。
+        g_interop.discard();
+        sdk_note(L"gpu ffxDispatch rc=%d stage=record", static_cast<int>(rc));
+        return false;
+    }
 
-    // 全部归还 COMMON（跨 API 交接契约），再交给 D3D11 侧
-    barrier(r.tex_output.d12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_COMMON);
+    barrier(r.tex_output.d12.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     for (ID3D12Resource *resource : inputs)
-        barrier(resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                D3D12_RESOURCE_STATE_COMMON);
-    if (FAILED(cmd->Close()))
+        barrier(resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    const auto submission = g_interop.submit(*r.game_ctx4.Get());
+    if (submission.ticket)
+    {
+        sc.last_submission = submission.ticket;
+        sc.reuse_needs_wait = true;
+    }
+    if (!submission.signal_ordered)
+    {
+        sdk_note(L"gpu FFX submission failed stage=submit");
         return false;
-    ID3D12CommandList *lists[] = {cmd};
-    g_queue->ExecuteCommandLists(1, lists);
-    const UINT64 ring_signal = ++g_fence_value;
-    const std::uint64_t v2 = g_shared_fence_value + 1;
-    // 双 signal：ring 槽位完成（自有 fence）+ 跨 API 交接完成（共享 fence）
-    if (FAILED(g_queue->Signal(g_fence.Get(), ring_signal)) ||
-        FAILED(g_queue->Signal(g_shared_fence.Get(), v2)))
-        return false;
-    slot.fence_value = ring_signal;
-    g_shared_fence_value = v2;
-    g_timing.submit_us.fetch_add(qpc_us() - t_submit_start, std::memory_order_relaxed);
-    // 【诊断】PerfProbe：submit 段**包含 ring 槽位阻塞等待**（见下方
-    // `wait_single_object_counted`）⇒ 若它偏大且 waitobj 计数 > 0，就是"每帧在等"。
+    }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::interop_submit, qpc_us() - t_submit_start);
+    submit.finish();
+    perf_probe::Scope wait(perf_probe::Segment::finish_wait);
 #endif
-    // （submit = D3D12 侧：Wait(v1) + allocator/list Reset + barrier + FFX dispatch + Execute + 双 Signal）
-
-    // ---- ③ 输出交接：同步模式立即等待+拷贝；异步模式记 pending，Present 前 finish ----
-    if (!g_async_upscale)
+    if (!g_interop.order_before_use(*r.game_ctx4.Get(), submission.ticket))
     {
-        if (FAILED(r.game_ctx4->Wait(g_shared_fence11.Get(), v2)))
-            return false;
-        if (input.output_target)
-            game_context->CopyResource(input.output_target, r.tex_output.d11.Get());
-        game_context->Flush();
-    }
-    else
-    {
-        // 异步：记录**本实例**的挂起（fence 值 + 输出目标 + context），返回——游戏继续渲染，
-        // FFX 与后续 GPU 工作并行；Present 前 finish_pending 收全部实例，或本实例下一次
-        // dispatch 入口先收自己的上一帧。（P2：原先全局单槽，两实例会互相借道。）
-        r.pending = true;
-        r.pending_v2 = v2;
-        r.pending_output_target = input.output_target; // AddRef（ComPtr 赋值）
-        r.pending_context = game_context;              // AddRef（Present 前使用）
-    }
-
-    if (rc == FFX_API_RETURN_OK)
-    {
-        g_gpu_only_transport_available = true;
-        const std::uint64_t count = g_on12_direct_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (count <= 4 || (count % 1024u) == 0)
-            sdk_note(L"gpu interop ffx12 completed count=%llu no_cpu_bridge=1",
-                     static_cast<unsigned long long>(count));
-    }
-    return rc == FFX_API_RETURN_OK;
-}
-
-// ---- P2：按实例的 pending / 资源释放 helper ----
-
-// 丢弃某实例的挂起帧（不等待、不拷贝）。用于态势已经不可能完成交接的场合：
-// 设备移除恢复、停机、以及 finish 失败后的清尾。
-void drop_instance_pending(InstanceRes &r)
-{
-    r.pending = false;
-    r.pending_v2 = 0;
-    r.pending_output_target.Reset();
-    r.pending_context.Reset();
-}
-
-// 完成**某实例**挂起的异步 FFX：等待共享 fence（FFX 输出完成）→ CopyResource 到该实例
-// 记录的游戏输出纹理。由 dispatch 入口（同实例上一帧）、finish_pending（Present 前收全部）、
-// 池重建与 LRU 驱逐路径调用；调用方持有 g_mutex。
-bool finish_instance(SdkContext &sc)
-{
-    InstanceRes &r = sc.res;
-    if (!r.pending)
-        return true;
-    ID3D11DeviceContext *game_context = r.pending_context.Get();
-    if (!r.game_ctx4 || !g_shared_fence11 || !game_context)
-    {
-        drop_instance_pending(r);
+        sdk_note(L"gpu FFX output Wait failed stage=delivery");
         return false;
     }
-    // 等待 FFX 输出完成（fence 通常已 Signal——GPU 上 FFX 与游戏后续工作并行，
-    // 此处仅当游戏提前到达 Present 才短暂阻塞）
-    const std::uint64_t t_wait_start = qpc_us();
-    if (FAILED(r.game_ctx4->Wait(g_shared_fence11.Get(), r.pending_v2)))
-    {
-        drop_instance_pending(r);
-        return false;
-    }
-    g_timing.wait_us.fetch_add(qpc_us() - t_wait_start, std::memory_order_relaxed);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::finish_wait, qpc_us() - t_wait_start);
+    wait.finish();
+    perf_probe::Scope copy(perf_probe::Segment::finish_copy);
 #endif
-    ID3D11Texture2D *output = r.pending_output_target.Get();
-    const std::uint64_t t_copy_start = qpc_us();
-    if (output && r.tex_output.d11)
-        game_context->CopyResource(output, r.tex_output.d11.Get());
-    // 不显式 Flush：拷贝命令留在 D3D11 队列，由游戏随后的 Present（或下一批
-    // 提交）自然带走——省一次显式提交的驱动往返（copy 196us 大头之一）。
-    // 正确性：DXGI Present 会确保 backbuffer 内容就绪（隐含提交排队命令）；
-    // 若游戏在拷贝后不再提交任何命令，Present 仍会带走它。
-    g_timing.copy_us.fetch_add(qpc_us() - t_copy_start, std::memory_order_relaxed);
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::add_span_us(perf_probe::Segment::finish_copy, qpc_us() - t_copy_start);
-#endif
-    drop_instance_pending(r);
+    // 2026-11-15：游戏常在 Present 之前消费目标。把依赖和复制放在当前 D3D11 流中，
+    // 而不是发布一张还没被写的纹理。此处只建立 GPU 顺序，不宣称 CPU 已看到像素。
+    game_context->CopyResource(input.output_target, r.tex_output.d11.Get());
+    if (!g_async_upscale) game_context->Flush();
+    sc.reuse_needs_wait = false;
+    g_gpu_only_transport_available = true;
+    const auto count = ++g_delivered_count;
+    if (count <= 4 || count % 1024u == 0)
+        sdk_note(L"gpu interop ffx12 output_ordered count=%llu no_cpu_bridge=1",
+                 static_cast<unsigned long long>(count));
     return true;
 }
 
-// 释放某实例**整套** GPU 互操作资源（共享纹理 + 视图 + b0 + ctx4 + pending）。
-// 生命周期要点（最容易泄漏的地方）：
-//   · LRU 驱逐 / 上限 4 轮换时每个实例约 68MB（1080p render + 4K display），不释放
-//     就是持续显存泄漏；ctx_for_key 与池重建路径都调本函数；
-//   · 释放前先把挂起帧落地（否则那一路输出永远回不到游戏纹理，表现为画面定格）；
-//     停机 / 设备移除路径由调用方先 drop_instance_pending（此时 finish 无意义）。
-//   · 不碰 sc.ctx（FFX context 由 destroy_context 负责）与设备级共享对象（CS/fence）。
+// 调用方必须已确认最后一个 GPU ticket 退役，或设备正处于移除状态。
 void release_instance_res(SdkContext &sc)
 {
     InstanceRes &r = sc.res;
-    if (r.pending)
-    {
-        if (!finish_instance(sc))
-            drop_instance_pending(r);
-    }
     // 诊断镜像若指向本实例的纹理，必须一起清掉（否则留下悬空指针）
     if (g_mirror_color_tex.Get() == r.tex_color.d11.Get())
         g_mirror_color_tex.Reset();
     if (g_mirror_output_tex.Get() == r.tex_output.d11.Get())
         g_mirror_output_tex.Reset();
-    release_shared(r.tex_color);
-    release_shared(r.tex_motion);
-    release_shared(r.tex_output);
-    release_shared_nt(r.tex_depth_share);
-    release_shared_nt(r.tex_motion_cvt_share);
-    release_shared_nt(r.tex_reactive_share);
-    r.depth_share_uav.Reset();
-    r.motion_cvt_share_uav.Reset();
-    r.reactive_share_uav.Reset();
-    r.depth_src_srv.Reset();
-    r.depth_src_last = nullptr;
-    r.motion_src_srv.Reset();
-    r.motion_src_last = nullptr;
-    r.motion_cb.Reset();
-    // b0 缓存失效：缓冲已释放，重建后必须重新上传一次
-    r.cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
-    r.cb_uploaded_flip = std::numeric_limits<float>::quiet_NaN();
-    r.ctx_src.Reset();
-    r.game_ctx4.Reset();
-    r.ctx_wrong_device = false;
-    r.rw = r.rh = r.dw = r.dh = 0;
-    r.output_enc_format = DXGI_FORMAT_R8G8B8A8_UNORM;
-}
-
-// Present 前收全部实例的挂起帧（P2：pending 按实例，一次 Present 要收完所有实例，
-// 否则非 Present 侧那个实例的输出会一直悬着）。
-bool finish_all_instances()
-{
-    bool ok = true;
-    for (SdkContext &sc : g_sdk_ctxs)
-    {
-        if (sc.res.pending && !finish_instance(sc))
-            ok = false;
-    }
-    return ok;
+    r = {}; // 仅在调用方确认 ticket 退役后销毁；新池不得继承旧视图与 CB。
 }
 
 } // namespace
@@ -2375,7 +1084,9 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     g_d11dev = game_device;
     // 清理：On12 引导已移除（不发生产品路线）。自建 D3D12 设备 + 共享句柄互操作。
     g_gpu_only_transport_available = false; // enabled only after direct gpu-interop dispatch lands.
-    SetUnhandledExceptionFilter(sdk234_exception_filter); // 崩溃定位：异常写 sdk234_steps.log
+#if defined(FFX12_DEBUG_STEPS)
+    SetUnhandledExceptionFilter(sdk234_exception_filter);
+#endif
     sdk234_step("init begin");
 #if defined(FFX12_DEBUG_STEPS)
     std::printf("[sdk234] init: device=%p dll=%ls\n", game_device, sdk_dll_path);
@@ -2433,51 +1144,12 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     std::printf("[sdk234] init: d3d12 device ok\n");
     std::fflush(stdout);
 #endif
-    {
-        D3D12_COMMAND_QUEUE_DESC qd {};
-        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-        if (FAILED(g_d12dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_queue))))
-            return false;
-    }
-    if (FAILED(g_d12dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_allocator))))
-        return false;
-    if (FAILED(g_d12dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_allocator.Get(), nullptr,
-                                           IID_PPV_ARGS(&g_cmdlist))))
-        return false;
-    // CreateCommandList 创建的 cmdlist 处于 open 状态；Reset 要求 closed → 创建后立即 Close
-    g_cmdlist->Close();
-    g_cmdlist_open = false;
-    if (FAILED(g_d12dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
-        return false;
-    g_fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (g_fence_event == nullptr)
-        return false;
-
-    // ---- ：原生 D3D11 纯 GPU 传输初始化 ----
-    // 共享 fence（D3D12 创建 → D3D11 OpenSharedFence）+ 深度提取/motion 解码 CS 编译。
     g_gpu_interop_ready = false;
     if (g_gpu_interop)
     {
-        bool setup_ok = true;
-        if (FAILED(g_d12dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_shared_fence))) ||
-            !g_shared_fence)
-            setup_ok = false;
-        if (setup_ok && FAILED(g_d12dev->CreateSharedHandle(
-                             g_shared_fence.Get(), nullptr, GENERIC_ALL, nullptr, &g_shared_fence_handle)))
-            setup_ok = false;
-        if (setup_ok && (FAILED(g_d11dev.As(&g_d11_5)) || !g_d11_5))
-            setup_ok = false;
-        if (setup_ok && FAILED(g_d11_5->OpenSharedFence(
-                             g_shared_fence_handle, IID_PPV_ARGS(&g_shared_fence11))))
-            setup_ok = false;
-        if (g_shared_fence_handle)
-        {
-            CloseHandle(g_shared_fence_handle);
-            g_shared_fence_handle = nullptr;
-        }
-        if (setup_ok && !g_shared_fence11)
-            setup_ok = false;
+        ComPtr<ID3D11Device5> device5;
+        bool setup_ok = SUCCEEDED(g_d11dev.As(&device5)) && device5 &&
+            g_interop.initialize(*device5.Get(), *g_d12dev.Get());
         // 深度提取 CS 编译
         if (setup_ok)
         {
@@ -2543,38 +1215,16 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
             // 注意这里不再因 b0 创建失败而影响 ready 判定——旧实现即使 CreateBuffer 失败
             // 也照样置 ready=true，故行为等价。
             g_gpu_interop_ready = true;
-            g_shared_fence_value = 0;
             sdk_note(L"gpu interop ready stage=init (NT shared handles + D3D11.4 fence)");
         }
         else
         {
             g_gpu_interop_ready = false;
             sdk_note(L"gpu interop unavailable stage=init");
-            g_shared_fence.Reset();
-            g_shared_fence11.Reset();
-            g_d11_5.Reset();
+            g_interop = {};
             g_depth_extract_cs.Reset();
         }
     }
-    if (g_gpu_interop_ready)
-    {
-        for (On12CommandSlot &slot : g_on12_command_slots)
-        {
-            if (FAILED(g_d12dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                         IID_PPV_ARGS(&slot.allocator))) ||
-                FAILED(g_d12dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                    slot.allocator.Get(), nullptr,
-                                                    IID_PPV_ARGS(&slot.list))) ||
-                FAILED(slot.list->Close()))
-            {
-                sdk_note(L"command ring creation failed stage=init");
-                return false;
-            }
-            slot.fence_value = 0;
-        }
-        g_on12_command_slot_cursor = 0;
-    }
-
     // Load the known-good ffx-api provider and select exactly the configured
     // effect version.  Do not silently fall back: a version mismatch must fail
     // open to the game's native path rather than alter the temporal baseline.
@@ -2722,10 +1372,24 @@ bool init_locked(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
     return true;
 }
 
+bool initialize_runtime(ID3D11Device *game_device, const wchar_t *path)
+{
+    try
+    {
+        return init_locked(game_device, path);
+    }
+    catch (...)
+    {
+        // 失败发生在 context 创建与 GPU 提交之前，不授权任何纹理交付或 fence 退休。
+        sdk_note(L"provider initialization threw C++ exception stage=runtime");
+        return false;
+    }
+}
+
 bool init(ID3D11Device *game_device, const wchar_t *sdk_dll_path)
 {
     std::lock_guard<std::timed_mutex> lock(g_mutex);
-    return init_locked(game_device, sdk_dll_path);
+    return initialize_runtime(game_device, sdk_dll_path);
 }
 
 void shutdown()
@@ -2753,53 +1417,29 @@ void shutdown()
         return;
     }
 
-    if (!g_active.exchange(false, std::memory_order_acq_rel))
+    if (!g_process_exiting.load(std::memory_order_acquire) && !g_interop.drain())
     {
+        sdk_note(L"native queue not retired; backend ownership kept stage=shutdown");
         return;
     }
+    g_active.store(false, std::memory_order_release);
     for (SdkContext &sc : g_sdk_ctxs)
     {
-        // P2：整套 GPU 互操作资源挂在实例上 —— 不释放就是"每实例约 68MB 显存"的泄漏。
-        // 停机路径不尝试落地挂起帧（进程在退出，且设备可能已不可用），直接丢弃。
-        drop_instance_pending(sc.res);
+        destroy_context(sc);
         release_instance_res(sc);
-        if (sc.created)
-            destroy_context(sc);
     }
     g_sdk_ctxs.clear();
     g_mirror_color_tex.Reset();
     g_mirror_output_tex.Reset();
-    release_shared(g_tex_depth);
     g_depth_extract_cs.Reset();
     g_motion_decode_cs.Reset();
     g_motion_decode_dz_cs.Reset();
     g_motion_raw_cs.Reset();
-    g_shared_fence.Reset();
-    g_shared_fence11.Reset();
-    g_d11_5.Reset();
-    g_shared_fence_value = 0;
     g_gpu_interop_ready = false;
-    g_active.store(false, std::memory_order_release);
-    if (g_fence_event)
-    {
-        CloseHandle(g_fence_event);
-        g_fence_event = nullptr;
-    }
-    g_fence.Reset();
-    g_cmdlist.Reset();
-    g_cmdlist_open = false;
-    g_allocator.Reset();
-    for (On12CommandSlot &slot : g_on12_command_slots)
-    {
-        slot.list.Reset();
-        slot.allocator.Reset();
-        slot.fence_value = 0;
-    }
-    g_on12_command_slot_cursor = 0;
+    g_interop = {};
+    g_delivered_count = 0;
     g_on12dev.Reset();
-    g_uses_on12_queue = false;
     g_gpu_only_transport_available = false;
-    g_queue.Reset();
     g_d12dev.Reset();
     // preload 缓存：**每个**候选句柄都要释放。旧实现只 FreeLibrary(g_sdk_module)，
     // 而 g_sdk_module 只是 g_preloaded 里第一个命中项，其余候选（默认 4.1.1 + 402c
@@ -2846,64 +1486,23 @@ void recover_device_removed_locked()
     sdk234_step("recover device removed");
     for (SdkContext &sc : g_sdk_ctxs)
     {
-        if (sc.created && g_runtime.destroy)
-        {
-            try
-            {
-                g_runtime.destroy(&sc.ctx, nullptr);
-            }
-            catch (...)
-            {
-            }
-        }
-        sc.ctx = nullptr;
-        sc.created = false;
-        // P2：整套实例资源也必须释放（纹理 + ctx4 + pending 引用都挂在实例上）。
-        // 设备已移除，pending 帧不可能再完成 —— 先丢弃再释放，避免对着旧 fence 白等。
-        drop_instance_pending(sc.res);
+        destroy_context(sc);
         release_instance_res(sc);
     }
     g_sdk_ctxs.clear();
     g_mirror_color_tex.Reset();
     g_mirror_output_tex.Reset();
-    release_shared(g_tex_depth);
-    g_shared_fence.Reset();
-    g_shared_fence11.Reset();
-    if (g_shared_fence_handle)
-    {
-        CloseHandle(g_shared_fence_handle);
-        g_shared_fence_handle = nullptr;
-    }
-    g_d11_5.Reset();
+    g_interop = {};
     g_depth_extract_cs.Reset();
     g_motion_decode_cs.Reset();
     g_motion_decode_dz_cs.Reset();
     g_motion_raw_cs.Reset();
     g_gpu_interop_ready = false;
-    g_shared_fence_value = 0;
     g_d12dev.Reset();
-    g_queue.Reset();
-    g_allocator.Reset();
-    g_cmdlist.Reset();
-    g_fence.Reset();
-    if (g_fence_event)
-    {
-        CloseHandle(g_fence_event);
-        g_fence_event = nullptr;
-    }
-    for (On12CommandSlot &slot : g_on12_command_slots)
-        slot = On12CommandSlot {};
-    g_on12_command_slot_cursor = 0;
-    g_on12_direct_dispatch_count.store(0, std::memory_order_relaxed);
-
-    // pending 帧状态已在上面随实例资源一起丢弃（P2）：它持有旧设备的 output_target 与
-    // 游戏 context（均为 AddRef 的 ComPtr）。旧实现只清纹理/队列，这两个引用留到下一次
-    // submit/complete 才可能被清，而那时缓存的 ctx4/fence 已是新设备，Wait 会对着不存在
-    // 的 fence 走一遍并白等。设备已移除，pending 帧不可能再完成。
-    // b0 缓存（含其失效）随 release_instance_res 一起处理。
+    g_delivered_count = 0;
 }
 
-bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
+DispatchResult dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key)
 {
     // 【诊断】PerfProbe：本函数 = 每游戏帧一次的 upscale 调用 ⇒ 它就是**帧边界**
     // （Present 钩子在本机直连模式下默认不装，见 swapchain_present_hook_needed()）。
@@ -2916,68 +1515,32 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
     // 在取锁**之前**判定是必须的——shutdown() 可能已持锁在释放资源，此时再进来等锁
     // 只会白等，拿到锁之后用的还是已被 Reset 的 ComPtr。
     if (g_shutting_down.load(std::memory_order_acquire))
-        return false;
+        return DispatchResult::failed;
     std::lock_guard<std::timed_mutex> lock(g_mutex);
     // 拿到锁后再判一次：等锁期间 shutdown() 可能已经开始。
     if (g_shutting_down.load(std::memory_order_acquire))
-        return false;
-#if defined(DX11FSRBRIDGE_ENABLE_NGX)
-    // ★ T-6 分流点（SDS §3.3.2）：ngx 模式下 D3D12 / FFX 完全不初始化。
-    //   位置硬约束：必须在二次 shutdown 判之后、t_dispatch_start 之前。
-    //   绝不能插在上方 if 的条件行与它唯一的 return false 之间——那样会被吞成 body，
-    //   编译零警告但所有 dispatch 恒返回 false（本项目第 4 类 BLOCKER 的典型形态）。
-    //
-    // g_backend 与 BackendKind 都是 ffx12 的符号，且本块就贴在 ffx12::dispatch() 体内，
-    // 与 g_backend 的存储（同一 TU 的匿名命名空间，Ffx12Backend.cpp:379）处于同一作用域
-    // ⇒ 可直接裸写。若哪天这段被挪到别的 TU，必须改写成
-    //   ffx12::backend() == ffx12::BackendKind::Ngx
-    if (g_backend == BackendKind::Ngx)
-    {
-        // ★ 复刻 native 路径下游（本函数内、分流点之后）的两道判空。不能靠共用：分流后
-        //   native 的判空不可达，而这里的失败形态是 return false（fail-open），不是崩溃。
-        //   B-1：四个尺寸任一为 0 ⇒ CopyResource / CreateTexture2D 都不接受。
-        if (game_context == nullptr || input.color == nullptr || input.depth == nullptr ||
-            input.motion == nullptr || input.output_target == nullptr)
-            return false;
-        if (input.render_w == 0 || input.render_h == 0 ||
-            input.display_w == 0 || input.display_h == 0)
-            return false;
-
-        // ★ 这里只有这一行。初始化在 ngx::dispatch 内部完成（懒初始化）。
-        //   不得在此调 ngx::init —— 公开 init() 已在计划第十稿取消。
-        const bool ok = ngx::dispatch(input, game_context, instance_key);
-
-        // 统计口径：不是与 native 完全同口径，而是「计数一致、rc 只记最终值」。
-        // native 路径在下方两行写这两个全局；ngx 模式下那两行不可达，故本分支自己写一次。
-        // kFfxDispatchOk 不存在（全仓库只有 kFfxDispatchNotReached，Ffx12Backend.cpp:316）。
-        // 成功用 0（与 FFX_API_RETURN_OK 同值），失败沿用既有哨兵。
-        g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
-        g_last_ffx_dispatch_rc.store(ok ? 0 : kFfxDispatchNotReached, std::memory_order_relaxed);
-        return ok;
-    }
-#endif
-    const std::uint64_t t_dispatch_start = qpc_us();
-    g_dispatch_counter.fetch_add(1, std::memory_order_relaxed);
+        return DispatchResult::failed;
     g_last_ffx_dispatch_rc.store(kFfxDispatchNotReached, std::memory_order_relaxed);
+    if (!game_context || !input.color || !input.depth || !input.motion || !input.output_target ||
+        !input.render_w || !input.render_h || !input.display_w || !input.display_h)
+        return DispatchResult::failed;
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+    if (g_backend == BackendKind::Ngx)
+        return ngx::dispatch(input, game_context, instance_key);
+#endif
 #if defined(FFX12_DEBUG_STEPS)
     std::printf("[sdk234] dispatch enter active=%d\n", g_active.load(std::memory_order_relaxed) ? 1 : 0);
     std::fflush(stdout);
 #endif
-    if (game_context == nullptr || input.color == nullptr || input.depth == nullptr ||
-        input.motion == nullptr || input.output_target == nullptr)
-        return false;
-    if (input.render_w == 0 || input.render_h == 0 || input.display_w == 0 || input.display_h == 0)
-        return false;
-
     // 懒初始化：用游戏 context 的设备 + 配置的 DLL 路径（调用方已持锁）
     if (!g_active.load(std::memory_order_relaxed))
     {
-        ID3D11Device *device = nullptr;
-        game_context->GetDevice(&device);
-        if (device == nullptr || g_sdk_path.empty())
-            return false;
-        if (!init_locked(device, g_sdk_path.c_str()))
-            return false;
+        if (g_sdk_path.empty()) return DispatchResult::failed;
+        // GetDevice 的临时引用和 init_locked 持有的后端引用不能混在一起；失败重试也要归还前者。
+        ComPtr<ID3D11Device> device;
+        game_context->GetDevice(device.GetAddressOf());
+        if (!device || !initialize_runtime(device.Get(), g_sdk_path.c_str()))
+            return DispatchResult::failed;
     }
 #if defined(FFX12_DEBUG_STEPS)
     std::printf("[sdk234] init done, ensuring pool %ux%u -> %ux%u\n", input.render_w, input.render_h,
@@ -2994,7 +1557,7 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
             sdk_note(L"dispatch device-removed d3d12 reason=0x%08X stage=entry",
                      static_cast<unsigned>(drr));
             recover_device_removed_locked(); // 放弃后端，下次 dispatch 惰性重建
-            return false;
+            return DispatchResult::failed;
         }
     }
     if (g_d11dev)
@@ -3005,138 +1568,39 @@ bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::u
             sdk_note(L"dispatch device-removed d3d11 reason=0x%08X stage=entry",
                      static_cast<unsigned>(drr11));
             recover_device_removed_locked();
-            return false;
+            return DispatchResult::failed;
         }
     }
-    // P2：**先取实例槽位，再按实例建池**（池是挂在实例上的）。
-    // 每实例独立 context（全部实例接管；实例重建=新 key→新 context=隐式 reset）
+    if (!g_interop.available()) return DispatchResult::failed;
+    // 不同场景实例的 temporal history 和共享纹理不能混用。
     SdkContext *sc = ctx_for_key(instance_key);
     if (!sc)
     {
         sdk_note(L"ctx slot exhausted stage=ctx");
-        return false;
+        return DispatchResult::failed;
     }
-    // 尺寸变化时重建**该实例**的共享池（P2：判等键在 res.rw/rh/dw/dh 上，按实例隔离，
-    // 甲实例的尺寸变化不再重建乙实例的纹理）
     if (!ensure_pool(input, *sc))
     {
         sdk_note(L"ensure_pool failed render=%ux%u->%ux%u stage=pool",
                  input.render_w, input.render_h, input.display_w, input.display_h);
-        return false;
-    }
-    sdk234_step("pool ok");
-    // FSR context 的 maxRenderSize 只在创建时定 ⇒ 尺寸变了必须重建 context
-    if (sc->created && (sc->rw != input.render_w || sc->rh != input.render_h ||
-                    sc->dw != input.display_w || sc->dh != input.display_h))
-    {
-        // 诊断（默认关）：context 重建 ⇒ FSR 历史清零 + 下一帧 reset。
-        if (instance_diag_note_allowed())
-        {
-            sdk_note(L"inst ctx recreate inst=%llu old=%ux%u->%ux%u new=%ux%u->%ux%u recreates=%llu",
-                     static_cast<unsigned long long>(instance_key),
-                     sc->rw, sc->rh, sc->dw, sc->dh,
-                     input.render_w, input.render_h, input.display_w, input.display_h,
-                     static_cast<unsigned long long>(g_ctx_recreates));
-        }
-        destroy_context(*sc);
-        ++g_ctx_recreates;
+        return DispatchResult::failed;
     }
     if (!create_context(*sc))
     {
         sdk_note(L"create_context failed render=%ux%u->%ux%u stage=ctx",
                  input.render_w, input.render_h, input.display_w, input.display_h);
-        return false;
-    }
-    sdk234_step("ctx ok");
-    if (sc->rw != sc->res.rw || sc->rh != sc->res.rh ||
-        sc->dw != sc->res.dw || sc->dh != sc->res.dh)
-    {
-        sc->rw = sc->res.rw;
-        sc->rh = sc->res.rh;
-        sc->dw = sc->res.dw;
-        sc->dh = sc->res.dh;
-        sc->first = true;
+        return DispatchResult::failed;
     }
     const bool reset = input.reset || sc->first;
     g_last_reset = reset;
-    sc->first = false;
-
-    if (!g_gpu_interop_ready)
-    {
-        sdk_note(L"gpu interop unavailable stage=dispatch");
-        return false;
-    }
-    // 异步模式：先完成**本实例**上一帧的挂起（防异常路径堆积——若 Present 未被调用，
-    // 本实例下一帧 dispatch 前强制交接；正常路径无挂起，立即返回）。
-    // P2：pending 按实例 —— 不再顺手落地别的实例（那是 Present 前 finish_pending 的职责）。
-    if (g_async_upscale && sc->res.pending)
-    {
-        if (!finish_instance(*sc))
-            return false;
-    }
-    const bool ok = dispatch_gpu_shared(input, game_context, *sc, reset);
-    // 计时统计：prep/submit 在 dispatch_gpu_shared 内分记；此处记 total
-    // （异步=提交即返，同步=含等待+拷贝）。wait/copy 在 finish_instance 内记。
-    {
-        const std::uint64_t t_now = qpc_us();
-        g_timing.total_us.fetch_add(t_now - t_dispatch_start, std::memory_order_relaxed);
-        const std::uint32_t n =
-            g_timing.frames.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (n == 8 || (n % 512) == 0)
-        {
-            const std::uint32_t avg_pw =
-                (std::uint32_t)(g_timing.prep_wait_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_pc =
-                (std::uint32_t)(g_timing.prep_cs_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_pf =
-                (std::uint32_t)(g_timing.prep_flush_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_p =
-                (std::uint32_t)(g_timing.prep_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_sig =
-                (std::uint32_t)(g_timing.signal_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_w12 =
-                (std::uint32_t)(g_timing.wait12_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_s =
-                (std::uint32_t)(g_timing.submit_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_w =
-                (std::uint32_t)(g_timing.wait_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_c =
-                (std::uint32_t)(g_timing.copy_us.load(std::memory_order_relaxed) / n);
-            const std::uint32_t avg_t =
-                (std::uint32_t)(g_timing.total_us.load(std::memory_order_relaxed) / n);
-            sdk_note(L"timing async=%d pwait=%uus pcs=%uus pflush=%uus sig=%uus w12=%uus submit=%uus wait=%uus copy=%uus total=%uus frames=%u",
-                     g_async_upscale ? 1 : 0, avg_pw, avg_pc, avg_pf, avg_sig, avg_w12, avg_s, avg_w, avg_c, avg_t, n);
-            // 独立落盘已移除（调试痕迹）：timing 经 sdk_note → 桥读取时拼入
-            // ffx12_path 行（等级 2 debug），LogLevel>=2 才写主日志——正式版
-            // 默认 LogLevel=1 不产生 timing 输出。
-            g_timing.prep_wait_us.store(0, std::memory_order_relaxed);
-            g_timing.prep_cs_us.store(0, std::memory_order_relaxed);
-            g_timing.prep_flush_us.store(0, std::memory_order_relaxed);
-            g_timing.prep_us.store(0, std::memory_order_relaxed);
-            g_timing.signal_us.store(0, std::memory_order_relaxed);
-            g_timing.wait12_us.store(0, std::memory_order_relaxed);
-            g_timing.submit_us.store(0, std::memory_order_relaxed);
-            g_timing.wait_us.store(0, std::memory_order_relaxed);
-            g_timing.copy_us.store(0, std::memory_order_relaxed);
-            g_timing.total_us.store(0, std::memory_order_relaxed);
-            g_timing.frames.store(0, std::memory_order_relaxed);
-        }
-    }
-    return ok;
+    const bool delivered = dispatch_gpu_shared(input, game_context, *sc, reset);
+    sc->first = !delivered;
+    return delivered ? DispatchResult::native_ordered : DispatchResult::failed;
 }
 
 void set_async_upscale(bool enable)
 {
     std::lock_guard<std::timed_mutex> lock(g_mutex);
-    // 切换时若从异步切回同步且存在挂起，立即丢弃**全部实例**的挂起（避免 pending 泄漏）
-    if (!enable)
-    {
-        for (SdkContext &sc : g_sdk_ctxs)
-        {
-            if (sc.res.pending)
-                drop_instance_pending(sc.res);
-        }
-    }
     g_async_upscale = enable;
 }
 
@@ -3152,14 +1616,6 @@ bool async_upscale_enabled()
     std::lock_guard<std::timed_mutex> lock(g_mutex);
     return g_async_upscale;
 }
-
-bool finish_pending()
-{
-    std::lock_guard<std::timed_mutex> lock(g_mutex);
-    // P2：pending 按实例 —— Present 前必须**收全部**实例（原先全局单槽，一次只收一个）
-    return finish_all_instances();
-}
-
 
 const char *selected_version_name()
 {
@@ -3439,29 +1895,14 @@ void debug_pixels(float out_pixels[16])
 
 void get_output_samples(std::uint32_t raw[5], std::uint32_t &w, std::uint32_t &h, bool &valid)
 {
-    std::lock_guard lock(g_out_samples_mutex);
-    for (int i = 0; i < 5; ++i)
-        raw[i] = g_out_samples.raw[i];
-    w = g_out_samples.w;
-    h = g_out_samples.h;
-    valid = g_out_samples.valid;
+    std::fill_n(raw, 5, 0u);
+    w = h = 0;
+    valid = false;
 }
 
 void get_chain_samples(ChainSampleData &out)
 {
-    std::lock_guard lock(g_out_samples_mutex);
-    for (int i = 0; i < 2; ++i)
-        out.motion_cvt[i] = g_chain_samples.motion_cvt[i];
-    for (int i = 0; i < 3; ++i)
-    {
-        out.color_linear[i] = g_chain_samples.color_linear[i];
-        out.output_linear[i] = g_chain_samples.output_linear[i];
-    }
-    out.canary = g_chain_samples.canary;
-    out.color_own = g_chain_samples.color_own;
-    out.depth_own = g_chain_samples.depth_own;
-    out.motion_own = g_chain_samples.motion_own;
-    out.valid = g_chain_samples.valid;
+    out = {};
 }
 #endif
 

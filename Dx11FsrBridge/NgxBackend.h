@@ -76,17 +76,9 @@ bool passthrough();
 bool cross_key_reuse();
 
 // ---- 每帧（唯一入口；初始化在内部懒完成）----
-// 返回 true  = NGX 已完成超分并把结果写入 in.output_target（调用方应 return true）。
-// 返回 false = 本帧未处理，调用方走原生放行（fail-open，D9）。
-//
-// ★ 没有公开的 init()。首次调用时内部执行：
-//     ID3D11Device *dev = nullptr;
-//     ctx->GetDevice(&dev);
-//     if (dev == nullptr) return false;
-//     const bool ok = ensure_init(dev);   // 幂等；只在首次成功时 AddRef 存 g_device
-//     dev->Release();                     // ★ 必须成对，否则每帧泄漏一个引用计数
-bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
-              std::uint64_t instance_key);
+// 回执型 provider 在写回前校验本次输出；旧 ABI 只校验 NGX 状态，不冒充回执。
+ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
+                              std::uint64_t instance_key);
 
 // ---- fail-open 信号（D9 两道拦截共用）----
 // 只读 std::atomic<bool> g_release_all；不碰容器、不取任何锁。

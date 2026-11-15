@@ -1,11 +1,5 @@
 // NgxParamMap.cpp —— NGX 参数映射的纯计算实现（零 D3D / 零 NGX / 零全局）。
 //
-// 本文件的每一行都是**逐字搬运**，来源见每个函数上方的「重构前原文」。
-// 改这里 = 改行为。若某个公式确实要改，那是另一个任务，且必须同时更新
-// NgxParamMapTest.cpp 的 oracle（否则测试会立刻红 —— 这正是它存在的意义）。
-//
-// 行尾：LF。
-
 #include "NgxParamMap.h"
 
 #include <cmath>    // std::isfinite（仅 JitterOutput::valid 诊断位用）
@@ -16,22 +10,11 @@ namespace ngx_param_map
 // ---------------------------------------------------------------------------
 // a) CreateFlags
 // ---------------------------------------------------------------------------
-// 重构前（NgxBackend.cpp 的 build_create_flags()，§3.8.2）：
-//     ev.flags   = 0;
-//     if (ev.is_hdr)                              ev.flags |= IsHDR;
-//                                                 ev.flags |= MVLowRes;     // ★ 恒设
-//     if (ffx12::motion_vectors_jittered())       ev.flags |= MVJittered;
-//     if (ffx12::depth_inverted())                ev.flags |= DepthInverted;
-//
-// ★ 位顺序无关（|= 可交换），但**位的集合**必须一模一样：
-//   is_hdr ⇒ bit0；恒有 bit1；mv_jittered ⇒ bit2；depth_inverted ⇒ bit3。
-//   重构前那行 MVLowRes 前面**没有 if**（缩进只是排版），所以它是无条件执行。
+// 2026-11-15：F6 无曝光纹理时会在 Eval 请求重建，Create 就声明自动曝光以免交付空画面。
 CreateFlagsOutput map_create_flags(const CreateFlagsInput &in)
 {
-    CreateFlagsOutput out {};
-    out.flags = 0;
+    CreateFlagsOutput out {kFlagMvLowRes | kFlagAutoExposure};
     if (in.is_hdr)            out.flags |= kFlagIsHdr;
-                              out.flags |= kFlagMvLowRes;   // 1<<1，恒设（与重构前那行逐字对应）
     if (in.mv_jittered)       out.flags |= kFlagMvJittered;
     if (in.depth_inverted)    out.flags |= kFlagDepthInverted;
     return out;

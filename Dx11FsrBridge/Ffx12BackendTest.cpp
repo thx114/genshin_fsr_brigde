@@ -294,14 +294,14 @@ int run_test_body(int argc, char **argv)
     in.frame_time_delta_ms = 16.7f;
     in.reset = true;
 
-    const bool ok1 = ffx12::dispatch(in, g_ctx.Get());
+    const bool ok1 = ffx12::dispatch(in, g_ctx.Get()) == ffx12::DispatchResult::native_ordered;
     std::printf("  dispatch#1=%d version=%s\n", ok1 ? 1 : 0, ffx12::selected_version_name());
     CHECK(ok1, "dispatch #1 (auto-init) ok");
     CHECK(ffx12::active(), "backend active after dispatch");
 
     // 第二帧（reset=false，验证连续派发）
     in.reset = false;
-    const bool ok2 = ffx12::dispatch(in, g_ctx.Get());
+    const bool ok2 = ffx12::dispatch(in, g_ctx.Get()) == ffx12::DispatchResult::native_ordered;
     std::printf("  dispatch#2=%d\n", ok2 ? 1 : 0);
     CHECK(ok2, "dispatch #2 (steady frame) ok");
 

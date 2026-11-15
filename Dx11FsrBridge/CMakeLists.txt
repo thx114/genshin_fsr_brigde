@@ -122,6 +122,14 @@ endif()
 
 add_library(Dx11FsrBridge SHARED
     Dx11FsrBridge.cpp
+    runtime/GraphicsIngress.cpp
+    runtime/ContextDispatch.cpp
+    runtime/FrameBindings.cpp
+    runtime/CandidateSignature.cpp
+    runtime/OutputHistory.cpp
+    runtime/FrameAttribution.cpp
+    runtime/BridgeConfig.cpp
+    game/VersionDiscovery.cpp
     BridgeLogger.cpp
     Dx11FsrBridge.rc
     RenderScaleMenu.cpp
@@ -129,6 +137,7 @@ add_library(Dx11FsrBridge SHARED
     Il2CppCallSiteHook.cpp
     TransparentJitterHook.cpp
     Ffx12Backend.cpp
+    native/InteropQueue.cpp
     NgxParamMap.cpp
 )
 
@@ -150,7 +159,7 @@ endif()
 # ⇒ `NgxBackend.cpp` 永不进编译单元 ⇒ ngx 的 13 个符号未定义 ⇒ **LNK2019**（本 target 无 GLOB）。
 if(DX11FSRBRIDGE_ENABLE_NGX)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/nvsdk_ngx_defs.h")
-        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp)
+        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp ngx/FrameResources.cpp ngx/ProviderDiscovery.cpp)
         target_include_directories(Dx11FsrBridge PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx")
         target_compile_definitions(Dx11FsrBridge PRIVATE DX11FSRBRIDGE_ENABLE_NGX=1)
@@ -201,10 +210,10 @@ endif()
 
 target_compile_features(Dx11FsrBridge PRIVATE cxx_std_20)
 if(MSVC)
-    # /EHsc 仅 Debug 配置开（异常展开——排查用，消除 C4530）；
-    # Release 不开（异常展开表使 DLL +184KB；桥自身不抛 C++ 异常，catch 为防御，
-    # 无 /EHsc 时异常直接 terminate（fail-fast），与旧版 762KB 行为一致）。
     target_compile_options(Dx11FsrBridge PRIVATE /utf-8 $<$<CONFIG:Debug>:/EHsc>)
+    # 2026-11-15：隔离宿主实测第三方 FFX 抛 0xE06D7363。SDK 边界必须有 C++ 展开，
+    # 不能扩散到 Draw 钩子；只对拥有 SDK 对象与锁的翻译单元保留这项开销。
+    set_property(SOURCE Ffx12Backend.cpp APPEND PROPERTY COMPILE_OPTIONS /EHsc)
     if(DX11FSRBRIDGE_RELEASE_RUNTIME)
         # 链接映射文件（模块大小分析用；仅构建产物，不部署）
         target_compile_options(Dx11FsrBridge PRIVATE $<$<CONFIG:Release>:/GL>)
@@ -362,6 +371,9 @@ fsrbridge_configure_test(NgxParamMapTest)
 target_include_directories(NgxParamMapTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 enable_testing()
 add_test(NAME NgxParamMapTest COMMAND NgxParamMapTest)
+if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
+    add_test(NAME Fsr2FamilyTakeoverTest COMMAND Fsr2FamilyTakeoverTest)
+endif()
 
 if(DX11FSRBRIDGE_BUILD_TESTS)
     add_executable(CreateFunctionRoutesTest tests/CreateFunctionRoutesTest.cpp)
@@ -372,6 +384,47 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     fsrbridge_configure_test(ComMethodRoutesTest)
     target_include_directories(ComMethodRoutesTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME ComMethodRoutesTest COMMAND ComMethodRoutesTest)
+    add_executable(VersionDiscoveryTest tests/VersionDiscoveryTest.cpp game/VersionDiscovery.cpp)
+    fsrbridge_configure_test(VersionDiscoveryTest)
+    add_test(NAME VersionDiscoveryTest COMMAND VersionDiscoveryTest)
+    add_executable(FsrVersionCheck tests/VersionFileProbe.cpp game/VersionDiscovery.cpp)
+    fsrbridge_configure_test(FsrVersionCheck)
+    add_executable(FrameBindingsTest tests/FrameBindingsTest.cpp runtime/FrameBindings.cpp)
+    fsrbridge_configure_test(FrameBindingsTest)
+    target_link_libraries(FrameBindingsTest PRIVATE d3d11)
+    add_test(NAME FrameBindingsTest COMMAND FrameBindingsTest)
+    add_executable(OutputHistoryTest tests/OutputHistoryTest.cpp runtime/OutputHistory.cpp)
+    fsrbridge_configure_test(OutputHistoryTest)
+    target_link_libraries(OutputHistoryTest PRIVATE d3d11)
+    add_test(NAME OutputHistoryTest COMMAND OutputHistoryTest)
+    if(DX11FSRBRIDGE_ENABLE_NGX AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/nvsdk_ngx_defs.h")
+        add_library(F6ReceiptProvider SHARED tests/F6ReceiptProvider.cpp)
+        fsrbridge_configure_test(F6ReceiptProvider)
+        add_executable(NgxProviderDiscoveryTest tests/NgxProviderDiscoveryTest.cpp ngx/ProviderDiscovery.cpp)
+        fsrbridge_configure_test(NgxProviderDiscoveryTest)
+        target_link_libraries(NgxProviderDiscoveryTest PRIVATE advapi32)
+        add_test(NAME NgxProviderDiscoveryTest COMMAND NgxProviderDiscoveryTest "$<TARGET_FILE:F6ReceiptProvider>")
+        add_executable(NgxFrameResourcesTest tests/NgxFrameResourcesTest.cpp ngx/FrameResources.cpp)
+        fsrbridge_configure_test(NgxFrameResourcesTest)
+        target_link_libraries(NgxFrameResourcesTest PRIVATE d3d11)
+        add_test(NAME NgxFrameResourcesTest COMMAND NgxFrameResourcesTest)
+    endif()
+    add_executable(CandidateSignatureTest tests/CandidateSignatureTest.cpp runtime/CandidateSignature.cpp)
+    fsrbridge_configure_test(CandidateSignatureTest)
+    add_test(NAME CandidateSignatureTest COMMAND CandidateSignatureTest)
+    add_executable(FrameAttributionTest tests/FrameAttributionTest.cpp
+        runtime/FrameAttribution.cpp Fsr2FamilyTakeover.cpp)
+    fsrbridge_configure_test(FrameAttributionTest)
+    add_test(NAME FrameAttributionTest COMMAND FrameAttributionTest)
+    add_executable(FrameTimelineTest tests/FrameTimelineTest.cpp)
+    fsrbridge_configure_test(FrameTimelineTest)
+    add_test(NAME FrameTimelineTest COMMAND FrameTimelineTest)
+    add_executable(DrawSequenceTest tests/DrawSequenceTest.cpp)
+    fsrbridge_configure_test(DrawSequenceTest)
+    add_test(NAME DrawSequenceTest COMMAND DrawSequenceTest)
+    add_executable(ContextObservationTest tests/ContextObservationTest.cpp)
+    fsrbridge_configure_test(ContextObservationTest)
+    add_test(NAME ContextObservationTest COMMAND ContextObservationTest)
 
     foreach(provider IN ITEMS First Second)
         add_library(CreateRouteProvider${provider} SHARED
@@ -387,11 +440,25 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         add_library(CreateRouteImports${importer} SHARED tests/create-routing/Imports.cpp)
         target_link_libraries(CreateRouteImports${importer} PRIVATE CreateRouteProviderFirst)
     endforeach()
+    add_library(FsrRejectProvider SHARED tests/FsrRejectProvider.cpp)
+    fsrbridge_configure_test(FsrRejectProvider)
+    target_include_directories(FsrRejectProvider PRIVATE
+        "${FFX_API_STAGE_ROOT}/api/include"
+        "${FFX_API_STAGE_ROOT}/upscalers/include")
+    add_executable(ProviderFrameHost tests/ProviderFrameHost.cpp)
+    fsrbridge_configure_test(ProviderFrameHost)
+    target_link_libraries(ProviderFrameHost PRIVATE d3d11 d3dcompiler)
+    if(DX11FSRBRIDGE_ENABLE_NGX)
+        add_test(NAME F6EvalReceiptIntegration COMMAND ProviderFrameHost ngx-receipt
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        set_tests_properties(F6EvalReceiptIntegration PROPERTIES TIMEOUT 45)
+    endif()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
-    target_link_libraries(CreateRouteIntegrationTest PRIVATE d3dcompiler)
+    target_link_libraries(CreateRouteIntegrationTest PRIVATE d3dcompiler dxgi)
     fsrbridge_configure_test(CreateRouteIntegrationTest)
     target_compile_definitions(CreateRouteIntegrationTest PRIVATE
-        DX11FSRBRIDGE_TEST_NGX=$<BOOL:${DX11FSRBRIDGE_ENABLE_NGX}>)
+        DX11FSRBRIDGE_TEST_NGX=$<BOOL:${DX11FSRBRIDGE_ENABLE_NGX}>
+        DX11FSRBRIDGE_TEST_RELEASE=$<BOOL:${DX11FSRBRIDGE_RELEASE_RUNTIME}>)
     add_executable(SystemD3D11FactoriesTest tests/SystemD3D11FactoriesTest.cpp)
     target_include_directories(SystemD3D11FactoriesTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
@@ -405,6 +472,13 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         warp-cached-factory hardware-cached-factory warp-cached-factory-device-only hardware-cached-factory-device-only
         warp-cached-factory-combined-device-only hardware-cached-factory-combined-device-only
         warp-cached-factory-free-library hardware-cached-factory-free-library
+        warp-for-hwnd-bridge-first hardware-for-hwnd-bridge-first
+        warp-for-hwnd-device-first hardware-for-hwnd-device-first
+        warp-for-hwnd-bridge-first-indexed warp-for-hwnd-device-first-indexed
+        hardware-for-hwnd-bridge-first-returned hardware-for-hwnd-device-first-returned
+        warp-for-hwnd-bridge-first-multithread hardware-for-hwnd-bridge-first-multithread
+        warp-for-hwnd-device-first-multithread hardware-for-hwnd-device-first-multithread
+        warp-for-hwnd-bridge-first-mirrored hardware-for-hwnd-device-first-mirrored
         wrapping-boundary wrapping-boundary-combined wrapping-boundary-retry)
         add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest
             "$<TARGET_FILE:Dx11FsrBridge>"
@@ -418,6 +492,7 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     add_executable(Il2CppCallSiteHookTest
         Il2CppCallSiteHookTest.cpp
         Il2CppCallSiteHook.cpp
+        game/VersionDiscovery.cpp
     )
     fsrbridge_configure_test(Il2CppCallSiteHookTest)
     target_include_directories(Il2CppCallSiteHookTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -509,6 +584,7 @@ if(DX11FSRBRIDGE_BUILD_BACKEND_TEST)
     add_executable(Ffx12BackendTest
         Ffx12BackendTest.cpp
         Ffx12Backend.cpp
+        native/InteropQueue.cpp
     )
     fsrbridge_configure_test(Ffx12BackendTest)
     target_include_directories(Ffx12BackendTest PRIVATE

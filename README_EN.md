@@ -107,6 +107,29 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 `-FetchUpstream` can be passed to the build script to refresh upstream components before packaging. The FuFu Launcher plugin package is written only to local `dist\FSR-Bridge-Plugin.v*.zip`; it is not included in GitHub Actions or GitHub Releases.
 
+## Neo rewrite branch
+
+`fsr/neo-rewrite` retains `Dx11FsrBridge.dll`, its INI, and installation entry points. The upstream
+release badge does not refer to Neo builds. The bridge separates graphics ingress, frame ownership and
+history, game-version discovery, and the two upscaling backends. FFX12 uses separate GPU fences in each
+direction. `Ffx12AsyncUpscale=1` keeps D3D11 batching; `0` flushes after scheduling the copy. Neither mode
+waits for the next Present to hand off the current frame.
+
+- **Game updates:** Render/Update/Camera use relative method layout in executable sections; the menu uses
+  its own signatures. Ambiguous or invalid candidates are rejected. Configured addresses are used only
+  after range and prologue checks. Build with `DX11FSRBRIDGE_BUILD_TESTS` and run
+  `FsrVersionCheck.exe <game executable>` to inspect a file without launching it.
+- **F6:** `Ffx12Backend=ngx` with `NgxProvider=external` selects external NGX. Providers that advertise
+  the receipt extension must prove output for that call before copyback. Legacy providers still use the
+  status-only ABI and log `evidence=ngx_status_only`; that is not proof of fresh pixels.
+- **Development tests:** `ctest --test-dir <build directory> --output-on-failure` runs device and WARP tests,
+  frame attribution, version discovery, and the F6 receipt fixture. `tools/Test-NeoProviders.ps1` and
+  `tools/Test-NeoF6Interop.ps1` run isolated hardware hosts with pinned DLLs and test settings, not a game
+  installation. Invoke `Test-NeoProviders.ps1` from PowerShell when passing an array with `-Cases`.
+
+Host tests do not establish game compatibility, ReShade/NR/FG behavior, HDR correctness, or frame-time
+improvement. See the [open issues](docs/OPEN-ISSUES.md) for remaining acceptance work.
+
 ## Features
 
 The bridge intercepts the game's native FSR2 calls once and then attaches two backends behind them — the AMD FFX12 SDK and NVIDIA NGX (DLSS):

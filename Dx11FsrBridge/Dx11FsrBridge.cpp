@@ -15,6 +15,19 @@
 #include "ComMethodRoutes.h"
 #include "ComVtableMethods.h"
 #include "InterfaceVtableLayout.h"
+#include "runtime/GraphicsIngress.h"
+#include "runtime/DrawSequence.h"
+#include "runtime/FrameBindings.h"
+#include "runtime/OutputHistory.h"
+#include "runtime/CandidateSignature.h"
+#include "runtime/FrameAttribution.h"
+#include "runtime/FrameTimeline.h"
+#include <chrono>
+#include "runtime/ContextObservation.h"
+#include "runtime/ContextDispatch.h"
+#include "runtime/BridgeConfig.h"
+#include "game/VersionDiscovery.h"
+#include "game/AnchorPatterns.h"
 #include "D3D11CreationScope.h"
 #include "SystemD3D11Factories.h"
 #include "Fsr2FamilyTakeover.h"
@@ -120,275 +133,11 @@ constexpr std::size_t k_idx_factory_create_swap_chain = 10;
 constexpr std::size_t k_idx_factory2_create_swap_chain_for_hwnd = 15;
 constexpr std::size_t k_idx_output6_get_desc1 = 27;
 
-struct Config
-{
-    bool enabled = true;
-    bool enable_logging = false;
-    // 渲染精度 hook 总开关（ini [Dx11FsrBridge] RenderScaleMenu，默认 1=开启）。
-    // 关闭后：不启动渲染精度菜单模块（不 hook 菜单文本/渲染命令构建/精度应用，
-    // 也不扩展候选精度档位），游戏回到原生精度档位。用于 A/B 与故障隔离。
-    bool render_scale_menu = true;
-    // 日志等级（LogLevel）：0=仅错误 1=核心状态（默认） 2=节流细节 3=全量（trace）
-    // 已废弃（保留仅为兼容旧 ini / 旧代码读取）；实际过滤由 logging 决定。
-    int log_level = 1;
-    // 日志系统配置（[Log] 段）。等级由调用点显式声明，不做内容推断。
-    struct LoggingConfig
-    {
-        blog::Level level = blog::Level::Info;
-        bool to_file = true;
-        bool to_debugger = false;
-        bool truncate_on_start = true;
-        // 兼容模式（**默认关**）：把 `log_line()` 回调传来的裸字符串按消息前缀归类。
-        //
-        // ⚠️ 2026-09-23（`[待办 1]` ①）：本文件 **28 处调用点已全部迁移**到 `LOG_*` 宏，
-        // 因此本开关**现在只服务一条路径** —— `initialize_render_scale_menu` 的回调
-        // （`RenderScaleMenu.cpp` 只有 `void(const std::string&)` 这一种回调形态，
-        // 携带不了分类）。**要移除本开关，须先改回调签名并迁移该模块的 18 处调用。**
-        // 关掉时这些行统一落 `core/INFO`，**不会被静默丢弃**。
-        bool compat_prefix_categories = false;
-        std::uint32_t max_file_kb = 16384;
-        std::uint32_t rotate_keep = 2;
-        // 异步写队列容量（条）。此前 Config::queue_capacity 从未被读取，
-        // 环形队列硬编码 16384，该字段是死配置。
-        std::uint32_t queue_capacity = 8192;
-        std::vector<std::pair<std::string, blog::Level>> categories;
-        // load_config() 在 blog::init() **之前**执行，此时日志器还是关闭状态，
-        // 配置解析期的告警会被直接丢弃（"日志撒谎"的同类问题：报告了等于没报告）。
-        // 统一缓存到这里，init 之后立刻回放。
-        std::vector<std::string> pending_warnings;
-    };
-    LoggingConfig logging;
-    DWORD target_process_id = 0;
-    std::wstring target_process_name;
-    bool log_all_dispatch = false;
-    bool log_resource_ops = false;
-    bool log_loader_activity = false;
-    bool log_interesting_dispatch_details = false;
-    bool hook_present = false;
-    bool final_scene_probe = false;
-    std::uint32_t final_scene_probe_limit = 6;
-    std::uint32_t final_scene_probe_signature_limit = 128;
-    bool final_scene_snapshot = false;
-    std::uint32_t final_scene_snapshot_interval_frames = 240;
-    int dlssg_dxgi_workaround = -1;
-    // Exposes HDR10 capability to the game while keeping the physical output
-    // on the SDR color space. This is an isolated experimental path.
-    bool hdr_swapchain_spoof = false;
-    // Actively requests the legacy linear HDR color space on the physical
-    // swapchain. It never rewrites swapchain or render-target formats.
-    bool hdr_swapchain_force = false;
-    // Records the system advanced-color capability query used by the engine.
-    // This diagnostic path never changes the returned display state.
-    bool hdr_environment_probe = false;
-    // Records DXGI output color capabilities without changing output objects.
-    bool hdr_output_desc_probe = false;
-    // Reports HDR output capability to the game through the DXGI output
-    // descriptor only. It does not change the physical display state.
-    bool hdr_output_desc_spoof = false;
-    // Experimental native-LDR test: request UNORM swapchain buffers instead of sRGB.
-    bool native_ldr_swapchain_unorm = false;
-    // Experimental process-start renderer replacement.  It is deliberately
-    // opt-in: enables a D3D11On12 device plus a DX12 flip-model swapchain.
-    bool dx11_on12_swapchain = false;
-    // Experimental native-LDR test: rewrite only full-resolution RTV|SRV targets.
-    bool native_ldr_final_target_unorm = false;
-    // Compresses the spoofed HDR backbuffer to the SDR display range immediately
-    // before Present. This is intentionally isolated from OptiScaler and the
-    // game's render passes.
-    bool hdr_sdr_tone_map = false;
-    bool hdr_sdr_tone_map_pq_input = true;
-    std::uint32_t hdr_sdr_tone_map_paper_white = 80;
-    std::uint32_t hdr_sdr_tone_map_peak = 100;
-    // Read-only identification of the last full-resolution draw into a known
-    // swapchain target. It is used to select a future tone-map insertion point.
-    bool hdr_composite_probe = false;
-    std::uint32_t hdr_composite_probe_limit = 32;
-    bool dump_pixel_shaders = false;
-    bool trace_pixel_shader_draws = false;
-    bool trace_texture_creates = false;
-    std::uint32_t texture_trace_hotkey = VK_F11;
-    std::uint32_t texture_trace_duration_ms = 10000;
-    std::uint32_t texture_trace_limit = 128;
-    std::uint64_t trace_pixel_shader_hash = 0x78057A29AF6C2D99ull;
-    std::uint32_t pixel_shader_trace_limit = 512;
-    std::uint64_t target_pixel_shader_hash = 0x78057A29AF6C2D99ull;
-    std::uint32_t pixel_shader_replacement_mode = 0;
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    std::uint32_t fsr2_translation_mode = 0;
-    bool fsr2_fast_state_tracking = false;
-    bool fsr2_mode2_on_demand_state = true;
-    std::uint32_t fsr2_output_validation_target = 0;
-    bool fsr2_motion_vectors_jittered = false;
-    bool fsr2_positive_motion_vector_scale = false;
-    bool fsr2_use_reactive_mask = false;
-    bool fsr2_use_transparency_mask = false;
-    std::uint32_t fsr2_jitter_mode = 0;
-    std::uint32_t fsr2_dump_input_textures = 0;
-    // ⚠️ 2026-09-27：`fsr2_compare_output_capture` 已按死代码删除（零读取点、零消费者）。
-    std::uint32_t fsr2_sharpness_percent = 0;
-    bool fsr2_use_native_exposure = true;
-    bool fsr2_compact_linear_output = false;
-    bool fsr2_lock_color_producer_shader = true;
-    bool fsr2_reset_on_color_path_change = false;
-    bool fsr2_reset_on_optiscaler_config_change = false;
-    std::uint32_t fsr2_optiscaler_config_reset_frames = 4;
-    bool fsr2_reset_on_optiscaler_log_change = false;
-    std::uint32_t fsr2_optiscaler_log_reset_duration_ms = 4000;
-    bool fsr2_trace_color_producers = false;
-    bool fsr2_early_output_probe = false;
-    std::uint32_t fsr2_early_output_probe_frames = 60;
-    bool block_dx11_on12_upscalers = true;
-    // Phase 1：FSR2 5-PS 合成族跳过（默认关闭）。开启后在"上一次累积 pass 被桥成功替换"
-    // 的前提下跳过 4 个 render-size 预处理 pass，消除双跑残余。见 Fsr2FamilyTakeover.h。
-    bool fsr2_family_skip = false;
-    std::uint32_t fsr2_family_expire_ms = 500;
-    // Phase 1.5：il2cpp 调用点钩子（默认关闭）。FFX_FSR2::Render 的 inline patch。
-    // observe 模式透传+计数（验证调用点/频率）；skip 模式实验性（切断 Mode 2 的
-    // jitter/触发链，勿与 Fsr2TranslationMode=2 同开）。
-    bool fsr2_il2cpp_hook = false;
-    bool fsr2_il2cpp_skip_render = false;
-    std::uint32_t fsr2_il2cpp_render_rva = 0x06B59670;
-    std::uint32_t fsr2_il2cpp_ucb_rva = 0x06B59600;
-    // 2026-08-26（AA 修复）：抓取游戏真实相机参数（near/far/FOV，RE 未确定）——
-    // ConfigureJitteredProjectionMatrix(camera) 每帧被 OnPreCull 调用。
-    bool ffx12_probe_camera = true;
-    bool ffx12_camera_hook = false;    // 只在已验证完整序言后显式启用
-    std::uint32_t ffx12_camera_rva = 0x06B558D0;
-    bool ffx12_projection_hook = false; // 观察已构造的 Camera projection matrix
-    std::uint32_t ffx12_projection_setter_rva = 0x013DC510;
-    // 【正式功能】透明队列抖动修复（TransparentJitter，默认**开**）。
-    // 强制 Camera.set_useJitteredProjectionMatrixForTransparentRendering 的实参为 true，
-    // 让透明队列物件参与超分的时间重建（修复翅膀水晶羽片 / 月环边缘硬阶梯）。
-    // 定位走签名发现（锚点 = 特征识别出的 ConfigureJitteredProjectionMatrix），不写死 RVA。
-    // 详见 TransparentJitterHook.h。
-    bool transparent_jitter = true;
-    // 【诊断】分段性能探针（PerfProbe，默认**关**）。
-    // 症状"帧率上不去但 GPU 占用低"⇒ 需要知道每帧的时间花在哪一段；
-    // 见 PerfProbe.h。`PerfProbeIntervalMs` = 汇总行间隔（默认 1000 ms），
-    // `PerfProbeDrawSample` = draw/dispatch 钩子的抽样步长（默认 32，避免逐 draw 计时）。
-    bool perf_probe = false;
-    std::uint32_t perf_probe_interval_ms = 1000;
-    std::uint32_t perf_probe_draw_sample = 32;
-    // 【正式功能】入口级过滤（B109，**默认开**）：`inspect_target_upscaler_draw_on_demand`
-    // 的调用入口处用调用实参淘汰 `element_count != 3` 的绘制（零 COM 调用）。
-    //
-    // 依据（真机 `perf_probe_draw_shape_draw` 第 4 行元素数直方图）：`count == 3` 是
-    // **唯一有 hits 的桶**（`elem_ix 3` / `elem_dr 3`），其余 24 个区间 hits 全 0，
-    // `outside_hits = 0` ⇒ 样本内约 6000 次识别全部满足 `count == 3`；
-    // 每区间约 121,100 次调用里可拒掉约 92.2% ⇒ 省约 `0.45 µs × 490 × 92.2% ≈ 203 µs/帧`。
-    //
-    // ⚠️ 代码层面**两套签名都不检查 `element_count`**（on-demand 路径的注释明说"不硬性
-    // 要求 3"）⇒ 判据只是"样本内的必要条件"、**不是代码级等价** ⇒ 因此带**自我证伪保险**
-    // （识别成功处检查 element_count，出现非 3 就一次性停用过滤器并打告警行，fail-open）
-    // 与 **canary 抽样放行**（让保险可观测，见 PerfProbe.h 的说明）。
-    bool draw_entry_filter = true;
-    // canary 抽样步长：N = 每 N 个非 3 绘制放行 1 个进内省（保险的探针）；
-    // 0 = 不放行（完全信任判据）；1 = 全部放行（等价于不过滤）。
-    std::uint32_t draw_entry_filter_canary = 64;
-    // Phase 1：进程内 FSR2 2.3.4 后端（ffxApi → amd_fidelityfx_upscaler_dx12.dll）。
-    // 桥直接驱动 AMD SDK（不经 OptiScaler）；Phase 2 的调用点接管会调用它的 dispatch。
-    bool ffx12 = false;
-    std::wstring ffx12_dll_path;
-    bool ffx12_fail_closed = false; // 禁止回退原生（测试/故障显式暴露）
-    // 【正式功能】P1 单实例接管（默认**关** = 全量接管）：置 1 时多个 FSR2 上下文并存
-    // 只接管**一个**实例，其余实例**放行游戏原生上采样**（返回 false，让游戏的累积 draw
-    // 照常执行；返回 true 会吞掉那一路的累积 pass ⇒ 画面冻住）。
-    // 历史（为什么默认不开）：引入时（2026-09-28）FFX12 的 GPU 互操作共享层是**全局单份**
-    // （共享纹理/fence/单槽 pending/尺寸池），只支持一条流水线；现场实测有两个长期并存的
-    // FSR2 上下文（各有一份 ffxContext、历史各归各的）⇒ 两路交替复用同一份共享资源，交付帧
-    // 混进另一视角的角色，故先用 P1 消除"并存"。同日 f9e52b3 起该共享层改为**按实例独占**
-    // （纹理/UAV/SRV/尺寸池/context/挂起槽全部按 instance_key 隔离，只剩 fence 是全局），
-    // 68ed170（2026-10-02）遂把缺省改为 0 全量接管，实测左右 1:1 分屏两路各自 100% 接管
-    // （0 拒绝 / 0 吞掉 / 无覆盖层 / 无冻结）。2026-11-10 合并 NGX 后端时被改回 1（回归，
-    // 提交说明所谓"与发布 ini 对齐"不成立——改动前两处本来都是 0），2026-11-13 恢复 0。
-    // ⚠️ NGX 后端例外：它的 feature/资源池是真全局单实例 ⇒ 无视本键，一律按 1 处理
-    //   （见 single_instance_takeover_effective()）。
-    bool ffx12_single_instance = false;
-    // 接管哪一个（默认 0 = 自动）：0 = render 面积大者优先、面积相同取**最早出现**；
-    // 1 = 强制最早出现；2 = 强制最新出现（与 1 互补：改一行 ini 即可换成"另一路"验证）。
-    std::uint32_t ffx12_single_instance_pick = 0;
-    // ---- P2 追加：诊断 + 两个**默认关**的实验开关（默认值下行为与 P1 完全一致）----
-    // diag：把裁决的输入/输出逐项落日志（候选集的年龄/次序/面积、每次交棒的原因、
-    //   接管权进入/退出事件、匹配路径）。用户需要证据定位"≤5 秒一次闪烁"的成因。
-    bool ffx12_single_instance_diag = false;
-    // sticky：粘滞裁决——只要上一任接管者仍在 hold_ms 内被匹配到就**不换人**。
-    //   用途：判定"闪烁是否由交接棒本身引起"（A/B 实验）。代价见 ini 注释。
-    bool ffx12_single_instance_sticky = false;
-    std::uint32_t ffx12_single_instance_hold_ms = 10000;
-    // strict：严格匹配实验——接管者这一 draw 若**不是**由"输出关联"匹配上的
-    //   （即只靠 token bootstrap 认领，而两路 render 尺寸相同 ⇒ 无法区分），
-    //   则不接管、放行原生。用于判定"闪烁是否由 视图↔实例 归属错配引起"。
-    bool ffx12_single_instance_strict = false;
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    bool ffx12_probe = false; // 一次性槽位/cb0 探测（诊断用，默认关）
-#endif
-    // 后端输出读回采样（诊断）。**默认关**：它会 CopySubresourceRegion + Flush +
-    // 同步 Map(READ)，阻塞渲染线程直到 GPU 画完，期间 GPU 空转。
-    // 此前无条件运行，是正式版里唯一持续存在的 GPU 同步点。
-    bool ffx12_readback_probes = false;
-    // Present 参数/帧间隔诊断（默认关）。用于定位"焦点窗口下帧数降低"是否来自呈现限速。
-    bool ffx12_present_probe = false;
-    bool ffx12_feature_fallback = true; // 特征识别兜底：1=运行时特征优先+已有样本(硬编码)兜底；0=纯特征识别（验证用——关闭所有版本特定样本）
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    bool optiscaler_bridge_probe = false; // 遗留 OptiScaler 候选桥路径（frames.jsonl 记录，默认关）
-#endif
-    // 抖动生成模式。**默认 3**（2026-09-18 由 4 改为 3）：
-    //   游戏 jitter 为 [0,1) 的 Halton 相位；FSR2 的 jitterOffset 期望**零中心**亚像素偏移。
-    //   模式 4 = -(norm×width)      → 值域 [-1,0]，**恒定带 -0.5px 偏置**、从不跨零；
-    //   模式 3 = -(norm×width)+0.5  → 值域 [-0.5,+0.5]，零中心（= v1.2.3 的公式）。
-    // 证据（2026-09-18 issue）：DLSS M/L（第二代 transformer）对重投影相位敏感，
-    //   模式 4 下累积朝错误方向 → 规则网格状黑线；改模式 3 即恢复正常。
-    //   其他上采样模型对半像素偏置较宽容，故长期未被发现 —— 但偏置是**普遍存在**的。
-    // 0=+norm*width-0.5, 1=+norm*width(符号反→整体抖), 2=raw, 3=-norm*width+0.5(默认), 4=-norm*width, 5=零
-    std::uint32_t ffx12_jitter_mode = 3;
-    bool ffx12_depth_inverted = true; // 游戏深度逆方向（0=far）；FSR2 默认 0=near
-    bool ffx12_decode_motion = true;  // 游戏 motion 为 R10G10B10A2 平方编码 → 解码 R16G16_FLOAT
-    bool ffx12_hdr_input = true;      // 游戏 10-bit HDR 管线
-    bool ffx12_auto_exposure = true;  // 2026-08-25 用户确认：原神需要自动曝光
-    bool ffx12_non_linear = true;     // 非线性色彩空间（OptiScaler 实证）
-    float ffx12_velocity_factor = 0.5f; // FSR2 高亮稳定性（OptiScaler 用 0.5）
-    // 运动矢量量级二分：保持已验证方向，只缩放送入 FSR2 的像素量级。
-    // 1.0 为现有行为；0.5/2.0 用于隔离“解码量级错误”造成的历史重投影拖影。
-    float ffx12_motion_scale = 1.0f;
-    float ffx12_camera_near = 0.25f;
-    float ffx12_camera_far = 6000.0f;
-    // 同一 Render generation 的双缓冲输出只复制首个 SDK 结果，绝不二次推进 FSR2 history。
-    bool ffx12_reuse_same_generation = true;
-    bool ffx12_output_mark = false;     // 输出标记（诊断：验证画面来源是否 ffx12）
-    float ffx12_fov_scale = 1.0f;       // FOV 缩放（AA 重投影验证：1.0=45°）
-    // 2026-11-10 实机复测推翻 2026-08-25 的结论：本版本游戏**不再**滞后一帧。
-    // 设 1（用上一帧 jitter）会让整个画面变模糊，且不解决 K 预设拖影；设 0 才与 FFX 持平。
-    // 四处统一为 0：结构体默认 / load_config fallback / package.ini / Deploy-Bridge.ps1。
-    bool ffx12_jitter_delay = false;
-    bool ffx12_force_reset = false;   // 诊断：每帧强制 FSR2 reset（与正常对比：相同=历史零贡献/单帧重建）
-    // 原生 D3D11 纯 GPU 传输（自建 D3D12 + NT 共享句柄 + D3D11.4 fence）。
-    // 默认开：GpuInteropProbe 已在本机字节级验证；不劫持游戏设备为 On12（进场前冻结根因）。
-    bool ffx12_gpu_interop = true;
-#endif
-    bool show_osd = false;
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    bool enable_similarity_probe = false;
-    bool reset_similarity_on_recording = true;
-#endif
-    std::uint32_t candidate_limit_per_frame = 64;
-    std::uint32_t interesting_dispatch_log_limit = 256;
-    std::uint32_t interesting_dispatch_phase_gap_ms = 1500;
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    std::uint32_t similarity_report_interval_ms = 2000;
-#endif
-    std::wstring run_label;
-};
-
-struct ResourceInfo
-{
-    std::uint64_t resource_key = 0;
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
-    std::uint32_t bind_flags = 0;
-    std::uint32_t misc_flags = 0;
-};
+using neo::graphics::ResourceInfo;
+using neo::graphics::TargetUpscalerDrawInfo;
+using neo::graphics::fsr_feature_color;
+using neo::graphics::identify_feature_candidate;
+using neo::graphics::k_min_fsr_constants;
 
 struct BufferInfo
 {
@@ -565,7 +314,8 @@ struct ModeMatch
 };
 
 HMODULE g_module = nullptr;
-Config g_config;
+neo::runtime::Config g_config;
+using neo::runtime::narrow;
 std::filesystem::path g_module_dir;
 std::filesystem::path g_log_path;
 #if defined(DX11FSRBRIDGE_FG_DXGI_DIAGNOSTICS)
@@ -592,9 +342,6 @@ SimilarityStats g_similarity;
 std::unordered_map<std::string, SimilarityStats> g_similarity_archives;
 #endif
 std::atomic_bool g_logging_enabled = false;
-// 当前日志等级（0=error 1=info 2=debug 3=trace）；load_config 同步 g_config.log_level。
-// Ffx12Backend 等跨模块引用（timing 独立落盘门控）。
-int g_bridge_log_level = 1;
 // 显卡路由摘要（initialize 早期产生、被 reset_log 清空）——存全局，active 后补打保证可见
 //
 // 2026-11-14（路由摘要跨线程裸读写，可致 use-after-free）：本块原先是 4 个裸
@@ -1009,6 +756,7 @@ using resize_target_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain *, const DX
 using check_color_space_support_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE, UINT *);
 using set_color_space1_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain3 *, DXGI_COLOR_SPACE_TYPE);
 using set_hdr_metadata_fn = HRESULT(STDMETHODCALLTYPE *)(IDXGISwapChain4 *, DXGI_HDR_METADATA_TYPE, UINT, void *);
+using set_multithread_protected_fn = BOOL(STDMETHODCALLTYPE *)(ID3D11Multithread *, BOOL);
 
 load_library_a_fn g_original_load_library_a = nullptr;
 load_library_w_fn g_original_load_library_w = nullptr;
@@ -1052,6 +800,12 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT in
 ComMethodRoutes<draw_indexed_fn, &hooked_draw_indexed, k_idx_draw_indexed, true> g_original_draw_indexed;
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location);
 ComMethodRoutes<draw_fn, &hooked_draw, k_idx_draw, true> g_original_draw;
+BOOL STDMETHODCALLTYPE hooked_set_multithread_protected(ID3D11Multithread *protection, BOOL enable);
+constexpr std::size_t k_idx_set_multithread_protected = 5;
+ComMethodRoutes<set_multithread_protected_fn, &hooked_set_multithread_protected, k_idx_set_multithread_protected, true>
+    g_original_set_multithread_protected;
+bool install_context_hooks(ID3D11DeviceContext *context);
+
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped);
 ComMethodRoutes<map_fn, &hooked_map, k_idx_map> g_original_map;
 void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource);
@@ -1116,84 +870,6 @@ ComMethodRoutes<factory2_create_swap_chain_for_hwnd_fn, &hooked_factory2_create_
 HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags);
 ComMethodRoutes<present_fn, &hooked_present, k_idx_present, true> g_original_present;
 
-void *bind_com_method(void *callback, void *original)
-{
-    if (callback == reinterpret_cast<void *>(&hooked_vs_set_constant_buffers))
-        return decltype(g_original_vs_set_constant_buffers)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_vs_set_shader))
-        return decltype(g_original_vs_set_shader)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_ps_set_shader_resources))
-        return decltype(g_original_ps_set_shader_resources)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_ps_set_shader))
-        return decltype(g_original_ps_set_shader)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_ps_set_constant_buffers))
-        return decltype(g_original_ps_set_constant_buffers)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_cs_set_shader_resources))
-        return decltype(g_original_cs_set_shader_resources)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_cs_set_uavs))
-        return decltype(g_original_cs_set_uavs)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_cs_set_shader))
-        return decltype(g_original_cs_set_shader)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_om_set_render_targets))
-        return decltype(g_original_om_set_render_targets)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_om_set_render_targets_and_uavs))
-        return decltype(g_original_om_set_render_targets_and_uavs)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_dispatch))
-        return decltype(g_original_dispatch)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_draw_indexed))
-        return decltype(g_original_draw_indexed)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_draw))
-        return decltype(g_original_draw)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_map))
-        return decltype(g_original_map)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_unmap))
-        return decltype(g_original_unmap)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_rs_set_viewports))
-        return decltype(g_original_rs_set_viewports)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_copy_subresource_region))
-        return decltype(g_original_copy_subresource_region)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_copy_resource))
-        return decltype(g_original_copy_resource)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_update_subresource))
-        return decltype(g_original_update_subresource)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_cs_set_constant_buffers))
-        return decltype(g_original_cs_set_constant_buffers)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_clear_rtv))
-        return decltype(g_original_clear_rtv)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_clear_dsv))
-        return decltype(g_original_clear_dsv)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_create_buffer))
-        return decltype(g_original_create_buffer)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_create_texture_2d))
-        return decltype(g_original_create_texture_2d)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_create_vertex_shader))
-        return decltype(g_original_create_vertex_shader)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_create_pixel_shader))
-        return decltype(g_original_create_pixel_shader)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_create_compute_shader))
-        return decltype(g_original_create_compute_shader)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_set_fullscreen_state))
-        return decltype(g_original_set_fullscreen_state)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_get_fullscreen_state))
-        return decltype(g_original_get_fullscreen_state)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_resize_buffers))
-        return decltype(g_original_resize_buffers)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_resize_target))
-        return decltype(g_original_resize_target)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_check_color_space_support))
-        return decltype(g_original_check_color_space_support)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_set_color_space1))
-        return decltype(g_original_set_color_space1)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_set_hdr_metadata))
-        return decltype(g_original_set_hdr_metadata)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_factory_create_swap_chain))
-        return decltype(g_original_factory_create_swap_chain)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_factory2_create_swap_chain_for_hwnd))
-        return decltype(g_original_factory2_create_swap_chain_for_hwnd)::bind(original);
-    if (callback == reinterpret_cast<void *>(&hooked_present))
-        return decltype(g_original_present)::bind(original);
-    return nullptr;
-}
 
 #if defined(DX11FSRBRIDGE_COLOR_DIAGNOSTICS)
 std::mutex g_fsr2_color_diagnostics_mutex;
@@ -1300,16 +976,6 @@ std::wstring current_process_name()
     wchar_t buffer[MAX_PATH] {};
     GetModuleFileNameW(nullptr, buffer, MAX_PATH);
     return std::filesystem::path(buffer).filename().wstring();
-}
-
-std::string narrow(const std::wstring &value)
-{
-    if (value.empty())
-        return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
-    std::string result(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
-    return result;
 }
 
 std::string format_string(DXGI_FORMAT format)
@@ -4126,771 +3792,6 @@ void update_osd_from_dispatch(std::uint32_t phase, UINT group_x, UINT group_y, U
 }
 #endif
 
-void load_config()
-{
-    const std::filesystem::path config_path = g_module_dir / L"Dx11FsrBridge.ini";
-    g_config.enabled = GetPrivateProfileIntW(L"Dx11FsrBridge", L"Enabled", 1, config_path.c_str()) != 0;
-    // ⚠️ 2026-09-23（用户要求）：**不再读旧键 `EnableLogging`**。
-    // 日志开关改由 `[Log] level` 派生（`level=off` 即关闭），见下方 [Log] 段。
-    // 这里只给**保守初值**：在 [Log] 段解析完成前保持开启，避免早期日志被丢。
-    g_config.enable_logging = true;
-    g_logging_enabled.store(true, std::memory_order_relaxed);
-    g_config.dlssg_dxgi_workaround =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DlssgDxgiWorkaround", -1, config_path.c_str());
-    // ---- 【诊断】HDR / 输出路径（native-LDR）/ D3D11On12 / 元数据抓取 整块 ----
-    // 归属判定（按"读取点 + 消费者"实证，不按名字猜）：
-    //   - `HdrEnvironmentProbe` / `HdrOutputDescProbe` / `HdrCompositeProbe*` 是**只读观测**，
-    //     源码注释本身就写着 "never changes the returned display state" ⇒ 纯诊断；
-    //   - `HdrSwapchainSpoof` / `HdrSwapchainForce` / `HdrOutputDescSpoof` / `HdrSdrToneMap*` /
-    //     `NativeLdr*` / `Dx11On12Swapchain` 是 "HDR / 输出路径" **实验装置**
-    //     （伪装 HDR 能力再压回 SDR、改写交换链格式），发布 ini 模板里**一个键都没有**；
-    //     发布的 HDR 通路是 `Ffx12Hdr` / `Ffx12PqChain` / `Ffx12NonLinear`，**不在本块内**；
-    //     ini 模板头部已把"HDR 与输出路径探针"划归**开发构建专属**；
-    //   - `CaptureMetadataOnly` 在读取点之外**没有任何消费者** ⇒ 幻影键 ⇒ 一并排除。
-    // ⇒ 整块只在诊断构建里读取；发布构建连键名字符串都不进产物。
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    g_config.hdr_swapchain_spoof =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainSpoof", 0, config_path.c_str()) != 0;
-    g_config.hdr_swapchain_force =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSwapchainForce", 0, config_path.c_str()) != 0;
-    g_config.hdr_environment_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrEnvironmentProbe", 0, config_path.c_str()) != 0;
-    g_config.hdr_output_desc_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescProbe", 0, config_path.c_str()) != 0;
-    g_config.hdr_output_desc_spoof =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrOutputDescSpoof", 0, config_path.c_str()) != 0;
-    g_config.native_ldr_swapchain_unorm =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrSwapchainUnorm", 0, config_path.c_str()) != 0;
-    g_config.dx11_on12_swapchain =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Dx11On12Swapchain", 0, config_path.c_str()) != 0;
-    g_config.native_ldr_final_target_unorm =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NativeLdrFinalTargetUnorm", 0, config_path.c_str()) != 0;
-    g_config.hdr_sdr_tone_map =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMap", 0, config_path.c_str()) != 0;
-    g_config.hdr_sdr_tone_map_pq_input =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrSdrToneMapPqInput", 1, config_path.c_str()) != 0;
-    g_config.hdr_sdr_tone_map_paper_white = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"HdrSdrToneMapPaperWhite", 80, config_path.c_str())),
-        1u,
-        1000u);
-    g_config.hdr_sdr_tone_map_peak = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"HdrSdrToneMapPeak", 100, config_path.c_str())),
-        1u,
-        10000u);
-    g_config.hdr_composite_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"HdrCompositeProbe", 0, config_path.c_str()) != 0;
-    g_config.hdr_composite_probe_limit = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"HdrCompositeProbeLimit", 32, config_path.c_str())),
-        1u,
-        512u);
-#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（HDR / native-LDR / D3D11On12）
-    // FSR2 输入纹理转储（诊断，默认关）。放在无条件区，避免被下面的 #if 吞掉。
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    fsr2dump::configure(config_path.c_str());
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    // ⚠️ 2026-09-27：ini 键 `EnableFsr2GetProcAddressShim` 的读取点与
-    //   `Config::enable_fsr2_get_proc_address_shim` 字段**已删除** —— 它是**幻影键**：
-    //   读取点之外没有任何消费者（`fsr2_get_proc_address_shim_query_mask()` 走的是
-    //   `DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME` 构建宏，与本 ini 键无关）⇒ 用户设了等于没设。
-    g_config.fsr2_translation_mode = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TranslationMode", 2, config_path.c_str()));
-    g_config.fsr2_mode2_on_demand_state =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Mode2OnDemandState", 1, config_path.c_str()) != 0;
-    g_config.fsr2_motion_vectors_jittered =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorsJittered", 0, config_path.c_str()) != 0;
-    g_config.fsr2_positive_motion_vector_scale =
-        // 2026-08-25（AA 修复，依据游戏 accumulate 反汇编）：游戏原生重投影 = UV − mv_g
-        // （mv_g=+sign·4d² 正向、UV 空间）；FSR2 期望 historyUV = UV + scale·mv_sample。
-        // 我们的解码 mv_sample = −mv_g（反向），故 scale 必须为 +renderSize（cb scale=+1）
-        // → 有效运动 = −mv_g ✓ 与游戏一致。旧默认 0（−renderSize）把运动再翻转回 +mv_g
-        // → 历史重投影方向全反 → 运动中历史每帧被拒/错位 → AA 退化为单帧放大（锯齿）。
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2MotionVectorScaleMode", 1, config_path.c_str()) == 1;
-    g_config.fsr2_use_reactive_mask =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseReactiveMask", 1, config_path.c_str()) != 0;
-    g_config.fsr2_use_transparency_mask =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseTransparencyMask", 0, config_path.c_str()) != 0;
-    g_config.fsr2_jitter_mode = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2JitterMode", 3, config_path.c_str()));
-    // ⚠️ 2026-09-27：ini 键 `Fsr2Hdr10PqColor` 的读取点与字段**已删除**（幻影键：
-    //   声明 + 读取点之外无任何消费者）。
-    g_config.fsr2_use_native_exposure =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2UseNativeExposure", 1, config_path.c_str()) != 0;
-    // ⚠️ 2026-09-27：ini 键 `Fsr2FastMetadataCopy` 的读取点与字段**已删除**（幻影键同上）。
-    g_config.fsr2_compact_linear_output =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2CompactLinearOutput", 1, config_path.c_str()) != 0;
-    g_config.fsr2_lock_color_producer_shader =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2LockColorProducerShader", 1, config_path.c_str()) != 0;
-    g_config.fsr2_reset_on_color_path_change =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2ResetOnColorPathChange", 1, config_path.c_str()) != 0;
-    g_config.block_dx11_on12_upscalers =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"BlockDx11On12Upscalers", 0, config_path.c_str()) != 0;
-    g_config.fsr2_family_skip =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FamilySkip", 0, config_path.c_str()) != 0;
-    g_config.fsr2_family_expire_ms = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"Fsr2FamilyExpireMs", 500, config_path.c_str())),
-        100u,
-        5000u);
-    g_config.fsr2_il2cpp_hook =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Il2CppHook", 0, config_path.c_str()) != 0;
-    g_config.fsr2_il2cpp_skip_render =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2Il2CppSkipRender", 0, config_path.c_str()) != 0;
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // 【诊断】相机/投影观测钩子（只读抓取游戏侧矩阵用于对照）——
-    // 发布的相机参数走**静态 ini 值**（Ffx12CameraNear / Ffx12CameraFar / Ffx12FovScale），
-    // 不依赖这三个钩子 ⇒ 归 B 组，只在诊断构建里读取。
-    g_config.ffx12_probe_camera =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ProbeCamera", 0, config_path.c_str()) != 0;
-    g_config.ffx12_camera_hook =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12CameraHook", 0, config_path.c_str()) != 0;
-    g_config.ffx12_projection_hook =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ProjectionHook", 0, config_path.c_str()) != 0;
-#endif
-    // 【正式功能】透明队列抖动修复（TransparentJitter，默认 **1 = 修复生效**）。
-    // ⚠️ 键名/段位必须与发布 ini 一致：段必须是 `[Dx11FsrBridge]`（放错段读不到，
-    // 本项目踩过），且必须在**生产分支**读取（load_config 无条件执行，不受
-    // DX11FSRBRIDGE_RELEASE_RUNTIME 影响）。
-    //
-    // ⚠️ 2026-09-27：**旧键兼容层已整体删除** —— `JitterFlagProbe` / `JitterFlagForce` /
-    // `JitterFlagProbeFrames` / `JitterFlagHotkey` 的读取、旧语义折算（probe && force）、
-    // 以及三条迁移告警串（`legacy_transparent_jitter_keys_ignored` /
-    // `legacy_transparent_jitter_keys_deprecated` / `removed_transparent_jitter_keys_present`）
-    // 全部移除。依据：发布更新方式是**覆盖安装**，不需要为旧版 ini 保留兼容；
-    // 留兼容层只会造成"两个键都生效、谁也说不清谁管用"。
-    // ⇒ 现在 `TransparentJitter` 是**唯一权威**，四个旧键**彻底不存在**（写了也无任何反应）。
-    g_config.transparent_jitter =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TransparentJitter", 1, config_path.c_str()) != 0;
-    const auto read_hex_rva = [&](const wchar_t *key, std::uint32_t fallback) {
-        wchar_t buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", key, L"", buf, static_cast<DWORD>(std::size(buf)),
-                                 config_path.c_str());
-        const std::wstring text(buf);
-        if (text.empty())
-            return fallback;
-        try
-        {
-            return static_cast<std::uint32_t>(std::stoul(text, nullptr, 0));
-        }
-        catch (...)
-        {
-            return fallback;
-        }
-    };
-    g_config.fsr2_il2cpp_render_rva = read_hex_rva(L"Fsr2Il2CppRenderRva", 0x06B59670);
-    g_config.fsr2_il2cpp_ucb_rva = read_hex_rva(L"Fsr2Il2CppUcbRva", 0x06B59600);
-    g_config.ffx12_camera_rva = read_hex_rva(L"Ffx12CameraRva", 0x06B558D0);
-    g_config.ffx12_projection_setter_rva =
-        read_hex_rva(L"Ffx12ProjectionSetterRva", 0x013DC510);
-    // 国际服（GenshinImpact.exe——打包偏移不同）RVA 覆盖：g_MethodPointers
-    // 30 方法 gap 匹配唯一命中（Render 0x06B580D0 / UCB 0x06B58060 / Camera 0x06B54420）
-    {
-        wchar_t exe_path[MAX_PATH] {};
-        if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) > 0)
-        {
-            std::wstring exe_name = std::filesystem::path(exe_path).filename().wstring();
-            for (wchar_t &ch : exe_name)
-                ch = static_cast<wchar_t>(towlower(ch));
-            if (exe_name.find(L"genshinimpact") != std::wstring::npos ||
-                exe_name.find(L"global") != std::wstring::npos)
-            {
-                g_config.fsr2_il2cpp_render_rva = read_hex_rva(L"Fsr2Il2CppRenderRvaGlobal", 0x06B580D0);
-                g_config.fsr2_il2cpp_ucb_rva = read_hex_rva(L"Fsr2Il2CppUcbRvaGlobal", 0x06B58060);
-                g_config.ffx12_camera_rva = read_hex_rva(L"Ffx12CameraRvaGlobal", 0x06B54420);
-            }
-        }
-    }
-    g_config.ffx12 =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12", 0, config_path.c_str()) != 0;
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_config.ffx12_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12Probe", 0, config_path.c_str()) != 0;
-#endif
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_config.optiscaler_bridge_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"OptiScalerBridgeProbe", 0, config_path.c_str()) != 0;
-#endif
-    g_config.ffx12_jitter_mode = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterMode", 3, config_path.c_str()));
-    g_config.ffx12_depth_inverted =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DepthInverted", 1, config_path.c_str()) != 0;
-    g_config.ffx12_decode_motion =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDecode", 1, config_path.c_str()) != 0;
-    g_config.ffx12_jitter_delay =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12JitterDelay", 0, config_path.c_str()) != 0;
-    g_config.ffx12_force_reset =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ForceReset", 0, config_path.c_str()) != 0;
-    g_config.ffx12_hdr_input =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12Hdr", 1, config_path.c_str()) != 0;
-    g_config.ffx12_auto_exposure =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AutoExposure", 1, config_path.c_str()) != 0;
-    g_config.ffx12_non_linear =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12NonLinear", 1, config_path.c_str()) != 0;
-    ffx12::set_use_pq_chain(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12PqChain", 0, config_path.c_str()) != 0);
-    g_config.ffx12_velocity_factor = std::clamp<float>(
-        static_cast<float>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12VelocityFactor", 50, config_path.c_str())) / 100.0f,
-        0.0f, 1.0f);
-    {
-        wchar_t motion_scale_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12MotionScale", L"1.0",
-                                 motion_scale_buf, static_cast<DWORD>(std::size(motion_scale_buf)),
-                                 config_path.c_str());
-    g_config.ffx12_motion_scale = std::clamp<float>(
-            std::wcstof(motion_scale_buf, nullptr), 0.0f, 4.0f);
-    }
-    g_config.ffx12_reuse_same_generation =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ReuseSameGeneration", 0,
-                              config_path.c_str()) != 0;
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // 【诊断】`Ffx12OutputMark`：源码注释即"输出标记（诊断：验证画面来源是否 ffx12）"，
-    // 且消费点 `ffx12::set_output_mark()` 本身就在 `!RELEASE_RUNTIME` 内
-    // ⇒ 发布构建里它连消费者都没有（幻影）⇒ 归 B 组。
-    g_config.ffx12_output_mark =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12OutputMark", 0, config_path.c_str()) != 0;
-#endif
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    ffx12::set_output_mark(g_config.ffx12_output_mark);
-#endif
-    {
-        wchar_t fov_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12FovScale", L"1.0", fov_buf,
-                                 static_cast<DWORD>(std::size(fov_buf)), config_path.c_str());
-        g_config.ffx12_fov_scale = std::clamp<float>(std::wcstof(fov_buf, nullptr), 0.1f, 3.0f);
-    }
-    {
-        wchar_t near_buf[32] {}, far_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12CameraNear", L"0.25", near_buf,
-                                 static_cast<DWORD>(std::size(near_buf)), config_path.c_str());
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12CameraFar", L"6000.0", far_buf,
-                                 static_cast<DWORD>(std::size(far_buf)), config_path.c_str());
-        g_config.ffx12_camera_near = std::clamp<float>(std::wcstof(near_buf, nullptr), 0.001f, 100.0f);
-        g_config.ffx12_camera_far = std::clamp<float>(std::wcstof(far_buf, nullptr), 10.0f, 100000.0f);
-    }
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    // 键归属（此前两行都写同一个 setter，第一行被第二行覆盖，等于死代码）：
-    //   Ffx12DecodeTest       -> g_decode_test（输出标记/解码测试）
-    //   Ffx12MotionDecodeTest -> g_motion_decode_test（motion 解码单独测试）
-    // 两者是后端里两个独立标志，不要再让其中一个写两次。
-    ffx12::set_decode_test(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DecodeTest", 0, config_path.c_str()) != 0);
-    ffx12::set_motion_decode_test(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDecodeTest", 0, config_path.c_str()) != 0);
-    ffx12::set_debug_layer(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DebugLayer", 0, config_path.c_str()) != 0);
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // 【诊断】`Ffx12MotionDeadzone`：已实测**无效**的 motion 死区实验键
-    // （审查矩阵：102 轮实测 motion<0.0005UV 归零无效果）⇒ 归 B 组，不再进发布构建。
-    ffx12::set_motion_deadzone(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12MotionDeadzone", 0, config_path.c_str()) != 0);
-#endif
-    ffx12::set_depth_inverted(g_config.ffx12_depth_inverted);
-    ffx12::set_decode_motion(g_config.ffx12_decode_motion);
-    ffx12::set_motion_vectors_jittered(g_config.fsr2_motion_vectors_jittered);
-    g_config.ffx12_gpu_interop =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12GpuInterop", 1, config_path.c_str()) != 0;
-    ffx12::set_gpu_interop(g_config.ffx12_gpu_interop);
-    // 异步交叠（async upscale）：默认开启——dispatch 只提交 FFX，Present 前
-    // 完成交接，FFX 与游戏后续渲染并行（消除每帧硬停 → GPU 满载）。
-    // 设 0 回退旧同步行为（dispatch 内等待+拷贝）。
-    ffx12::set_async_upscale(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12AsyncUpscale", 1, config_path.c_str()) != 0);
-    ffx12::set_hdr_input(g_config.ffx12_hdr_input);
-    // ---- D13 十键读取（SDS §3.13.1）+ 键 11 NgxCrossKeyReuse：紧邻 Ffx12Hdr 的读取点 ----
-    // 此处 blog::init() 尚未执行 ⇒ 11 个 setter 只存值、一行日志都不打；
-    // 唯一需要输出的是非法值告警，它先进 pending_warnings，由 initialize() 回放。
-    //
-    // ⚠️ Ffx12Backend 只接受**精确小写**的 auto / native / ngx：不 tolower、不 trim。
-    //    缺键（lpDefault=L"auto"，与发布模板一致，见 AGENTS.md §二.7）与显式 auto 等效：
-    //    先按 native 落位，等首个适配器信息到手再按型号判（resolve_backend_auto）；
-    //    显式 native ⇒ native 且不告警；
-    //    显式空值 / NGX / Native / 拼错 ⇒ native + backend_invalid 告警。
-#if defined(DX11FSRBRIDGE_ENABLE_NGX)
-    // ---- 键 1：Ffx12Backend（唯一走 ffx12 命名空间的键——不存在 ngx::set_backend）----
-    wchar_t backend_buf[64] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"auto",
-                             backend_buf, static_cast<DWORD>(std::size(backend_buf)),
-                             config_path.c_str());
-    const std::wstring backend_value(backend_buf);
-    const bool ngx_mode = (backend_value == L"ngx");
-    const bool native_mode = (backend_value == L"native");
-    const bool auto_mode = (backend_value == L"auto");
-    if (!ngx_mode && !native_mode && !auto_mode)
-        g_config.logging.pending_warnings.emplace_back(
-            "ngx_core backend=native config_warn bits=backend_invalid");
-    // auto：此刻还没有适配器信息（设备还没创建），先按 native 落位；
-    // 真正的判定发生在 route_from_d3d11_device -> resolve_backend_auto（设备创建 hook 内，
-    // 早于 swapchain_hook_needed() 的求值）。
-    g_backend_auto_requested = auto_mode;
-    ffx12::set_backend(ngx_mode ? ffx12::BackendKind::Ngx : ffx12::BackendKind::Native);
-
-    // ---- 键 2：NgxApplicationId（uint64；0 → 1337，warn 位由 set_ 内部记）----
-    wchar_t appid_buf[32] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxApplicationId", L"1337",
-                             appid_buf, static_cast<DWORD>(std::size(appid_buf)),
-                             config_path.c_str());
-    const unsigned long long appid =
-        static_cast<unsigned long long>(_wcstoui64(appid_buf, nullptr, 10));
-    ngx::set_application_id(appid);
-
-    // ---- 键 3：NgxFeatureDirs（分号分隔；空 = 自动探测）----
-    wchar_t dirs_buf[2048] {};
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxFeatureDirs", L"",
-                             dirs_buf, static_cast<DWORD>(std::size(dirs_buf)),
-                             config_path.c_str());
-    std::vector<std::wstring> ngx_dirs;   // 空 vector = 让 ensure_init 走自动探测
-    if (dirs_buf[0] != L'\0')
-    {
-        const std::wstring all(dirs_buf);
-        std::size_t pos = 0;
-        while (pos <= all.size())
-        {
-            const std::size_t sep = all.find(L';', pos);
-            const std::size_t end = (sep == std::wstring::npos) ? all.size() : sep;
-            if (end > pos) ngx_dirs.emplace_back(all, pos, end - pos);
-            if (sep == std::wstring::npos) break;
-            pos = sep + 1;
-        }
-    }
-    ngx::set_feature_dirs(ngx_dirs);
-
-    // ---- 键 4：NgxHdr（T-8 三态：auto / 1 / 0；默认 0 = 强制 SDR）----
-    // 为什么默认从 auto 改成 0（实机 E2 证据，同机同场景对比）：
-    //   NgxHdr=auto ⇒ 解析成 HDR（create_flags=0xB，含 IsHDR）⇒ 角色走动/转视角时拖影明显；
-    //   NgxHdr=0    ⇒ create_flags=0xA（无 IsHDR）⇒ 拖影大幅改善。
-    // 机制：桥交给 NGX 的是 **PQ 码值**，不是线性光。置 IsHDR 会让 DLSS 按 HDR 管线解释这些
-    //   码值，色调映射与运动补偿的判断偏离画面实际内容 ⇒ 走动/转视角时大面积拖影。
-    // ⚠️ 该结论只在**绕过 OptiScaler** 时才能测出 —— OptiScaler 会把 IsHDR 强制改回 1。
-    // auto 三态仍然可用（只是不再是默认）：
-    //   auto = 自动探测（① swapchain color space > ② swapchain 缓冲格式 > ③ 输入纹理格式）；
-    //   1 = 强制 HDR；0 = 强制 SDR。旧配置写 1/0 仍然有效。
-    //   需要复现原行为（HDR 会话解析成 HDR）时，显式写 auto。
-    {
-        wchar_t hdr_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxHdr", L"0",
-                                 hdr_buf, static_cast<DWORD>(std::size(hdr_buf)),
-                                 config_path.c_str());
-        std::wstring hdr_s(hdr_buf);
-        // trim 两侧空白
-        const auto b = hdr_s.find_first_not_of(L" \t");
-        const auto e = hdr_s.find_last_not_of(L" \t");
-        hdr_s = (b == std::wstring::npos) ? std::wstring() : hdr_s.substr(b, e - b + 1);
-        for (auto &ch : hdr_s) ch = static_cast<wchar_t>(towlower(ch));
-        int hdr_mode = 0;   // auto
-        if (hdr_s == L"1" || hdr_s == L"true" || hdr_s == L"on")       hdr_mode = 1;
-        else if (hdr_s == L"0" || hdr_s == L"false" || hdr_s == L"off") hdr_mode = 2;
-        // 其它（含 "auto"、空、无法识别）一律 auto
-        ngx::set_hdr_mode(hdr_mode);
-    }
-
-    // ---- 键 5：NgxRenderPreset（P-11：默认 0 = 不设 preset，跟随 NGX 自身规则）----
-    // 0 = 六个 preset 参数一个都不设，由 NGX 按性能档自行决定（与 OptiScaler 的
-    // RenderPresetForAll=0 同义）。合法值 5..15 可显式指定档位。
-    const int ngx_preset =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxRenderPreset", 0, config_path.c_str());
-    ngx::set_render_preset(ngx_preset);
-
-    // ---- 键 6：NgxSetFrameTimeDelta（默认 1）----
-    const int ngx_dt =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxSetFrameTimeDelta", 1, config_path.c_str());
-    ngx::set_frame_time_delta(ngx_dt != 0);
-
-    // ---- 键 7：NgxUseReactiveMask（默认 0）----
-    const int ngx_react =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxUseReactiveMask", 0, config_path.c_str());
-    ngx::set_use_reactive_mask(ngx_react != 0);
-
-    // ---- 键 8：NgxLogLevel（默认 1；0=全关 1=error 2=info 3=debug）----
-    const int ngx_lv =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxLogLevel", 1, config_path.c_str());
-    ngx::set_log_level(ngx_lv);
-
-    // ---- 键 9：NgxPassthrough（默认 0）----
-    const int ngx_pt =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPassthrough", 0, config_path.c_str());
-    ngx::set_passthrough(ngx_pt != 0);
-
-    // ---- 键 10：NgxProvider（2026-11-10 增，B154；默认 auto）----
-    // 只接受**精确小写**的 auto / nvidia / external：与 Ffx12Backend 同风格（不 tolower、不 trim）。
-    // 其它取值（显式空值 / 拼错 / ngx / NVIDIA）⇒ auto + provider_invalid 告警（位由 setter 记），
-    // 因为"拼错"与"故意用默认"在日志里必须能区分开。
-    {
-        wchar_t provider_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxProvider", L"auto",
-                                 provider_buf, static_cast<DWORD>(std::size(provider_buf)),
-                                 config_path.c_str());
-        const std::wstring provider_value(provider_buf);
-        int provider_mode = -1;   // -1 = 非法（交给 set_provider_mode 记位并回 auto）
-        if (provider_value == L"auto")
-            provider_mode = 0;
-        else if (provider_value == L"nvidia")
-            provider_mode = 1;
-        else if (provider_value == L"external")
-            provider_mode = 2;
-        ngx::set_provider_mode(provider_mode);
-    }
-    // ---- 键 11：NgxCrossKeyReuse（默认 1）----
-    // 1 = instance_key 变化但尺寸/格式全等时复用现有资源池与 feature（消除进出角色界面
-    //     ~500ms 卡顿 + 短暂黑屏：根因是 destroy_instance() 的 g_release(feature)，实测 502ms）；
-    // 0 = 每次 key 变化都销毁重建，与引入本键之前**逐字节同一条路径**。
-    // ★ 语义是 int -> bool 折叠（!= 0），与上面 8 个二分开关一致：非 0 即开。
-    const int ngx_ckr =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxCrossKeyReuse", 1, config_path.c_str());
-    ngx::set_cross_key_reuse(ngx_ckr != 0);
-#else
-    // ---- REQ-08：NGX 未编译进本产物 ----
-    // 十个键里只有 Ffx12Backend 有消费者（后端选择器归 ffx12），其余 9 个 NGX 键在 OFF
-    // 构型下没有任何消费者，故不读。缺键（lpDefault=L"auto"）/ 显式 auto ⇒ 交给
-    // resolve_backend_auto 按型号判；显式 native ⇒ 静默 native（不告警）；
-    // 精确 ngx 与非法值 ⇒ 强制 Native + 一条固定告警。
-    {
-        wchar_t backend_buf[64] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Backend", L"auto",
-                                 backend_buf, static_cast<DWORD>(std::size(backend_buf)),
-                                 config_path.c_str());
-        // auto 在本构型下**合法**、不告警：型号判为 RTX 时才有必要提示"想走 ngx 但没编进来"，
-        // 而那时才拿得到适配器信息（由 resolve_backend_auto 打这一行）。
-        const std::wstring backend_value(backend_buf);
-        g_backend_auto_requested = (backend_value == L"auto");
-        if (backend_value != L"native" && !g_backend_auto_requested)
-            g_config.logging.pending_warnings.emplace_back(
-                "ngx_core backend=native config_warn bits=ngx_not_compiled");
-        ffx12::set_backend(ffx12::BackendKind::Native);
-    }
-#endif
-    ffx12::set_auto_exposure(g_config.ffx12_auto_exposure);
-    ffx12::set_non_linear(g_config.ffx12_non_linear);
-    ffx12::set_velocity_factor(g_config.ffx12_velocity_factor);
-    // 【正式功能】P1 单实例接管（默认**关** = 全量接管）——段必须是 `[Dx11FsrBridge]`。
-    // 它读在诊断守卫之外：这是**功能键**（消费者改变行为），发布构建必须保留。
-    // 缺省 0 必须与发布模板一致（Dx11FsrBridge.package.ini）：FFX 后端的共享层已按实例隔离
-    // （f9e52b3），全量接管才是分屏场景的正确值；NGX 后端无视本键、一律按 1 处理
-    // （见 single_instance_takeover_effective()）。
-    g_config.ffx12_single_instance =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstance", 0, config_path.c_str()) != 0;
-    g_config.ffx12_single_instance_pick = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"Ffx12SingleInstancePick", 0, config_path.c_str())),
-        0u,
-        2u);
-    // P2 追加：诊断 + 两个默认关的实验开关（同样是**功能键**，读在诊断守卫之外）。
-    g_config.ffx12_single_instance_diag =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstanceDiag", 0, config_path.c_str()) != 0;
-    g_config.ffx12_single_instance_sticky =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstanceSticky", 0, config_path.c_str()) != 0;
-    g_config.ffx12_single_instance_hold_ms = std::clamp<std::uint32_t>(
-        static_cast<std::uint32_t>(GetPrivateProfileIntW(
-            L"Dx11FsrBridge", L"Ffx12SingleInstanceHoldMs", 10000, config_path.c_str())),
-        3000u,
-        60000u);
-    g_config.ffx12_single_instance_strict =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12SingleInstanceStrictMatch", 0, config_path.c_str()) != 0;
-    // 后端侧同开关：池重建 / context 重建留痕（默认关；见 Ffx12Backend.h 的说明）
-    ffx12::set_instance_diag(g_config.ffx12_single_instance_diag);
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    ffx12::set_dump_frames(static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12DumpFrames", 0, config_path.c_str())));
-#endif
-    {
-        wchar_t ver_buf[32] {};
-        // 默认请求最高版本前缀（4.x）——provider 的 GET_VERSIONS 按 GPU
-        // 能力过滤，降级链 4→3→2 自动兜底；无需按显卡分类强制降级。
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12Version", L"ffx12-fsr4.x", ver_buf,
-                                 static_cast<DWORD>(std::size(ver_buf)), config_path.c_str());
-        ffx12::set_sdk_version(narrow(ver_buf).c_str());
-    }
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // 【诊断】像素着色器 dump（把 .cso 落盘）。消费者 `dump_pixel_shader_bytecode` /
-    // `dump_vertex_shader_bytecode` 本身都在 `!RELEASE_RUNTIME` 内 ⇒ 归 B 组。
-    // 诊断 shader dump 也必须在 RELEASE 分支读取（非 RELEASE 分支的读取不生效）
-    g_config.dump_pixel_shaders = GetPrivateProfileIntW(L"Dx11FsrBridge", L"DumpPixelShaders", 0, config_path.c_str()) != 0;
-#endif
-    // 后端输出读回采样（诊断，默认关）。开启会引入同步 GPU 等待 → 掉帧，仅排查用。
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // 【诊断】`Ffx12ReadbackProbes`：**本项目唯一持续 GPU 同步读回点**
-    // （Begin/End + GetData；源码注释即"开启会引入同步 GPU 等待 → 掉帧，仅排查用"）
-    // ⇒ 归 B 组，发布构建整块不参与编译。
-    g_config.ffx12_readback_probes =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12ReadbackProbes", 0, config_path.c_str()) != 0;
-#endif
-    // ⚠️ Fsr2FastStateTracking —— 生产构建下**必须读**，且默认开启（=1）。
-    //
-    // 该键门控的是**状态镜像钩子的整体旁路**，共 11 处：
-    //   PSSetShaderResources / PSSetConstantBuffers / OMSetRenderTargets / RSSetViewports
-    //   在"已学到目标 PS hash"后**整钩子直接透传**，不再做每调用的资源内省；
-    //   PSSetShader 只记一个 hash；inspect_target_upscaler_draw 走廉价预筛。
-    //
-    // 而它在旧代码里**只在非 RELEASE 分支被读取**（生产构建定义
-    // DX11FSRBRIDGE_RELEASE_RUNTIME=1 → 恒为默认 false）→ 这些旁路**从未生效**，
-    // 每次资源绑定都执行 read_resource_info（GetResource/GetType/QueryInterface/
-    // GetDesc + AddRef/Release）。实测后果（用户报告，9800X3D）：
-    //   - 单核占用最高 80%（单线程热点）、GPU 空转（CPU 喂不上）
-    //   - 渲染精度 0.2 与 0.5 帧数无差别（瓶颈不在像素吞吐）
-    //   - 角色模型精度越高帧数越低（绑定调用数随 draw 数增长）
-    // 默认值取 1：这是该开关的设计意图（学到目标后旁路），也是发布配置期望的行为。
-    g_config.fsr2_fast_state_tracking =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2FastStateTracking", 1, config_path.c_str()) != 0;
-    // ---- 【诊断束】呈现探针 / 着色器与纹理追踪 / 像素着色器替换 ----
-    // 归属判定（读取点 + 消费者）：
-    //   - `Ffx12PresentProbe` 只 LOG present 参数与帧间隔（源码注释：仅记录）；
-    //   - `TracePixelShaderDraws` + `PixelShaderTraceLimit` + `TargetPixelShaderHash` +
-    //     `PixelShaderReplacementMode` + `DumpPixelShaders` 是同一支"目标 PS 追踪/替换"实验
-    //     （消费者只写 JSON 追踪流与替换 shader，不参与发布通路）；
-    //   - `TraceTextureCreates` + `TextureTrace*`（热键触发的限时纹理创建追踪）同理。
-    // ⇒ 整束归 B 组，只在诊断构建里读取。
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // Present 参数/帧间隔诊断（默认关）。仅记录 sync_interval/flags/帧间隔/前台状态。
-    g_config.ffx12_present_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12PresentProbe", 0, config_path.c_str()) != 0;
-    g_config.trace_pixel_shader_draws =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TracePixelShaderDraws", 0, config_path.c_str()) != 0;
-    // 纹理创建追踪（热键触发的限时追踪）
-    g_config.trace_texture_creates =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TraceTextureCreates", 0, config_path.c_str()) != 0;
-    g_config.texture_trace_hotkey = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceHotkey", VK_F11, config_path.c_str()));
-    g_config.texture_trace_duration_ms = static_cast<std::uint32_t>(std::max<INT>(
-        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceDurationMs", 10000, config_path.c_str())));
-    g_config.texture_trace_limit = static_cast<std::uint32_t>(std::max<INT>(
-        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"TextureTraceLimit", 128, config_path.c_str())));
-    // 像素着色器替换（target hash 为 16 进制字符串）
-    {
-        wchar_t hash_buf[32] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"TargetPixelShaderHash", L"78057A29AF6C2D99", hash_buf,
-                                 static_cast<DWORD>(std::size(hash_buf)), config_path.c_str());
-        wchar_t *hash_end = nullptr;
-        const unsigned long long parsed = std::wcstoull(hash_buf, &hash_end, 16);
-        if (hash_end != hash_buf)
-            g_config.target_pixel_shader_hash = parsed;
-        g_config.pixel_shader_replacement_mode = static_cast<std::uint32_t>(
-            GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderReplacementMode", 0, config_path.c_str()));
-    }
-    g_config.pixel_shader_trace_limit = static_cast<std::uint32_t>(std::max<INT>(
-        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"PixelShaderTraceLimit", 512, config_path.c_str())));
-#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（呈现探针 / PS+纹理追踪 / PS 替换）
-    // FSR2 锐化：**此前只在非 RELEASE 分支读取**，导致 sdk_in.enable_sharpening 那处
-    // "日志撒谎修复"在生产里拿到的永远是默认 0 —— 等于该功能从未生效。
-    g_config.fsr2_sharpness_percent = static_cast<std::uint32_t>(std::clamp<INT>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2SharpnessPercent", 0, config_path.c_str()), 0, 100));
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // ---- 【诊断束】色彩产出者追踪 / 早输出探针（`Fsr2GpuTiming` 整支已按死代码删除）----
-    //   - `Fsr2TraceColorProducers`：色彩产出者写历史追踪（F6 手动落盘）；
-    //   - `Fsr2EarlyOutputProbe(+Frames)`：早输出探针。
-    g_config.fsr2_trace_color_producers =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2TraceColorProducers", 0, config_path.c_str()) != 0;
-    g_config.fsr2_early_output_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbe", 0, config_path.c_str()) != 0;
-    g_config.fsr2_early_output_probe_frames = static_cast<std::uint32_t>(std::max<INT>(
-        1, GetPrivateProfileIntW(L"Dx11FsrBridge", L"Fsr2EarlyOutputProbeFrames", 60, config_path.c_str())));
-#endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（色彩产出者追踪 / 早输出探针）
-    {
-        wchar_t buf[520] {};
-        GetPrivateProfileStringW(L"Dx11FsrBridge", L"Ffx12DllPath", L"", buf,
-                                 static_cast<DWORD>(std::size(buf)), config_path.c_str());
-        g_config.ffx12_dll_path = buf;
-        if (g_config.ffx12_dll_path.empty())
-            // 默认指向 Bridge 目录自身副本（不再依赖 OptiScaler 目录布局——
-            // OptiScaler 更新后其 SDK DLL 移入子目录，外路径失配导致 LoadLibrary 失败 → 黑屏）。
-            // 正式版 SDK 统一放上一级 payload\AMD（Bridge 目录只留桥本体）。
-            g_config.ffx12_dll_path = g_module_dir.parent_path() / L"AMD" / L"amd_fidelityfx_upscaler_dx12.dll";
-        ffx12::set_sdk_dll_path(g_config.ffx12_dll_path.c_str());
-    }
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // 【诊断】`Ffx12FailClosed`：源码注释即"禁止回退原生（测试/故障显式暴露）"——
-    // 它把 dispatch 失败从"回退原生"改成"直接失败"（=黑屏式故障注入）。
-    // 审查文档也把它记为 fail-closed 诊断 ⇒ 归 B 组，发布构建不再读取。
-    g_config.ffx12_fail_closed =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FailClosed", 0, config_path.c_str()) != 0;
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_NGX)
-    // 2026-11-09（PR #12 审查次要项 10）：`NgxPassthrough=1` 与 `Ffx12FailClosed=1` 的
-    // **代码级互斥**。AGENTS.md §二.7 要求评估「两个『关闭/接管』语义的开关同时开启
-    // 是否互相吞掉」—— 这一对恰好是其中最坏的一种：
-    //   ① NgxPassthrough=1 ⇒ ngx::dispatch 在第 0 步就 return false（不超分）；
-    //   ② 该 false 传回 ffx12::dispatch ⇒ 走到 draw 钩子的派发失败分支；
-    //   ③ Ffx12FailClosed=1 ⇒ 该分支 return true = **吞掉这次 draw 且不产出任何图**。
-    //   ⇒ 不超分 + 不回退 + draw 被吞 = **每帧黑屏**（不崩不冻，最难排查的一类）。
-    //
-    // 处理方向：**强制关掉 Ffx12FailClosed**，而不是关 passthrough。
-    //   理由：passthrough 是用户显式要的观测手段（SDS 判据 14 依赖它），关掉它等于
-    //   让用户「设了没反应」；而 fail_closed 是**故障注入式诊断**（源码注释即「禁止
-    //   回退原生（测试/故障显式暴露）」），它的正确语义本就是「暴露失败」，
-    //   不是「制造黑屏」。两者冲突时保留用户的观测意图、放弃故障注入，方向更安全。
-    //
-    // ★ 位置硬约束：必须在**两个键都读完**之后（NgxPassthrough 在键 9、Ffx12FailClosed
-    //   在本块上方）且在任何消费者之前（唯一消费者是 draw 钩子的派发失败分支）。
-    // ★ 为什么用 pending_warnings 而不是 LOG_WARN：load_config() 跑在 blog::init() 之前，
-    //   此时直接写日志会被丢弃（见本文件 §logging 的说明与 pending_warnings 的回放点）。
-    //
-    // ★ 为什么用 ngx::passthrough() 而不是就地重读 ini，也不用局部变量 ngx_pt：
-    //   · 不重读 ini：一次 GetPrivateProfileIntW 有文件解析开销，且会与键 9 形成
-    //     **两个解析点**——两处若哪天改了一处默认值就会静默不一致。
-    //   · 不用 ngx_pt：它虽然在同一函数作用域内可见（:4196，`#endif` 不关闭 C++ 作用域），
-    //     但 ngx::passthrough() 返回的正是 4198 行 set_passthrough 存进去的那个值，
-    //     也就是**下游消费者读到的同一个值** ⇒ 本互斥的判据与消费者同源，
-    //     不会出现「互斥按 ini 判、消费者按全局判」的两套口径。
-    //
-    // ⚠️ 适用范围（如实记录）：`Ffx12FailClosed` 的**读取点**本身在
-    //   `#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)` 内 ⇒ 发布构建里
-    //   g_config.ffx12_fail_closed 恒为 false，本互斥在发布构建中**永不触发**。
-    //   也就是说这对组合只在诊断构建里能凑出来 —— 但它恰恰是诊断构建最容易踩的组合
-    //   （排查黑屏时同时开「直通」与「失败关闭」来定位到底哪一段吞了图），必须挡住。
-    if (ngx::passthrough() && g_config.ffx12_fail_closed)
-    {
-        g_config.ffx12_fail_closed = false;
-        g_config.logging.pending_warnings.emplace_back(
-            "config_mutex key=Ffx12FailClosed forced=0 reason=NgxPassthrough=1 "
-            "why=passthrough_plus_failclosed_black_screen");
-    }
-#endif
-    // -----------------------------------------------------------------------
-    // 日志配置。新方案：显式等级 + 分类过滤（[Log] 段），不做内容推断。
-    // `[Log] level` 是**唯一权威**（缺省 info）。
-    //
-    // ⚠️ 2026-09-27：旧键存在性探测（`LogLevel` / `Ffx12FullLogging` / `EnableLogging`）
-    // 与 `legacy_log_keys_ignored` 迁移告警**已删除** —— 发布更新方式是**覆盖安装**，
-    // 不为旧版 ini 保留兼容。旧键现在**彻底不存在**（写了也不会有任何反应，
-    // 也不会再污染"已废弃键"的告警噪声）。
-    // -----------------------------------------------------------------------
-    {
-        wchar_t level_text[32] {};
-        GetPrivateProfileStringW(L"Log", L"level", L"info", level_text,
-                                 static_cast<DWORD>(std::size(level_text)), config_path.c_str());
-        blog::Level parsed {};
-        if (!blog::parse_level(narrow(level_text).c_str(), parsed))
-        {
-            // 解析失败也回落 info（而非 TRACE）—— 与"默认 info"一致
-            parsed = blog::Level::Info;
-            g_config.logging.pending_warnings.push_back(
-                std::string("log_level_unparsed value=") + narrow(level_text) + " fallback=info");
-        }
-        g_config.logging.level = parsed;
-
-        // 日志开关由等级派生：`level=off` 即关闭
-        g_config.enable_logging = (parsed != blog::Level::Off);
-        g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
-
-        g_config.logging.to_debugger =
-            GetPrivateProfileIntW(L"Log", L"to_debugger", 0, config_path.c_str()) != 0;
-        g_config.logging.to_file =
-            GetPrivateProfileIntW(L"Log", L"to_file", 1, config_path.c_str()) != 0;
-        g_config.logging.truncate_on_start =
-            GetPrivateProfileIntW(L"Log", L"truncate_on_start", 1, config_path.c_str()) != 0;
-        g_config.logging.compat_prefix_categories =
-            GetPrivateProfileIntW(L"Log", L"compat_prefix", 0, config_path.c_str()) != 0;
-        g_config.logging.max_file_kb = std::clamp<std::uint32_t>(
-            static_cast<std::uint32_t>(
-                GetPrivateProfileIntW(L"Log", L"max_file_kb", 16384, config_path.c_str())),
-            0u, 4u * 1024u * 1024u);
-        g_config.logging.rotate_keep = std::clamp<std::uint32_t>(
-            static_cast<std::uint32_t>(
-                GetPrivateProfileIntW(L"Log", L"rotate_keep", 2, config_path.c_str())),
-            0u, 8u);
-        g_config.logging.queue_capacity = std::clamp<std::uint32_t>(
-            static_cast<std::uint32_t>(
-                GetPrivateProfileIntW(L"Log", L"queue_capacity", 8192, config_path.c_str())),
-            1024u, 262144u);
-
-        // 分类覆盖：[Log.Categories] 段，每行 category=level
-        wchar_t section[4096] {};
-        const DWORD section_len = GetPrivateProfileSectionW(
-            L"Log.Categories", section, static_cast<DWORD>(std::size(section)), config_path.c_str());
-        g_config.logging.categories.clear();
-        // 不按 section_len 迭代：缓冲区不足时 GetPrivateProfileSectionW 返回 nSize-2，
-        // 按该值推进可能踩到未写入区域。直接以双 NUL 结尾为准，天然不会越界。
-        for (const wchar_t *cursor = section; *cursor != L'\0';)
-        {
-            const std::wstring row(cursor);
-            cursor += row.size() + 1;
-            if (row.empty())
-                continue;
-            const std::size_t eq = row.find(L'=');
-            if (eq == std::wstring::npos || eq == 0)
-                continue;
-            const std::wstring key = row.substr(0, eq);
-            const std::wstring value = row.substr(eq + 1);
-            blog::Level cat_level {};
-            if (blog::parse_level(narrow(value).c_str(), cat_level))
-                g_config.logging.categories.emplace_back(narrow(key), cat_level);
-        }
-        // 段被缓冲区截断时必须显式暴露：否则表现为"某个分类覆盖静默不生效"。
-        if (section_len >= static_cast<DWORD>(std::size(section)) - 2)
-        {
-            g_config.logging.pending_warnings.push_back("log_categories_section_truncated buffer=" +
-                std::to_string(std::size(section)) + " parsed=" +
-                std::to_string(g_config.logging.categories.size()));
-        }
-        // 旧字段（已无任何读取点）：按**新等级**回填，避免留下过期值。
-        g_bridge_log_level =
-            (parsed == blog::Level::Trace) ? 3 :
-            (parsed == blog::Level::Debug) ? 2 :
-            (parsed == blog::Level::Off || parsed == blog::Level::Error) ? 0 : 1;
-    }
-
-    // 渲染精度 hook 总开关（**正式版必须在此读取**——非正式版分支另有一份同样的读取，
-    // 只写一边会让该开关在正式版静默失效；历史上 trace 键正是这样失效过）。
-    g_config.render_scale_menu =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"RenderScaleMenu", 1, config_path.c_str()) != 0;
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    g_config.show_osd = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ShowOSD", 0, config_path.c_str()) != 0;
-#endif
-    g_config.ffx12_feature_fallback =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"Ffx12FeatureFallback", 1, config_path.c_str()) != 0;
-    // ⚠️ 2026-09-27：ini 键 `AssumePhaseOrder` 的读取点与字段**已删除**，同时删除其
-    //   唯一（死）消费者 `mode_name_for_phase()` —— 该函数全仓没有任何调用点，
-    //   读到的值不改变任何行为（幻影键）。
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_config.enable_similarity_probe = GetPrivateProfileIntW(L"Dx11FsrBridge", L"EnableSimilarityProbe", 0, config_path.c_str()) != 0;
-    g_config.reset_similarity_on_recording = GetPrivateProfileIntW(L"Dx11FsrBridge", L"ResetSimilarityOnRecording", 1, config_path.c_str()) != 0;
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    // 【诊断束】候选上限 + 有趣 dispatch 的日志节流参数。
-    //   - `CandidateLimitPerFrame`：唯一消费者是 `maybe_track_fsr2_color_candidate`
-    //     （每帧候选记录上限），消费者本身与色彩产出者追踪同属诊断观测；
-    //   - `InterestingDispatch*`：只控制"有趣 dispatch"日志的条数与相位间隔 ⇒ 日志节流参数。
-    g_config.candidate_limit_per_frame = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"CandidateLimitPerFrame", 64, config_path.c_str()));
-    g_config.interesting_dispatch_log_limit = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"InterestingDispatchLogLimit", 256, config_path.c_str()));
-    g_config.interesting_dispatch_phase_gap_ms = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"InterestingDispatchPhaseGapMs", 1500, config_path.c_str()));
-#endif
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    g_config.similarity_report_interval_ms = static_cast<std::uint32_t>(GetPrivateProfileIntW(L"Dx11FsrBridge", L"SimilarityReportIntervalMs", 2000, config_path.c_str()));
-#endif
-    wchar_t label_buffer[128] {};
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    GetPrivateProfileStringW(L"Dx11FsrBridge", L"RunLabel", L"", label_buffer, static_cast<DWORD>(std::size(label_buffer)), config_path.c_str());
-    g_config.run_label = label_buffer;
-#endif
-
-    // 【诊断】分段性能探针（默认关）。⚠️ 三个键只在这里读一次（配置读取本身
-    // 就是被怀疑的对象之一：`GetPrivateProfile*` 是文件/注册表 IO，
-    // **绝不允许出现在每帧路径上** —— 本探针会把它计数并证明它不在热路径）。
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    g_config.perf_probe =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbe", 0, config_path.c_str()) != 0;
-    g_config.perf_probe_interval_ms = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeIntervalMs", 1000, config_path.c_str()));
-    g_config.perf_probe_draw_sample = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"PerfProbeDrawSample", 32, config_path.c_str()));
-#endif
-
-    // 【正式功能】入口级过滤（B109）——**段必须是 `[Dx11FsrBridge]`**（放错段读不到，
-    // 本项目踩过这个坑）。⚠️ 它与 `PerfProbe` 总开关**无关**：探针关着它照样生效
-    // （保险的告警行也照样会打出来 —— 它走的是无条件注入的 sink）。
-    //
-    // `DrawEntryFilter=1`（默认）= 在调用入口用 `element_count == 3` 早退；
-    // `=0` = 关闭，一切走原路径（保险触发后用户也可以手动关）。
-    g_config.draw_entry_filter =
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DrawEntryFilter", 1, config_path.c_str()) != 0;
-    // canary 抽样步长（保险的探针，见 PerfProbe.h）：0 = 不放行；1 = 全部放行；N = 每 N 个 1 个。
-    g_config.draw_entry_filter_canary = static_cast<std::uint32_t>(
-        GetPrivateProfileIntW(L"Dx11FsrBridge", L"DrawEntryFilterCanary", 64, config_path.c_str()));
-}
-
 bool process_matches()
 {
     if (!g_config.enabled)
@@ -6319,16 +5220,6 @@ void install_loader_hooks_for_loaded_modules()
         LOG_INFO(blog::cat::core, summary);
 }
 
-bool patch_vtable_methods(void *instance, std::size_t method_count, const std::vector<std::pair<std::size_t, void *>> &patches)
-{
-    return com_vtable::patch(instance, method_count, patches, bind_com_method);
-}
-
-std::size_t context_vtable_size(ID3D11DeviceContext *context)
-{
-    return interface_layout::context(context);
-}
-
 // 内部工作跨代理转发时共享线程域，避免临时改写某一对象的全局 vptr。
 using ScopedContextVtableBypass = ContextPolicyBypass;
 
@@ -7605,11 +6496,6 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain *swapchain, UINT sync_in
     }
 #endif
     tone_map_hdr_backbuffer_to_sdr(swapchain, frame_index);
-    // 异步交叠（async upscale）：Present 前完成挂起的 FFX——等待输出就绪并
-    // 拷贝回游戏目标。FFX 与游戏本帧后续渲染已在 GPU 上并行（消除每帧硬停）。
-    // 无挂起时零开销（单锁内布尔检查）。
-    if (ffx12::async_upscale_enabled())
-        ffx12::finish_pending();
     return g_original_present(swapchain, sync_interval, flags);
 }
 
@@ -8346,22 +7232,6 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
     g_original_dispatch(context, group_x, group_y, group_z);
 }
 
-struct TargetUpscalerDrawInfo
-{
-    std::uint32_t render_width = 0;
-    std::uint32_t render_height = 0;
-    std::uint32_t output_width = 0;
-    std::uint32_t output_height = 0;
-    std::uint64_t constant_buffer_key = 0;
-    std::uint64_t color_resource_key = 0;
-    std::uint64_t motion_resource_key = 0;
-    std::uint32_t color_srv_slot = 0;
-    std::uint32_t depth_srv_slot = 2;
-    std::uint32_t motion_srv_slot = 3;
-    std::uint32_t transparency_srv_slot = UINT_MAX;
-    std::uint32_t output_rtv_slot = 1;
-};
-
 // 接管路径指纹缓存（正缓存）：缓存"识别成功"的资源特征指纹 → 布局。
 // 键 = 特征值（尺寸/格式/槽位组合，非指针）——UI 切换/视图地址复用无关。
 // 命中：按缓存布局读少量视图验证指纹 → 直接构造 info（省 9 视图完整读取）。
@@ -8508,180 +7378,6 @@ void register_cb0_for_jitter(ID3D11Buffer *constant_buffer)
     }
 }
 
-DXGI_FORMAT resource_view_or_format(const ResourceInfo &info)
-{
-    return info.view_format != DXGI_FORMAT_UNKNOWN ? info.view_format : info.format;
-}
-
-bool fsr_feature_depth(const ResourceInfo &info)
-{
-    switch (resource_view_or_format(info))
-    {
-    case DXGI_FORMAT_D32_FLOAT:
-    case DXGI_FORMAT_D24_UNORM_S8_UINT:
-    case DXGI_FORMAT_R32_FLOAT:
-    case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-        return true;
-    default:
-        return info.format == DXGI_FORMAT_R32G8X24_TYPELESS;
-    }
-}
-
-bool fsr_feature_color(const ResourceInfo &info)
-{
-    switch (resource_view_or_format(info))
-    {
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-    case DXGI_FORMAT_R11G11B10_FLOAT:
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-    case DXGI_FORMAT_R8G8B8A8_UNORM:
-    case DXGI_FORMAT_B8G8R8A8_UNORM:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool fsr_feature_motion(const ResourceInfo &info)
-{
-    switch (resource_view_or_format(info))
-    {
-    case DXGI_FORMAT_R16G16_FLOAT:
-    case DXGI_FORMAT_R16G16_SNORM:
-    case DXGI_FORMAT_R16G16_UNORM:
-    case DXGI_FORMAT_R32G32_FLOAT:
-    case DXGI_FORMAT_R8G8_SNORM:
-    case DXGI_FORMAT_R8G8_UNORM:
-    case DXGI_FORMAT_R10G10B10A2_UNORM: // Genshin's square-encoded MV surface
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
-        return true;
-    default:
-        return false;
-    }
-}
-
-bool fsr_feature_transparency(const ResourceInfo &info)
-{
-    switch (resource_view_or_format(info))
-    {
-    case DXGI_FORMAT_R8_TYPELESS:
-    case DXGI_FORMAT_R8_UNORM:
-        return true;
-    default:
-        return false;
-    }
-}
-
-template <std::size_t SrvCount, std::size_t RtvCount>
-std::optional<TargetUpscalerDrawInfo> identify_target_upscaler_resources(
-    const std::array<ResourceInfo, SrvCount> &srvs,
-    const std::array<ResourceInfo, RtvCount> &rtvs,
-    std::uint32_t viewport_width, std::uint32_t viewport_height,
-    std::uint32_t cb0_bytes, std::uint64_t cb0_key)
-{
-    if (cb0_bytes < 464 || viewport_width == 0 || viewport_height == 0)
-        return std::nullopt;
-
-    int output_slot = -1;
-    int output_score = -1;
-    for (std::size_t i = 0; i < RtvCount; ++i)
-    {
-        const ResourceInfo &candidate = rtvs[i];
-        if (candidate.resource_key == 0 || candidate.width != viewport_width ||
-            candidate.height != viewport_height || !fsr_feature_color(candidate))
-            continue;
-        int score = 1;
-        const DXGI_FORMAT format = resource_view_or_format(candidate);
-        if (format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R11G11B10_FLOAT ||
-            format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-            score += 4;
-        if (score > output_score)
-        {
-            output_slot = static_cast<int>(i);
-            output_score = score;
-        }
-    }
-    if (output_slot < 0)
-        return std::nullopt;
-    const ResourceInfo &output = rtvs[output_slot];
-
-    int weight_count = 0;
-    int history_count = 0;
-    for (const ResourceInfo &srv : srvs)
-    {
-        weight_count += srv.resource_key != 0 && srv.width == 16 && srv.height == 16 ? 1 : 0;
-        history_count += srv.resource_key != 0 && srv.width == output.width && srv.height == output.height ? 1 : 0;
-    }
-    if (weight_count == 0 || history_count < 2)
-        return std::nullopt;
-
-    int depth_slot = -1;
-    for (std::size_t i = 0; i < SrvCount; ++i)
-    {
-        if (srvs[i].resource_key != 0 && fsr_feature_depth(srvs[i]))
-        {
-            depth_slot = static_cast<int>(i);
-            break;
-        }
-    }
-    if (depth_slot < 0)
-        return std::nullopt;
-    const ResourceInfo &depth = srvs[depth_slot];
-
-    int color_slot = -1, motion_slot = -1, transparency_slot = -1;
-    int color_score = -1, motion_score = -1, transparency_score = -1;
-    for (std::size_t i = 0; i < SrvCount; ++i)
-    {
-        const ResourceInfo &candidate = srvs[i];
-        if (candidate.resource_key == 0 || candidate.width != depth.width ||
-            candidate.height != depth.height || static_cast<int>(i) == depth_slot ||
-            (candidate.width == 16 && candidate.height == 16))
-            continue;
-        if (fsr_feature_color(candidate))
-        {
-            int score = 1;
-            const DXGI_FORMAT format = resource_view_or_format(candidate);
-            if (format == DXGI_FORMAT_R11G11B10_FLOAT || format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-                score += 4;
-            if (i == 0) score += 2; // known layout is only a tie-breaker, never a requirement
-            if (score > color_score) { color_score = score; color_slot = static_cast<int>(i); }
-        }
-        if (fsr_feature_motion(candidate))
-        {
-            int score = 1;
-            const DXGI_FORMAT format = resource_view_or_format(candidate);
-            if (format == DXGI_FORMAT_R16G16_FLOAT || format == DXGI_FORMAT_R16G16_SNORM ||
-                format == DXGI_FORMAT_R32G32_FLOAT) score += 4;
-            if (i == 3) score += 2; // tie-breaker for the observed game layout
-            if (score > motion_score) { motion_score = score; motion_slot = static_cast<int>(i); }
-        }
-        if (fsr_feature_transparency(candidate))
-        {
-            int score = 1;
-            if (i == 4) score += 2; // observed layout only breaks ties
-            if (score > transparency_score)
-            {
-                transparency_score = score;
-                transparency_slot = static_cast<int>(i);
-            }
-        }
-    }
-    if (color_slot < 0 || motion_slot < 0 || color_slot == motion_slot)
-        return std::nullopt;
-    const ResourceInfo &color = srvs[color_slot];
-    if (color.width > output.width || color.height > output.height)
-        return std::nullopt;
-
-    return TargetUpscalerDrawInfo {
-        color.width, color.height, output.width, output.height, cb0_key,
-        color.resource_key, srvs[motion_slot].resource_key,
-        static_cast<std::uint32_t>(color_slot), static_cast<std::uint32_t>(depth_slot),
-        static_cast<std::uint32_t>(motion_slot),
-        transparency_slot >= 0 ? static_cast<std::uint32_t>(transparency_slot) : UINT_MAX,
-        static_cast<std::uint32_t>(output_slot)};
-}
-
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_count)
 {
     if (element_count != 3)
@@ -8699,9 +7395,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
     if (g_state.current_ps_hash == 0)
         return std::nullopt;
 
-    const auto identified = identify_target_upscaler_resources(
-        g_state.ps_srvs, g_state.rtvs, g_state.viewport_width, g_state.viewport_height,
-        g_state.ps_cbs[0].byte_width, g_state.ps_cbs[0].resource_key);
+    const auto identified = identify_feature_candidate(g_state.ps_srvs, g_state.rtvs, {
+        g_state.viewport_width, g_state.viewport_height, g_state.ps_cbs[0].byte_width, g_state.ps_cbs[0].resource_key});
     if (!identified)
         return std::nullopt;
 
@@ -8750,6 +7445,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(UINT element_
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     ID3D11DeviceContext *context,
     UINT element_count,
+    std::optional<neo::graphics::FrameBindings> &bindings,
     const perf_probe::DrawShapeMarkArmed &draw_shape_mark = perf_probe::DrawShapeMarkArmed {})
 {
     // 【诊断】B106 漏斗（默认关，跟 `PerfProbe` 总开关）：给这条函数的**每一道判定**
@@ -8781,7 +7477,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     //
     //   ⚠️ **等价性（代码级，必须说清）**：`element_count` 在本函数体内**一次都没被读**
     //      （它只是形参；下面两套签名 `fixed_slot_identify` /
-    //      `identify_target_upscaler_resources` 都**不检查**它，函数上方注释也明说
+    //      `identify_feature_candidate` 都**不检查**它，函数上方注释也明说
     //      "不硬性要求 3"）⇒ 一次绘制的识别结果**只取决于当时的 D3D 状态**
     //      （RTV/SRV/cb0/视口/正缓存），与它的元素数**无因果关系**。
     //      ⇒ 本条判据**不是**代码级等价：它拒掉的调用在**代码上不排除**"状态恰好也匹配"
@@ -8844,8 +7540,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         LOG_DEBUG(blog::cat::upscale, "fsr2_on_demand_identify_fail " + detail);
     };
 
-    std::array<ID3D11RenderTargetView *, 2> render_targets {};
-    context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
+    auto &frame = bindings.emplace(*context);
+    const auto render_targets = frame.targets();
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_om);
 #endif
@@ -8879,11 +7575,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
             fail_log(std::string("stage=prescreen rtv0=") + (render_targets[0] != nullptr ? "1" : "0") +
                 " rtv1=" + (render_targets[1] != nullptr ? "1" : "0"));
         }
-        for (ID3D11RenderTargetView *render_target : render_targets)
-        {
-            if (render_target != nullptr)
-                render_target->Release();
-        }
         return std::nullopt;
     }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -8909,8 +7600,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
             {
                 if (lowres_diag_count.fetch_add(1, std::memory_order_relaxed) < 12)
                 {
-                    std::array<ID3D11ShaderResourceView *, 7> diag_srvs {};
-                    context->PSGetShaderResources(0, static_cast<UINT>(diag_srvs.size()), diag_srvs.data());
+                    const auto diag_srvs = frame.inputs();
                     std::ostringstream diag;
                     diag << "fsr2_on_demand_lowres rtv0=" << rtv0_info.width << "x" << rtv0_info.height
                          << "f" << static_cast<std::uint32_t>(rtv0_info.format)
@@ -8923,8 +7613,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
                         diag << i << ":" << (info.resource_key
                             ? (std::to_string(info.width) + "x" + std::to_string(info.height) + "f" + std::to_string(static_cast<std::uint32_t>(info.format)))
                             : "0") << " ";
-                        if (diag_srvs[i] != nullptr)
-                            diag_srvs[i]->Release();
                     }
                     LOG_INFO(blog::cat::upscale, diag.str());
                 }
@@ -8946,31 +7634,13 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     };
     stage_log("identify_begin dual_rtv=1");
 
-    std::array<ID3D11ShaderResourceView *, 7> shader_resources {};
-    ID3D11Buffer *constant_buffer = nullptr;
-    context->PSGetShaderResources(0, static_cast<UINT>(shader_resources.size()), shader_resources.data());
-    context->PSGetConstantBuffers(0, 1, &constant_buffer);
+    const auto shader_resources = frame.inputs();
+    Microsoft::WRL::ComPtr<ID3D11Buffer> cb0;
+    context->PSGetConstantBuffers(0, 1, cb0.GetAddressOf());
+    ID3D11Buffer *const constant_buffer = cb0.Get();
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_ps_query);
 #endif
-
-    // 统一的释放（B106：下面新增了两条早退路径 ⇒ 用一处 lambda 消灭"失败返回漏 Release"
-    // 这一类错）。释放对象与顺序与旧实现**逐条一致**（SRV → RTV → cb）。
-    const auto release_bound_views = [&]()
-    {
-        for (ID3D11ShaderResourceView *view : shader_resources)
-        {
-            if (view != nullptr)
-                view->Release();
-        }
-        for (ID3D11RenderTargetView *render_target : render_targets)
-        {
-            if (render_target != nullptr)
-                render_target->Release();
-        }
-        if (constant_buffer != nullptr)
-            constant_buffer->Release();
-    };
 
     // 快速路径：正缓存命中直接构造接管（省 9 视图完整读取——只读 RTV[0] + 布局 3 SRV 验证指纹）
     //
@@ -9000,7 +7670,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         perf_probe::note_identified_total();
 #endif
         register_cb0_for_jitter(constant_buffer);
-        release_bound_views();
         return fast_info;
     }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -9011,7 +7680,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     //
     // 等价性（逐条对照代码）：
     //   - 第一签名 `fixed_slot_identify`：`constant_buffer_description.ByteWidth < 464` ⇒ 直接拒绝；
-    //   - 第二签名 `identify_target_upscaler_resources`：首行
+    //   - 第二签名 `identify_feature_candidate`：首行
     //     `if (cb0_bytes < 464 || viewport_width == 0 || viewport_height == 0) return std::nullopt;`
     //     （调用处传的正是 `constant_buffer_description.ByteWidth`）；
     //   - `constant_buffer == nullptr` ⇒ desc 保持零初始化 ⇒ ByteWidth = 0 < 464 ⇒ 同上被拒。
@@ -9020,9 +7689,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     D3D11_BUFFER_DESC constant_buffer_description {};
     if (constant_buffer != nullptr)
         constant_buffer->GetDesc(&constant_buffer_description);
-    if (constant_buffer_description.ByteWidth < 464)
+    if (constant_buffer_description.ByteWidth < k_min_fsr_constants)
     {
-        release_bound_views();
         return std::nullopt;
     }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -9053,7 +7721,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     const bool viewport_usable = viewport_count != 0 && viewport.Width != 0 && viewport.Height != 0;
     if (!viewport_usable)
     {
-        release_bound_views();
         return std::nullopt;
     }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -9069,7 +7736,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         (rtv_matches_viewport(outputs[0]) && fsr_feature_color(outputs[0]));
     if (!output_candidate)
     {
-        release_bound_views();
         return std::nullopt;
     }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -9083,80 +7749,36 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     const std::uint64_t constant_buffer_key =
         reinterpret_cast<std::uint64_t>(constant_buffer);
 
-    // 与旧实现一致：签名判据只用副本（inputs/outputs）⇒ 读完即可释放。
-    release_bound_views();
-
-    // 第一签名：固定槽位（1.1.5/1.2.3 兼容——国际服实测匹配 render=2304x1296
-    // output=3840x2160）。inputs[0..6]/outputs[0..1] 固定布局，无格式过滤。
-    const auto fixed_slot_identify = [&]() -> std::optional<TargetUpscalerDrawInfo> {
-        const ResourceInfo &color = inputs[0];
-        const ResourceInfo &weights = inputs[1];
-        const ResourceInfo &depth = inputs[2];
-        const ResourceInfo &motion = inputs[3];
-        const ResourceInfo &flags = inputs[4];
-        const ResourceInfo &history_metadata = inputs[5];
-        const ResourceInfo &history_color = inputs[6];
-        const ResourceInfo &output_metadata = outputs[0];
-        const ResourceInfo &output_color = outputs[1];
-        const bool resources_present = color.resource_key != 0 && weights.resource_key != 0 &&
-            depth.resource_key != 0 && motion.resource_key != 0 && flags.resource_key != 0 &&
-            history_metadata.resource_key != 0 && history_color.resource_key != 0 &&
-            output_metadata.resource_key != 0 && output_color.resource_key != 0;
-        const bool input_dimensions_match = depth.width == color.width && depth.height == color.height &&
-            motion.width == color.width && motion.height == color.height &&
-            flags.width == color.width && flags.height == color.height;
-        const bool output_dimensions_match =
-            output_metadata.width == output_color.width && output_metadata.height == output_color.height &&
-            history_metadata.width == output_color.width && history_metadata.height == output_color.height &&
-            history_color.width == output_color.width && history_color.height == output_color.height &&
-            viewport_count != 0 && static_cast<std::uint32_t>(viewport.Width) == output_color.width &&
-            static_cast<std::uint32_t>(viewport.Height) == output_color.height;
-        if (!resources_present || !input_dimensions_match || !output_dimensions_match ||
-            weights.width != 16 || weights.height != 16 ||
-            color.width > output_color.width || color.height > output_color.height ||
-            constant_buffer_description.ByteWidth < 464)
-        {
-            // 只记录 4K TAAU 输出（output=3840x2160——1.1.5 识别的国际服 TAAU 特征）
-            if (output_color.width == 3840 || output_color.height == 2160)
-            {
-                static std::atomic_uint32_t fixed_slot_diag_count { 0 };
-                if (fixed_slot_diag_count.fetch_add(1, std::memory_order_relaxed) < 12)
-                {
-                    std::ostringstream diag;
-                    diag << "fsr2_fixed_slot_fail"
-                         << " res=" << (resources_present ? 1 : 0)
-                         << " in_dim=" << (input_dimensions_match ? 1 : 0)
-                         << " out_dim=" << (output_dimensions_match ? 1 : 0)
-                         << " w=" << weights.width << "x" << weights.height
-                         << " color=" << color.width << "x" << color.height
-                         << " out=" << output_color.width << "x" << output_color.height
-                         << " outm=" << output_metadata.width << "x" << output_metadata.height
-                         << " hm=" << history_metadata.width << "x" << history_metadata.height
-                         << " hc=" << history_color.width << "x" << history_color.height
-                         << " vp=" << (viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0)
-                         << "x" << (viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0)
-                         << " cb0=" << constant_buffer_description.ByteWidth;
-                    LOG_INFO(blog::cat::upscale, diag.str());
-                }
-            }
-            return std::nullopt;
-        }
-        TargetUpscalerDrawInfo info;
-        info.render_width = color.width;
-        info.render_height = color.height;
-        info.output_width = output_color.width;
-        info.output_height = output_color.height;
-        info.constant_buffer_key = constant_buffer_key;
-        info.color_resource_key = color.resource_key;
-        info.motion_resource_key = motion.resource_key;
-        info.color_srv_slot = 0;
-        info.depth_srv_slot = 2;
-        info.motion_srv_slot = 3;
-        info.output_rtv_slot = 1;
-        return info;
+    const neo::graphics::CandidateGeometry geometry {
+        viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0,
+        viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
+        constant_buffer_description.ByteWidth, constant_buffer_key,
     };
-
-    std::optional<TargetUpscalerDrawInfo> identified = fixed_slot_identify();
+    neo::graphics::StandardEvidence standard {};
+    auto identified = neo::graphics::identify_standard_candidate(inputs, outputs, geometry, standard);
+    const auto &[output_metadata, output_color] = outputs;
+    if (!identified && (output_color.width == 3840 || output_color.height == 2160))
+    {
+        // 固定布局不检查格式；保留国际服旧布局失配时的原始几何证据。
+        static std::atomic_uint32_t fixed_slot_diag_count { 0 };
+        if (fixed_slot_diag_count.fetch_add(1, std::memory_order_relaxed) < 12)
+        {
+            std::ostringstream diag;
+            diag << "fsr2_fixed_slot_fail"
+                 << " res=" << (standard.resources_present ? 1 : 0)
+                 << " in_dim=" << (standard.input_sizes_match ? 1 : 0)
+                 << " out_dim=" << (standard.target_sizes_match ? 1 : 0)
+                 << " w=" << inputs[1].width << "x" << inputs[1].height
+                 << " color=" << inputs[0].width << "x" << inputs[0].height
+                 << " out=" << output_color.width << "x" << output_color.height
+                 << " outm=" << output_metadata.width << "x" << output_metadata.height
+                 << " hm=" << inputs[5].width << "x" << inputs[5].height
+                 << " hc=" << inputs[6].width << "x" << inputs[6].height
+                 << " vp=" << geometry.viewport_width << "x" << geometry.viewport_height
+                 << " cb0=" << geometry.cb0_bytes;
+            LOG_INFO(blog::cat::upscale, diag.str());
+        }
+    }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (identified)
         perf_funnel.mark(perf_probe::FunnelStage::fixed_ok);
@@ -9164,11 +7786,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     if (!identified)
     {
         // 第二签名：动态槽位评分（国服技能等不同 shader 的 TAAU 路径）
-        identified = identify_target_upscaler_resources(
-            inputs, outputs,
-            viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0,
-            viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
-            constant_buffer_description.ByteWidth, constant_buffer_key);
+        identified = identify_feature_candidate(inputs, outputs, geometry);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         if (identified)
             perf_funnel.mark(perf_probe::FunnelStage::dynamic_ok);
@@ -9256,11 +7874,12 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
 std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
     ID3D11DeviceContext *context,
     UINT element_count,
-    const perf_probe::DrawShapeMarkArmed &draw_shape_mark = perf_probe::DrawShapeMarkArmed {})
+    std::optional<neo::graphics::FrameBindings> &bindings,
+    const perf_probe::DrawShapeMarkArmed &draw_shape_mark)
 {
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
-        return inspect_target_upscaler_draw_on_demand(context, element_count, draw_shape_mark);
+        return inspect_target_upscaler_draw_on_demand(context, element_count, bindings, draw_shape_mark);
 #endif
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     const std::uint64_t fast_target_hash = g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed);
@@ -9272,12 +7891,12 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
             return std::nullopt;
         }
 
-        std::array<ID3D11ShaderResourceView *, 7> shader_resources {};
-        std::array<ID3D11RenderTargetView *, 2> render_targets {};
-        ID3D11Buffer *constant_buffer = nullptr;
-        context->PSGetShaderResources(0, static_cast<UINT>(shader_resources.size()), shader_resources.data());
-        context->OMGetRenderTargets(static_cast<UINT>(render_targets.size()), render_targets.data(), nullptr);
-        context->PSGetConstantBuffers(0, 1, &constant_buffer);
+        auto &frame = bindings.emplace(*context);
+        const auto shader_resources = frame.inputs();
+        const auto render_targets = frame.targets();
+        Microsoft::WRL::ComPtr<ID3D11Buffer> cb0;
+        context->PSGetConstantBuffers(0, 1, cb0.GetAddressOf());
+        ID3D11Buffer *const constant_buffer = cb0.Get();
 
         D3D11_VIEWPORT viewport {};
         UINT viewport_count = 1;
@@ -9296,24 +7915,10 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
         const std::uint64_t constant_buffer_key =
             reinterpret_cast<std::uint64_t>(constant_buffer);
 
-        for (ID3D11ShaderResourceView *view : shader_resources)
-        {
-            if (view != nullptr)
-                view->Release();
-        }
-        for (ID3D11RenderTargetView *render_target : render_targets)
-        {
-            if (render_target != nullptr)
-                render_target->Release();
-        }
-        if (constant_buffer != nullptr)
-            constant_buffer->Release();
-
-        const auto identified = identify_target_upscaler_resources(
-            inputs, outputs,
+        const auto identified = identify_feature_candidate(inputs, outputs, {
             viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Width) : 0,
             viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
-            constant_buffer_description.ByteWidth, constant_buffer_key);
+            constant_buffer_description.ByteWidth, constant_buffer_key});
         if (!identified)
             return std::nullopt;
 
@@ -11037,12 +9642,9 @@ void probe_native_params_once(
 }
 #endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
 
-template <typename DrawCall>
-bool try_fsr2_translation_draw(
-    ID3D11DeviceContext *context,
-    UINT element_count,
+bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
     const std::optional<TargetUpscalerDrawInfo> &inspected_draw_info,
-    DrawCall &&draw_call)
+    std::optional<neo::graphics::FrameBindings> &bindings)
 {
     const std::uint32_t translation_mode = g_config.fsr2_translation_mode;
     if (translation_mode == 0 || context == nullptr)
@@ -11060,8 +9662,7 @@ bool try_fsr2_translation_draw(
     if (g_fsr2_dx11on12_block_logged.load(std::memory_order_relaxed))
         g_fsr2_dx11on12_block_logged.store(false, std::memory_order_relaxed);
 
-    // 两个调用点（hooked_draw / hooked_draw_indexed）都已在本帧对该 draw inspect
-    // 过一次并传入结果；这里不再回退重查，避免按需查询模式下的重复内省。
+    // 调度器已经读取本次 draw 的唯一候选；不回退重查，避免按需路径重复读 D3D 状态。
     const std::optional<TargetUpscalerDrawInfo> &draw_info = inspected_draw_info;
     if (!draw_info)
         return false;
@@ -11099,31 +9700,12 @@ bool try_fsr2_translation_draw(
         struct Sdk234InstState
         {
             std::uint64_t instance = 0;
-            std::uint64_t last_gen = 0;           // 已消费代次
-            // 仅诊断：Render generation 与游戏 frame_index 不是同一概念。若同一
-            // frame_index 被多个新 generation 推进 SDK history，记录事实但不改变
-            // dispatch 行为，避免在未证实前把正常多视图渲染误判为重复帧。
-            std::uint32_t last_dispatched_frame = 0;
-            std::uint64_t last_dispatched_frame_gen = 0;
-            std::uint64_t duplicate_frame_count = 0;
-            std::uint64_t last_dispatch_tick = 0; // 接管空窗检测
-            std::uint64_t last_frame_tick = 0;    // 帧间隔测量
-            // 帧时间步：高精度 + 游戏帧号门控——
-            // 同帧多次 dispatch（alternate 双缓冲/多视图）共享同一时间步；
-            // 不同帧间 dt = QPC 实测真实帧间隔。
-            std::uint64_t last_frame_index = 0;
-            std::uint64_t last_dispatch_us = 0;
+            neo::graphics::FrameTimeline timeline;
+            neo::graphics::OutputHistory output_history;
             std::uint64_t last_gap_log_tick = 0;
-            std::uint64_t out_a = 0, out_b = 0;   // 该实例写过的输出（双缓冲）
-            std::uint64_t out_a_tick = 0, out_b_tick = 0; // 各输出上次派发时间（每输出 gate）
-            ID3D11Texture2D *last_sdk_output = nullptr; // 当前 Render generation 的首个 SDK 输出（持有引用）
-            std::uint64_t last_sdk_output_gen = 0;
-            std::uint64_t last_repair_gen = 0; // 每个 canonical generation 至多修复一次 alternate
-            // direct-only 故障恢复：失败 token 绝不能在 TTL 内反复推进或复用旧输出；
-            // 下一枚有效 token 必须以 reset 重新建立 history。
-            bool reset_next = false;
-            std::uint64_t invalidated_gen = 0;
-            std::uint64_t invalidation_count = 0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+            std::uint64_t duplicate_frame_count = 0;
+#endif
             float prev_jx = 0.0f, prev_jy = 0.0f; // jdelay 上一帧 jitter
             // 2026-08-25（AA 修复）：cb0 jitter 槽位自适应——不同视图/着色器变体的 jitter
             // 可能在不同槽位（[28].xy / [27].zw / [26].zw，probe 实证布局）。探测两帧后
@@ -11198,7 +9780,10 @@ bool try_fsr2_translation_draw(
             bool jit_last_valid = false;
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（去向计数 + 输入/输出键 + 抖动新鲜度 —— 只喂日志）
         };
-        static Sdk234InstState sdk234_insts[8] {};
+        // 后端在进程退出时不调用驱动析构；引用在失效、交棒和复用槽时正常归还。
+        // 让 OS 回收最后这组状态，避免静态 ComPtr 析构在 loader lock 内调用图形运行时。
+        using InstanceSlots = std::array<Sdk234InstState, il2cpp_callsite::k_render_instance_capacity>;
+        static auto &sdk234_insts = *new InstanceSlots {};
         static std::size_t sdk234_inst_count = 0;
         static std::uint64_t sdk234_inst_seq = 0;
         // P1：**当前接管者**（每轮裁决都会刷新；未裁决时保持上一次的值）。
@@ -11233,367 +9818,66 @@ bool try_fsr2_translation_draw(
         auto p1_release_instance_state = [](Sdk234InstState &state, std::uint64_t now) -> std::uint64_t
         {
             const std::uint64_t dispatch_age =
-                state.last_dispatch_tick != 0 ? now - state.last_dispatch_tick : 0;
-            state.out_a = state.out_b = 0;
-            state.out_a_tick = state.out_b_tick = 0;
-            if (state.last_sdk_output != nullptr)
-            {
-                state.last_sdk_output->Release();
-                state.last_sdk_output = nullptr;
-            }
-            state.last_sdk_output_gen = 0;
-            state.last_repair_gen = 0;
-            state.reset_next = true;
-            state.last_dispatch_tick = 0;
-            state.last_frame_tick = 0;
-            state.last_dispatch_us = 0;
-            state.last_frame_index = 0;
-            state.last_dispatched_frame = 0;
-            state.last_dispatched_frame_gen = 0;
+                state.timeline.last_write_tick() != 0 ? now - state.timeline.last_write_tick() : 0;
+            state.output_history.forget_instance();
+            state.timeline.relinquish();
             state.dbg_color = 0;
             state.dbg_depth = 0;
             return dispatch_age;
         };
 
-        // 1) 当前 draw 的输出指针（draw→实例 输出关联；与 cover-skip 同源同值）
-        ID3D11RenderTargetView *bind_rtvs[4] {};
-        ID3D11DepthStencilView *bind_dsv = nullptr;
-        context->OMGetRenderTargets(4, bind_rtvs, &bind_dsv);
-        ID3D11Resource *draw_out_res = nullptr;
-        const UINT draw_output_slot = draw_info->output_rtv_slot;
-        if (draw_output_slot < std::size(bind_rtvs) && bind_rtvs[draw_output_slot] != nullptr)
-            bind_rtvs[draw_output_slot]->GetResource(&draw_out_res);
-        for (int i = 0; i < 4; ++i)
-            if (bind_rtvs[i] != nullptr)
-                bind_rtvs[i]->Release();
-        if (bind_dsv != nullptr)
-            bind_dsv->Release();
-        const std::uint64_t draw_out_ptr = reinterpret_cast<std::uint64_t>(draw_out_res);
-        if (draw_out_res != nullptr)
-            draw_out_res->Release();
-
-        // 1b) 当前 draw 的**采样来源**（color SRV 上的资源指针）—— 【本批 2026-09-29 新增】
-        // 为什么必须有它（**左右 1:1 分屏实机定案**，B123 的 `ffx12_accum_dest` 直接给出）：
-        //   两路 render 尺寸相同时，(instance,render_w,render_h) 与"token 代次最新"都分不出
-        //   这个 draw 属于哪一路 ⇒ 实测接管者 seen=17561 / disp=2393（13.6%）/ pass_refuse=15119
-        //   （86%）⇒ 那半屏在 FSR4 与游戏原生之间来回切 = 用户看到的**可见抖动**。
-        //   而"采样来源"是每一路视图自己的 G-buffer（实机 56 秒内同一路 111 行读数完全一致）
-        //   ⇒ 它是**与输出归属并列**的一等归属证据，同时用于两处：
-        //     ① draw→实例 归属（下面第 2 步：优先认给"来源命中"的实例）；
-        //     ② "多义拒绝"的豁免（本 draw 采的就是我们自己的 ⇒ 不是猜测，是真帧）。
-        // 成本：每个**被识别出的**累积 draw 一次 `PSGetShaderResources(1)` + 1 次 GetResource
-        //   （实机量级 ~620 次/秒；同一路径里的 OMGetRenderTargets(4) + 识别本身都比它重）。
-        //   ⚠️ 与派发时记录 `acc_in_color` 的口径**同一来源**（都用 color_srv_slot）⇒ 可比。
-        std::uint64_t claim_color_ptr = 0;
-        {
-            ID3D11ShaderResourceView *claim_srv = nullptr;
-            context->PSGetShaderResources(draw_info->color_srv_slot, 1, &claim_srv);
-            if (claim_srv != nullptr)
-            {
-                ID3D11Resource *claim_res = nullptr;
-                if ((claim_srv->GetResource(&claim_res), claim_res != nullptr))
-                {
-                    claim_color_ptr = reinterpret_cast<std::uint64_t>(claim_res);
-                    claim_res->Release();
-                }
-                claim_srv->Release();
-            }
-        }
+        // 镜像识别只有布局；按需识别已经持有同一次 Draw 的视图。两者都用真实资源作归属证据。
+        using FrameBindings = neo::graphics::FrameBindings;
+        auto &frame = bindings ? *bindings : bindings.emplace(*context, FrameBindings::Extent::legacy);
+        const auto bound_output = frame.target_resource(draw_info->output_rtv_slot);
+        const auto bound_color = frame.input_resource(draw_info->color_srv_slot);
+        const auto draw_out_ptr = reinterpret_cast<std::uint64_t>(bound_output.Get());
+        const auto claim_color_ptr = reinterpret_cast<std::uint64_t>(bound_color.Get());
 
         // 2) draw→实例 匹配
-        il2cpp_callsite::CapturedParams call_params {};
-        std::uint64_t call_gen = 0;
-        std::uint64_t match_inst = 0;
-        // A draw may legitimately use the alternate FSR output buffer without
-        // entering Render again.  Keep this association separate from a fresh
-        // token: it is only eligible for a bounded canonical-output repair,
-        // never for another temporal dispatch.
-        std::uint64_t output_associated_inst = 0;
-        bool output_association_ambiguous = false;
-        // 诊断：本 draw 是**怎么**被认领的（0=无 1=输出关联 2=bootstrap 仅 token 3=输出关联兜底）。
-        // 用途：两路视图 render 尺寸相同时，(instance,render_w,render_h) 过滤器**无法区分**
-        // 视图归属 —— 若接管者的 draw 实际只靠 token bootstrap 认领（2），那一帧就可能
-        // 把"另一路视图"的帧喂进接管者的 FSR 历史（跟随剪影的短暂覆盖层）。日志可定案。
-        std::uint32_t match_path = 0;
-        std::uint32_t match_token_candidates = 0; // bootstrap 时"仍有未消费 token 且**当前活跃**"的实例数
-        std::uint32_t match_token_ghosts = 0;     // 诊断：有未消费 token 但**已经不再画**的实例数
-        // ---- P1 活性判据（**非粘性**）：某个实例**当前**是否真在画目标累积 draw ----
-        // 纯函数 `fsr2_family_takeover::p1_other_instance_currently_live`（可离线单测）定义口径；
-        // 下面建一张查询表，供本次匹配（token 候选计数）与后续所有"多实例/多义"判据（拒绝认领、
-        // 放行无归属 draw）**共用同一个**活性语义 —— 避免出现"裁决说只有一个活跃实例、认领判据
-        // 却认为有两个"的自相矛盾。
-        //
-        // 活性 = 该实例在最近 k_p1_live_ms 内被本函数匹配到过（确实还在画）。
-        // 反例（幽灵实例）：曾经画过、但早已沉默，却仍被游戏调用 Render（FSR2 上下文尚未销毁）
-        // ⇒ 每帧都有一枚新鲜的 250ms token、却**不再产画面**。它**不得**参与任何"多义/多实例"
-        // 裁决，否则单视图场景里接管者会被永久拒绝（实机回归 2026-09-28：
-        // `ffx12_ambiguous_bootstrap` 每帧命中一次、涨到 5376，而另一路的 :g 代次已冻住 54 秒
-        // ⇒ 桥超分隔帧推进 ⇒ 静止边缘抖动/锯齿）。
+        const auto render = il2cpp_callsite::snapshot_render_tokens(draw_info->render_width, draw_info->render_height);
         constexpr std::uint64_t k_p1_live_ms = 200;
-        std::uint64_t p1_liveness_inst[8] {};
-        std::uint64_t p1_liveness_seen[8] {};
-        std::uint32_t p1_liveness_n = 0;
+        std::array<neo::graphics::FrameEvidence, il2cpp_callsite::k_render_instance_capacity> evidence {};
+        std::array<std::uint64_t, il2cpp_callsite::k_render_instance_capacity> live_instances {};
+        std::size_t live_count = 0;
+        bool saw_dormant_instance = false;
+        for (std::size_t i = 0; i < render.count; ++i)
         {
-            std::uint64_t all_insts[8] {};
-            std::size_t all_n = 0;
-            il2cpp_callsite::known_instances(all_insts, 8, all_n);
-            const std::uint64_t live_now = GetTickCount64();
-            for (std::size_t k = 0; k < all_n && p1_liveness_n < 8; ++k)
-            {
-                if (all_insts[k] == 0)
-                    continue;
-                std::uint64_t seen = 0;
-                for (std::size_t j = 0; j < sdk234_inst_count; ++j)
-                {
-                    if (sdk234_insts[j].instance == all_insts[k])
-                    {
-                        seen = sdk234_insts[j].p1_last_seen_tick;
-                        break;
-                    }
-                }
-                if (seen != 0 && live_now >= seen && live_now - seen <= k_p1_live_ms)
-                {
-                    p1_liveness_inst[p1_liveness_n] = all_insts[k];
-                    p1_liveness_seen[p1_liveness_n] = seen;
-                    ++p1_liveness_n;
-                }
-            }
-        }
-        // 查询：inst 是否**当前活跃**（= 它确实还在画这一路的累积 draw）。
-        const auto p1_instance_is_live = [&](std::uint64_t inst) -> bool
-        {
-            for (std::uint32_t k = 0; k < p1_liveness_n; ++k)
-            {
-                if (p1_liveness_inst[k] == inst)
-                    return true;
-            }
-            return false;
-        };
-        // "除 inst 之外，**当前**是否还有另一个活跃实例" —— P1 多实例/多义判据的唯一入口。
-        const auto p1_other_instance_live = [&](std::uint64_t inst) -> bool
-        {
-            for (std::uint32_t k = 0; k < p1_liveness_n; ++k)
-            {
-                if (p1_liveness_inst[k] != inst)
-                    return true;
-            }
-            return false;
-        };
-        // 【本批 2026-09-29】按实例取状态槽（只读）：draw→实例 归属要看"它记过的采样来源/
-        // 输出"，而这一步发生在 `st`（本次认领的槽）解析之前 ⇒ 需要一个只读查表入口。
-        const auto p1_state_for = [&](std::uint64_t inst) -> const Sdk234InstState *
-        {
-            if (inst == 0)
-                return nullptr;
+            const auto &observed = render.entries[i];
+            const Sdk234InstState *state = nullptr;
             for (std::size_t j = 0; j < sdk234_inst_count; ++j)
             {
-                if (sdk234_insts[j].instance == inst)
-                    return &sdk234_insts[j];
+                if (sdk234_insts[j].instance != observed.instance) continue;
+                state = &sdk234_insts[j];
+                break;
             }
-            return nullptr;
+            // Token 证明 Render 已调用；只有最近的 Draw 认领才算仍在画。
+            const bool live = state &&
+                neo::graphics::recently_observed(state->p1_last_seen_tick, render.observed_tick, k_p1_live_ms);
+            if (live) live_instances[live_count++] = observed.instance;
+            else if (state && state->p1_last_seen_tick) saw_dormant_instance = true;
+            evidence[i] = { &observed, state ? state->acc_in_color : 0, state ? state->timeline.last_write_tick() : 0,
+                live, state && state->output_history.owns(draw_out_ptr) };
+        }
+        const auto p1_instance_is_live = [&](std::uint64_t inst)
+        {
+            return std::find(live_instances.begin(), live_instances.begin() + live_count, inst) !=
+                live_instances.begin() + live_count;
         };
-        // 诊断：是否存在"画过但早已沉默"的幽灵实例（不参与任何裁决，只用于验收探针）。
-        // 这里顺手把纯函数跑一遍（生产路径也覆盖它，避免实现漂移只在单测里被发现）。
-        bool p1_ghost_instance_present = false;
+        const auto p1_other_instance_live = [&](std::uint64_t inst)
         {
-            std::uint64_t all_insts[8] {};
-            std::size_t all_n = 0;
-            il2cpp_callsite::known_instances(all_insts, 8, all_n);
-            for (std::size_t k = 0; k < all_n; ++k)
-            {
-                if (all_insts[k] == 0 || p1_instance_is_live(all_insts[k]))
-                    continue;
-                // 它自己不在活性表里 ⇒ 用纯函数确认"确实没有别的活跃实例"（口径一致性）
-                const bool others_live =
-                    fsr2_family_takeover::p1_other_instance_currently_live(
-                        p1_liveness_inst, p1_liveness_seen, p1_liveness_n, all_insts[k],
-                        GetTickCount64(), k_p1_live_ms);
-                if (others_live)
-                    continue;
-                bool ever_matched = false;
-                for (std::size_t j = 0; j < sdk234_inst_count; ++j)
-                {
-                    if (sdk234_insts[j].instance == all_insts[k] &&
-                        sdk234_insts[j].p1_last_seen_tick != 0)
-                    {
-                        ever_matched = true;
-                        break;
-                    }
-                }
-                if (ever_matched)
-                    p1_ghost_instance_present = true;
-            }
-        }
-        {
-            std::uint64_t insts[8] {};
-            std::size_t inst_n = 0;
-            il2cpp_callsite::known_instances(insts, 8, inst_n);
-            // A) 输出关联只作为候选提示。候选必须仍有未消费的 Render
-            // token；旧实例虽然可能复用同一 output 指针，但没有 pending
-            // token 时绝不能再次认领当前 draw。
-            {
-                std::uint64_t best_gen = 0;
-                for (std::size_t i = 0; i < inst_n; ++i)
-                {
-                    bool out_match = false;
-                    for (std::size_t j = 0; j < sdk234_inst_count; ++j)
-                    {
-                        if (sdk234_insts[j].instance == insts[i] &&
-                            ((sdk234_insts[j].out_a != 0 && sdk234_insts[j].out_a == draw_out_ptr) ||
-                             (sdk234_insts[j].out_b != 0 && sdk234_insts[j].out_b == draw_out_ptr)))
-                        {
-                            out_match = true;
-                            break;
-                        }
-                    }
-                    if (!out_match)
-                        continue;
-                    if (output_associated_inst == 0)
-                    {
-                        output_associated_inst = insts[i];
-                    }
-                    else if (output_associated_inst != insts[i])
-                    {
-                        output_association_ambiguous = true;
-                    }
-                    il2cpp_callsite::RenderToken token {};
-                    if (!il2cpp_callsite::latest_pending_render_token_for(
-                            insts[i], draw_info->render_width, draw_info->render_height, token))
-                        continue;
-                    if (token.generation > best_gen)
-                    {
-                        best_gen = token.generation;
-                        match_inst = insts[i];
-                        call_gen = token.generation;
-                        call_params = token.params;
-                        match_path = 1; // 输出关联 + token 双重确认（最可靠）
-                    }
-                }
-            }
-            if (output_association_ambiguous)
-                output_associated_inst = 0;
-            // B) bootstrap：仅从尚未消费的 token 选取最新 Render。不能再
-            // 用每实例的 latest snapshot 猜测，否则切界面后旧实例会永久
-            // 把已消费 generation 认领为当前 draw。
-            if (match_inst == 0)
-            {
-                std::uint64_t best_gen = 0;
-                // 【本批 2026-09-29 · 分屏】两条**不依赖 token 代次**的备选（都只在读到
-                // 采样来源 `claim_color_ptr` 时才可能成立）：
-                //   `best_gen_src`  —— 本 draw 采样的 color **就是**该实例上次派发用的那张
-                //                     ⇒ 正面证据："这个 draw 是它的"（首选，与代次顺序无关）；
-                //   `best_gen_keep` —— 该实例**没有**采样来源记忆（例如从未派发过的另一路），
-                //                     或它的记忆可能已过期 ⇒ 不排除（次选，按代次最新）。
-                //   被**排除**的形态 = "记忆是新的、且确与本 draw 的来源不同" ⇒ 这个 draw
-                //   不是它的（实机：另一路的累积 draw 因"token 代次最新"被误认给接管者，
-                //   既让接管者的 `seen` 混进别人的 draw，也白占一次拒绝计数）。
-                std::uint64_t best_gen_src = 0, best_gen_keep = 0;
-                std::uint64_t pick_src_inst = 0, pick_keep_inst = 0;
-                il2cpp_callsite::RenderToken pick_src_token {}, pick_keep_token {};
-                std::uint64_t cand_now = 0;
-                bool cand_now_valid = false;
-                for (std::size_t i = 0; i < inst_n; ++i)
-                {
-                    il2cpp_callsite::RenderToken token {};
-                    if (!il2cpp_callsite::latest_pending_render_token_for(
-                            insts[i], draw_info->render_width, draw_info->render_height, token))
-                        continue;
-                    // 诊断/拒绝判据共用的"竞争性候选"计数：**必须**排除"有未消费 token、但早已
-                    // 不再画这个累积 draw"的实例（下称幽灵实例）。
-                    // ⚠️ 实机回归（2026-09-28，用户报告"普通场景超分大幅降低 + 静止抖动/锯齿"）：
-                    //   旧实现在这里只按"token 是否存在且未过期"计数 ⇒ 幽灵实例只要还在被游戏
-                    //   调用 Render（它的 FSR2 上下文仍未销毁，即使这一路早已不产画面），就会有
-                    //   一枚 250ms 内的新 token ⇒ 计数**长期恒为 2** ⇒ 下游"多义认领拒绝"永久
-                    //   命中 ⇒ 接管者**每一个**累积 draw 都被放行给游戏原生（实测每帧命中一次：
-                    //   `ffx12_ambiguous_bootstrap count` 从 1 涨到 5376，而
-                    //   `ffx12_election cand=[...(pass,g=3610...)]` 里那个"pass"实例的 :g 已冻住
-                    //   54 秒）⇒ 桥的超分时域累积变成隔帧推进 ⇒ 静止画面边缘也抖动/锯齿。
-                    //   判据与 `g_sdk234_multi_instance` 的活性判据保持**同一个**语义：实例必须
-                    //   最近 k_p1_live_ms 内真的被本函数匹配到（= 它确实还在画）。幽灵实例永远
-                    //   不再"活跃"，因此永远不会再有能力否掉接管者的认领 ✓
-                    //   ⇒ 单实例场景（本进程从未出现过第二个实例）行为与修复②之前**逐字相同** ✓
-                    if (p1_instance_is_live(insts[i]))
-                        ++match_token_candidates;
-                    else
-                        ++match_token_ghosts;  // 诊断：只计数，不参与裁决
-                    if (token.generation > best_gen)
-                    {
-                        best_gen = token.generation;
-                        match_inst = insts[i];
-                        call_gen = token.generation;
-                        call_params = token.params;
-                        match_path = 2; // 仅靠 token bootstrap：**没有输出归属校验**
-                    }
-                    if (claim_color_ptr != 0)
-                    {
-                        const Sdk234InstState *cand = p1_state_for(insts[i]);
-                        const std::uint64_t cand_color = cand != nullptr ? cand->acc_in_color : 0;
-                        const bool cand_color_known = cand_color != 0;
-                        const bool cand_color_matches = cand_color_known && cand_color == claim_color_ptr;
-                        bool cand_memory_fresh = false;
-                        if (cand_color_known && cand != nullptr)
-                        {
-                            if (!cand_now_valid)
-                            {
-                                cand_now = GetTickCount64();
-                                cand_now_valid = true;
-                            }
-                            cand_memory_fresh = cand->last_dispatch_tick != 0 &&
-                                cand_now >= cand->last_dispatch_tick &&
-                                cand_now - cand->last_dispatch_tick <= k_p1_bootstrap_health_ms;
-                        }
-                        if (cand_color_matches)
-                        {
-                            // 正面：来源命中（首选）
-                            if (token.generation > best_gen_src)
-                            {
-                                best_gen_src = token.generation;
-                                pick_src_inst = insts[i];
-                                pick_src_token = token;
-                            }
-                        }
-                        else if (!fsr2_family_takeover::p1_exclude_candidate_by_source(
-                                     cand_color_known, cand_color_matches, cand_memory_fresh))
-                        {
-                            // 没有来源记忆 / 记忆可能过期 ⇒ 不排除（次选）
-                            if (token.generation > best_gen_keep)
-                            {
-                                best_gen_keep = token.generation;
-                                pick_keep_inst = insts[i];
-                                pick_keep_token = token;
-                            }
-                        }
-                        // else：记忆是新的、且确实不是本 draw 的来源 ⇒ **排除**这个候选
-                    }
-                }
-                // 覆盖旧规则的**唯一**条件（旧规则仍保留为兜底：既有单测/既有场景不变）：
-                //   · 有来源命中 ⇒ 认给命中者（与代次顺序无关 ⇒ 两路交错渲染下也稳定）；
-                //   · 否则若有"未被排除"的候选 ⇒ 认给其中代次最新者；
-                //   · 一个都没有 ⇒ 退回旧规则（**绝不出现"无人认领"** ⇒ 不可能因此饿死接管者）。
-                if (best_gen_src != 0)
-                {
-                    match_inst = pick_src_inst;
-                    call_gen = pick_src_token.generation;
-                    call_params = pick_src_token.params;
-                    match_path = 2;
-                }
-                else if (best_gen_keep != 0)
-                {
-                    match_inst = pick_keep_inst;
-                    call_gen = pick_keep_token.generation;
-                    call_params = pick_keep_token.params;
-                    match_path = 2;
-                }
-            }
-            // No pending token means this is not a new temporal input.  It
-            // can nevertheless be the paired write to an alternate output
-            // buffer immediately after the current SDK dispatch.
-            if (match_inst == 0 && output_associated_inst != 0)
-            {
-                match_inst = output_associated_inst;
-                match_path = 3; // 输出关联兜底（无 token，只允许 repair，不推进历史）
-            }
-        }
+            return live_count > 1 || (live_count == 1 && live_instances[0] != inst);
+        };
+        const bool p1_ghost_instance_present = live_count == 0 && saw_dormant_instance;
+        const auto claim = neo::graphics::attribute_frame(std::span(evidence.data(), render.count),
+            claim_color_ptr, render.observed_tick, k_p1_bootstrap_health_ms);
+        const auto call_params = claim.token.params;
+        const std::uint64_t call_gen = claim.token.generation;
+        const std::uint64_t match_inst = claim.instance;
+        const std::uint64_t output_associated_inst = claim.unique_output_owner;
+        const auto match_path = static_cast<std::uint32_t>(claim.path);
+        const std::uint32_t match_token_candidates = claim.live_candidates;
+        const std::uint32_t match_token_ghosts = claim.dormant_candidates;
 
         // 3) 每实例状态槽
         Sdk234InstState *st = nullptr;
@@ -11610,15 +9894,15 @@ bool try_fsr2_translation_draw(
             }
             if (slot == sdk234_inst_count)
             {
-                if (sdk234_inst_count < 8)
+                if (sdk234_inst_count < sdk234_insts.size())
                 {
                     slot = sdk234_inst_count++;
                 }
                 else
                 {
                     std::size_t oldest = 0;
-                    for (std::size_t j = 1; j < 8; ++j)
-                        if (sdk234_insts[j].last_dispatch_tick < sdk234_insts[oldest].last_dispatch_tick)
+                    for (std::size_t j = 1; j < sdk234_insts.size(); ++j)
+                        if (sdk234_insts[j].timeline.last_write_tick() < sdk234_insts[oldest].timeline.last_write_tick())
                             oldest = j;
                     slot = oldest;
                 }
@@ -11923,8 +10207,8 @@ bool try_fsr2_translation_draw(
                 std::uint64_t prev_out_b = 0;
                 if (prev_state != nullptr)
                 {
-                    prev_out_a = prev_state->out_a;
-                    prev_out_b = prev_state->out_b;
+                    prev_out_a = prev_state->output_history.first();
+                    prev_out_b = prev_state->output_history.second();
                     prev_dispatch_age = p1_release_instance_state(*prev_state, p1_now);
                     prev_state->p1_was_taker = false; // 与 D6 的 draw 驱动事件去重
                     prev_state->native_until_tick = p1_now + k_p1_native_release_ms;
@@ -12009,10 +10293,10 @@ bool try_fsr2_translation_draw(
                         std::string(now_taker ? "enter" : "leave") +
                         " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                         " last_dispatch_age_ms=" +
-                        std::to_string(st->last_dispatch_tick != 0
-                                           ? p1_now - st->last_dispatch_tick
+                        std::to_string(st->timeline.last_write_tick() != 0
+                                           ? p1_now - st->timeline.last_write_tick()
                                            : 0) +
-                        " out_a=" + hex64(st->out_a) + " out_b=" + hex64(st->out_b) +
+                        " out_a=" + hex64(st->output_history.first()) + " out_b=" + hex64(st->output_history.second()) +
                         " match_path=" + std::to_string(match_path));
                 }
             }
@@ -12137,7 +10421,7 @@ bool try_fsr2_translation_draw(
             }
             // 纯诊断：这一 draw 是否写的就是接管者的双缓冲（用于判断"放行有没有误伤接管者"）
             const bool writes_taker_buffer = taker_state != nullptr &&
-                (taker_state->out_a == draw_out_ptr || taker_state->out_b == draw_out_ptr);
+                taker_state->output_history.owns(draw_out_ptr);
             // ⚠️ 放行前提必须是"**当前**确有另一个活跃实例"（非粘性）。见 g_sdk234_multi_instance
             // 的判据注释：用"历史上出现过第二个实例"会让这条放行在单视图场景长期生效 ⇒ 本桥的
             // 超分被大面积让给游戏原生（实机回归的直接机制之一）。
@@ -12168,8 +10452,8 @@ bool try_fsr2_translation_draw(
                         g_sdk234_multi_instance.load(std::memory_order_relaxed)) +
                     " take=" + hex64(sdk234_take_cur & 0xFFFFFFFFull) +
                     " out=" + hex64(draw_out_ptr) +
-                    " taker_out_a=" + hex64(taker_state != nullptr ? taker_state->out_a : 0) +
-                    " taker_out_b=" + hex64(taker_state != nullptr ? taker_state->out_b : 0) +
+                    " taker_out_a=" + hex64(taker_state != nullptr ? taker_state->output_history.first() : 0) +
+                    " taker_out_b=" + hex64(taker_state != nullptr ? taker_state->output_history.second() : 0) +
                     " writes_taker_buffer=" + std::to_string(writes_taker_buffer ? 1 : 0) +
                     " frame=" + std::to_string(call_params.frame_index) +
                     " action=" + std::string(release_now ? "passthrough_native" : "fail_closed"));
@@ -12199,30 +10483,9 @@ bool try_fsr2_translation_draw(
         {
             if (st == nullptr || call_gen == 0)
                 return;
-            st->reset_next = true;
-            st->invalidated_gen = call_gen;
-            ++st->invalidation_count;
-            st->last_dispatch_tick = 0;
-            st->last_frame_tick = 0;
-            // 帧时间基准一并失效：失败后的下一次 dispatch 重新以 16.7 兜底起步
-            st->last_dispatch_us = 0;
-            st->last_frame_index = 0;
-            // ⚠️ 修复②(d)：**不再**清 out_a/out_b。
-            // 旧实现每次失败都抹掉"输出归属记忆" ⇒ 失败之后的每一个 draw 都只能走
-            // token bootstrap（match_path=2，**没有归属校验**），这正是"视图↔实例 归属
-            // 错配"（ffx12_input_alias=143 / ffx12_match_unverified=18，样本 match_path=2）
-            // 的温床：失败越多 ⇒ 未命中越多 ⇒ 越容易把另一路视图的帧喂进本实例历史。
-            // 保留它们**不会**复活陈旧帧：下面同时清空了 last_sdk_output（paired draw 的
-            // 修复拷贝要求它非空）与 last_dispatch_tick（sdk234_output_duplicate 要求它
-            // 在 50ms 内）⇒ 两条"复制旧帧"的消费者都已关闭；而 path 1（输出关联）仍要求
-            // 该实例有**未消费的 Render token** 才成立 ⇒ 它只用于把 draw 正确归属到实例。
-            st->out_a_tick = st->out_b_tick = 0;
-            if (st->last_sdk_output != nullptr)
-            {
-                st->last_sdk_output->Release();
-                st->last_sdk_output = nullptr;
-            }
-            st->last_sdk_output_gen = 0;
+            st->timeline.invalidate();
+            // 失败后只留输出归属，不保留能被成对 Draw 交付的旧纹理。
+            st->output_history.invalidate_frame();
             const bool consumed = il2cpp_callsite::consume_render_token_for(match_inst, call_gen);
             LOG_INFO(blog::cat::upscale, "ffx12_result rc=" + std::string(reason) +
                 " gen=" + std::to_string(call_gen) +
@@ -12239,27 +10502,21 @@ bool try_fsr2_translation_draw(
         //    这等价于错误地额外推进一次 FSR history，会形成方向性残影；无法证明新帧时
         //    必须回退原生路径，不能用时间阈值猜测。
         const std::uint64_t sdk234_now = GetTickCount64();
-        const bool sdk234_gen_fresh = st != nullptr && call_gen != 0 && call_gen != st->last_gen;
-        const bool sdk234_duplicate_game_frame = sdk234_gen_fresh &&
-            st->last_dispatched_frame_gen != 0 &&
-            call_params.frame_index == st->last_dispatched_frame;
-        if (sdk234_duplicate_game_frame)
+        const bool sdk234_gen_fresh = st != nullptr && st->timeline.is_new(call_gen);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        if (sdk234_gen_fresh && st->timeline.same_game_frame(call_params.frame_index))
         {
             ++st->duplicate_frame_count;
             LOG_DEBUG(blog::cat::upscale, "ffx12_duplicate_render_frame inst=" +
-                hex64(match_inst & 0xFFFFFFFFull) +
-                " frame=" + std::to_string(call_params.frame_index) +
-                " gen=" + std::to_string(call_gen) +
-                " previous_gen=" + std::to_string(st->last_dispatched_frame_gen) +
-                " out=" + hex64(draw_out_ptr) +
-                " count=" + std::to_string(st->duplicate_frame_count));
+                hex64(match_inst & 0xFFFFFFFFull) + " frame=" + std::to_string(call_params.frame_index) +
+                " gen=" + std::to_string(call_gen) + " previous_gen=" + std::to_string(st->timeline.generation()) +
+                " out=" + hex64(draw_out_ptr) + " count=" + std::to_string(st->duplicate_frame_count));
         }
-        // 仅允许“无 token + 输出明确属于该实例双缓冲 + canonical 输出确实对应
+#endif
         // 最近已消费 generation”的 paired draw 做 repair。不能只凭时间窗猜测，
         // 否则普通 draw 会把上一帧复制到当前缓冲并造成旧帧闪烁。
         const bool output_belongs_to_instance = st != nullptr && draw_out_ptr != 0 &&
-            ((st->out_a != 0 && st->out_a == draw_out_ptr) ||
-             (st->out_b != 0 && st->out_b == draw_out_ptr));
+            st->output_history.owns(draw_out_ptr);
         // ---- P2 诊断 D5：视图↔实例 归属错配探针（Ffx12SingleInstanceDiag=1）----
         // 两路视图的 render 尺寸相同 ⇒ bootstrap 的 (instance,render_w,render_h)
         // 过滤器区分不了 draw 属于哪一路。若某一 draw 只靠 token bootstrap 认领
@@ -12277,7 +10534,7 @@ bool try_fsr2_translation_draw(
                 LOG_INFO(blog::cat::upscale, "ffx12_match_unverified count=" + std::to_string(uc) +
                     " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                     " out=" + hex64(draw_out_ptr) +
-                    " out_a=" + hex64(st->out_a) + " out_b=" + hex64(st->out_b) +
+                    " out_a=" + hex64(st->output_history.first()) + " out_b=" + hex64(st->output_history.second()) +
                     " token_cands=" + std::to_string(match_token_candidates) +
                     " gen=" + std::to_string(call_gen) +
                     " frame=" + std::to_string(call_params.frame_index));
@@ -12336,9 +10593,9 @@ bool try_fsr2_translation_draw(
         p2_facts.input_belongs_to_claimer = claim_input_owned;
         p2_facts.claim_has_generation = call_gen != 0;
         p2_facts.same_size_token_candidates = match_token_candidates;
-        p2_facts.claimer_has_ownership = st != nullptr && (st->out_a != 0 || st->out_b != 0);
-        p2_facts.claimer_recently_dispatched = st != nullptr && st->last_dispatch_tick != 0 &&
-            sdk234_now - st->last_dispatch_tick <= k_p1_bootstrap_health_ms;
+        p2_facts.claimer_has_ownership = st != nullptr && st->output_history.has_association();
+        p2_facts.claimer_recently_dispatched = st != nullptr && st->timeline.last_write_tick() != 0 &&
+            sdk234_now - st->timeline.last_write_tick() <= k_p1_bootstrap_health_ms;
         if (match_inst != 0 && st != nullptr &&
             fsr2_family_takeover::p1_refuse_token_only_claim(p2_facts))
         {
@@ -12383,9 +10640,9 @@ bool try_fsr2_translation_draw(
                     " token_cands=" + std::to_string(match_token_candidates) +
                     " token_ghosts=" + std::to_string(match_token_ghosts) +
                     " out=" + hex64(draw_out_ptr) +
-                    " out_a=" + hex64(st->out_a) + " out_b=" + hex64(st->out_b) +
+                    " out_a=" + hex64(st->output_history.first()) + " out_b=" + hex64(st->output_history.second()) +
                     refuse_evidence_fields +
-                    " dispatch_age_ms=" + std::to_string(sdk234_now - st->last_dispatch_tick) +
+                    " dispatch_age_ms=" + std::to_string(sdk234_now - st->timeline.last_write_tick()) +
                     " frame=" + std::to_string(call_params.frame_index) +
                     " action=passthrough_native");
             }
@@ -12422,10 +10679,8 @@ bool try_fsr2_translation_draw(
         }
         const bool sdk234_output_duplicate = st != nullptr && call_gen == 0 &&
             output_associated_inst == match_inst && output_belongs_to_instance &&
-            st->last_sdk_output != nullptr && st->last_gen != 0 &&
-            st->last_sdk_output_gen == st->last_gen && st->last_dispatch_tick != 0 &&
-            st->last_repair_gen != st->last_gen &&
-            sdk234_now - st->last_dispatch_tick <= 50;
+            st->output_history.can_repair(st->timeline.generation()) && st->timeline.last_write_tick() != 0 &&
+            sdk234_now - st->timeline.last_write_tick() <= 50;
         if (match_inst != 0 && st != nullptr && (sdk234_gen_fresh || sdk234_output_duplicate))
         {
             // 记录 sdk234 拦截的 draw 的 ps hash（确认是否游戏 accumulate 0x78057A29AF6C2D99）
@@ -12445,85 +10700,26 @@ bool try_fsr2_translation_draw(
                         " frame=" + std::to_string(call_params.frame_index));
                 }
             }
-            // 现场查询当前 accumulate draw 的绑定。角色和尺寸均由 draw 特征识别决定；
-            // 不假定 t0/t2/t3 或 RTV1，也不把窗口尺寸当作 render size。
-            ID3D11ShaderResourceView *bound_srvs[8] {};
-            context->PSGetShaderResources(0, 8, bound_srvs);
-            ID3D11RenderTargetView *bound_rtvs[4] {};
-            ID3D11DepthStencilView *bound_dsv = nullptr;
-            context->OMGetRenderTargets(4, bound_rtvs, &bound_dsv);
-            ID3D11Texture2D *color_tex = nullptr;
-            ID3D11Texture2D *depth_tex = nullptr;
-            ID3D11Texture2D *motion_tex = nullptr;
-            ID3D11Texture2D *transparency_tex = nullptr;
-            ID3D11Texture2D *output_tex = nullptr;
-            ID3D11Resource *sdk234_out_res = nullptr;
-            ID3D11Resource *res = nullptr;
-            const UINT color_slot = draw_info->color_srv_slot;
-            const UINT depth_slot = draw_info->depth_srv_slot;
-            const UINT motion_slot = draw_info->motion_srv_slot;
-            const UINT transparency_slot = draw_info->transparency_srv_slot;
-            const UINT output_slot = draw_info->output_rtv_slot;
-            if (color_slot < std::size(bound_srvs) && bound_srvs[color_slot] &&
-                (bound_srvs[color_slot]->GetResource(&res), res))
-            {
-                res->QueryInterface(IID_PPV_ARGS(&color_tex));
-                res->Release();
-            }
-            if (depth_slot < std::size(bound_srvs) && bound_srvs[depth_slot] &&
-                (bound_srvs[depth_slot]->GetResource(&res), res))
-            {
-                res->QueryInterface(IID_PPV_ARGS(&depth_tex));
-                res->Release();
-            }
-            if (motion_slot < std::size(bound_srvs) && bound_srvs[motion_slot] &&
-                (bound_srvs[motion_slot]->GetResource(&res), res))
-            {
-                res->QueryInterface(IID_PPV_ARGS(&motion_tex));
-                res->Release();
-            }
-            if (transparency_slot < std::size(bound_srvs) && bound_srvs[transparency_slot] &&
-                (bound_srvs[transparency_slot]->GetResource(&res), res))
-            {
-                res->QueryInterface(IID_PPV_ARGS(&transparency_tex));
-                res->Release();
-            }
-            if (output_slot < std::size(bound_rtvs) && bound_rtvs[output_slot] &&
-                (bound_rtvs[output_slot]->GetResource(&res), res))
-            {
-                sdk234_out_res = res; // 记录 GetResource 原始指针（防覆盖比较用，与转译层 output 同一来源）
-                res->QueryInterface(IID_PPV_ARGS(&output_tex));
-                res->Release();
-            }
-            for (int i = 0; i < 8; ++i)
-                if (bound_srvs[i]) bound_srvs[i]->Release();
-            for (int i = 0; i < 4; ++i)
-                if (bound_rtvs[i]) bound_rtvs[i]->Release();
-            if (bound_dsv) bound_dsv->Release();
-            // The un-tokened paired draw must not run the native upscaler and
-            // must not advance FSR history a second time.  Refresh only its
-            // alternate output from the SDK result produced moments ago; this
-            // prevents a stale buffer from flashing between two valid frames.
+            // 源/输出的原始 COM 资源指针与实例匹配同源。RAII 也覆盖派发失败的早退。
+            const auto color = FrameBindings::texture_2d(bound_color);
+            const auto depth = FrameBindings::texture_2d(frame.input_resource(draw_info->depth_srv_slot));
+            const auto motion = FrameBindings::texture_2d(frame.input_resource(draw_info->motion_srv_slot));
+            const auto transparency = FrameBindings::texture_2d(frame.input_resource(draw_info->transparency_srv_slot));
+            const auto output = FrameBindings::texture_2d(bound_output);
+            auto *const color_tex = color.Get();
+            auto *depth_tex = depth.Get();
+            auto *const motion_tex = motion.Get();
+            auto *const transparency_tex = transparency.Get();
+            auto *const output_tex = output.Get();
+            auto *const sdk234_out_res = bound_output.Get();
             if (sdk234_output_duplicate && output_tex != nullptr)
             {
-                D3D11_TEXTURE2D_DESC source_desc {};
-                D3D11_TEXTURE2D_DESC target_desc {};
-                st->last_sdk_output->GetDesc(&source_desc);
-                output_tex->GetDesc(&target_desc);
-                const bool copy_compatible = source_desc.Width == target_desc.Width &&
-                    source_desc.Height == target_desc.Height && source_desc.Format == target_desc.Format &&
-                    source_desc.MipLevels == target_desc.MipLevels &&
-                    source_desc.ArraySize == target_desc.ArraySize &&
-                    source_desc.SampleDesc.Count == target_desc.SampleDesc.Count &&
-                    source_desc.SampleDesc.Quality == target_desc.SampleDesc.Quality;
-                if (copy_compatible)
+                if (const auto delivery = st->output_history.deliver(*context, *output_tex,
+                    st->timeline.generation(), draw_out_ptr, neo::graphics::OutputHistory::Mode::Repair))
                 {
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                     ++st->acc_dispatch_repair; // 【仅诊断】①' 输出修复拷贝（不推进历史）
 #endif
-                    const bool same_output = st->last_sdk_output == output_tex;
-                    if (!same_output)
-                        context->CopyResource(output_tex, st->last_sdk_output);
                     static std::atomic_uint64_t sdk234_output_repair_count { 0 };
                     const std::uint64_t repair_count =
                         sdk234_output_repair_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -12531,36 +10727,13 @@ bool try_fsr2_translation_draw(
                     {
                         LOG_DEBUG(blog::cat::upscale, "ffx12_output_repair count=" + std::to_string(repair_count) +
                             " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
-                            " age_ms=" + std::to_string(sdk234_now - st->last_dispatch_tick) +
-                            " same_output=" + std::to_string(same_output ? 1 : 0) +
-                            " src=" + hex64(reinterpret_cast<std::uint64_t>(st->last_sdk_output)) +
+                            " age_ms=" + std::to_string(sdk234_now - st->timeline.last_write_tick()) +
+                            " same_output=" + std::to_string(delivery->same_output) +
+                            " src=" + hex64(reinterpret_cast<std::uint64_t>(delivery->source)) +
                             " dst=" + hex64(reinterpret_cast<std::uint64_t>(output_tex)));
                     }
-                    st->last_repair_gen = st->last_gen;
                     g_sdk234_output_ptr = reinterpret_cast<std::uint64_t>(sdk234_out_res);
                     g_sdk234_output_tick.store(GetTickCount64(), std::memory_order_relaxed);
-                    if (st->out_a == 0 || st->out_a == draw_out_ptr)
-                    {
-                        st->out_a = draw_out_ptr;
-                        st->out_a_tick = GetTickCount64();
-                    }
-                    else if (st->out_b == 0 || st->out_b == draw_out_ptr)
-                    {
-                        st->out_b = draw_out_ptr;
-                        st->out_b_tick = GetTickCount64();
-                    }
-                    else
-                    {
-                        st->out_b = st->out_a;
-                        st->out_b_tick = st->out_a_tick;
-                        st->out_a = draw_out_ptr;
-                        st->out_a_tick = GetTickCount64();
-                    }
-                    if (color_tex) color_tex->Release();
-                    if (depth_tex) depth_tex->Release();
-                    if (motion_tex) motion_tex->Release();
-                    if (transparency_tex) transparency_tex->Release();
-                    output_tex->Release();
                     return true;
                 }
             }
@@ -12570,27 +10743,14 @@ bool try_fsr2_translation_draw(
                 // 旧逻辑在每输出超过 5ms 时再次 ffxDispatch，导致一套 color/depth/motion
                 // 连续推进同一 FSR2 history 两次，形成多帧叠影。这里将首个 SDK 结果复制到
                 // 第二输出，仍拦截原生 draw，但不再推进 temporal history。
-                if (!sdk234_gen_fresh && g_config.ffx12_reuse_same_generation &&
-                    st->last_sdk_output != nullptr && st->last_sdk_output_gen == call_gen)
+                if (!sdk234_gen_fresh && g_config.ffx12_reuse_same_generation)
                 {
-                    D3D11_TEXTURE2D_DESC prior_desc {};
-                    D3D11_TEXTURE2D_DESC target_desc {};
-                    st->last_sdk_output->GetDesc(&prior_desc);
-                    output_tex->GetDesc(&target_desc);
-                    const bool copy_compatible = prior_desc.Width == target_desc.Width &&
-                        prior_desc.Height == target_desc.Height && prior_desc.Format == target_desc.Format &&
-                        prior_desc.MipLevels == target_desc.MipLevels &&
-                        prior_desc.ArraySize == target_desc.ArraySize &&
-                        prior_desc.SampleDesc.Count == target_desc.SampleDesc.Count &&
-                        prior_desc.SampleDesc.Quality == target_desc.SampleDesc.Quality;
-                    if (copy_compatible)
+                    if (const auto delivery = st->output_history.deliver(*context, *output_tex,
+                        call_gen, draw_out_ptr, neo::graphics::OutputHistory::Mode::Repeat))
                     {
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                         ++st->acc_dispatch_reuse; // 【仅诊断】①'' 同代次复用拷贝（不推进历史）
 #endif
-                        const bool same_output = st->last_sdk_output == output_tex;
-                        if (!same_output)
-                            context->CopyResource(output_tex, st->last_sdk_output);
                         static std::atomic_uint64_t sdk234_reuse_count { 0 };
                         const std::uint64_t rc = sdk234_reuse_count.fetch_add(1, std::memory_order_relaxed) + 1;
                         if (rc <= 8 || rc % 1024 == 0)
@@ -12598,34 +10758,12 @@ bool try_fsr2_translation_draw(
                             LOG_DEBUG(blog::cat::upscale, "ffx12_reuse_generation count=" + std::to_string(rc) +
                                 " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                                 " frame=" + std::to_string(call_params.frame_index) +
-                                " same_output=" + std::to_string(same_output ? 1 : 0) +
-                                " src=" + hex64(reinterpret_cast<std::uint64_t>(st->last_sdk_output)) +
+                                " same_output=" + std::to_string(delivery->same_output) +
+                                " src=" + hex64(reinterpret_cast<std::uint64_t>(delivery->source)) +
                                 " dst=" + hex64(reinterpret_cast<std::uint64_t>(output_tex)));
                         }
                         g_sdk234_output_ptr = reinterpret_cast<std::uint64_t>(sdk234_out_res);
                         g_sdk234_output_tick.store(GetTickCount64(), std::memory_order_relaxed);
-                        if (st->out_a == 0 || st->out_a == draw_out_ptr)
-                        {
-                            st->out_a = draw_out_ptr;
-                            st->out_a_tick = GetTickCount64();
-                        }
-                        else if (st->out_b == 0 || st->out_b == draw_out_ptr)
-                        {
-                            st->out_b = draw_out_ptr;
-                            st->out_b_tick = GetTickCount64();
-                        }
-                        else
-                        {
-                            st->out_b = st->out_a;
-                            st->out_b_tick = st->out_a_tick;
-                            st->out_a = draw_out_ptr;
-                            st->out_a_tick = GetTickCount64();
-                        }
-                        color_tex->Release();
-                        depth_tex->Release();
-                        motion_tex->Release();
-                        if (transparency_tex) transparency_tex->Release();
-                        output_tex->Release();
                         return true;
                     }
                 }
@@ -12646,51 +10784,21 @@ bool try_fsr2_translation_draw(
                     }
                 }
                 {
-                // 绑定深度（slot2 SRV）实测内容全 0（bits3x3 全 00000000）——
-                // 非游戏真实深度缓冲。改用当前 draw 的 DSV 资源（场景深度缓冲本体）：
-                // 只要 accumulate 时 DSV 仍绑定则优先替代，否则回退原绑定纹理。
+                // 原生累积 Draw 的深度 SRV 可能为空数据；保持优先使用当前 DSV 的策略。
+                const auto scene_depth = frame.scene_depth();
+                if (scene_depth && scene_depth.Get() != depth_tex)
                 {
-                    ID3D11DepthStencilView *cur_dsv = nullptr;
-                    ID3D11RenderTargetView *cur_rtvs[4] = {};
-                    context->OMGetRenderTargets(4, cur_rtvs, &cur_dsv);
-                    for (auto *r : cur_rtvs)
-                        if (r) r->Release();
-                    if (cur_dsv != nullptr)
+                    D3D11_TEXTURE2D_DESC details {};
+                    scene_depth->GetDesc(&details);
+                    if (details.Format != DXGI_FORMAT_UNKNOWN)
                     {
-                        ID3D11Resource *dsv_res = nullptr;
-                        cur_dsv->GetResource(&dsv_res);
-                        if (dsv_res != nullptr)
-                        {
-                            ID3D11Texture2D *dsv_tex = nullptr;
-                            if (SUCCEEDED(dsv_res->QueryInterface(__uuidof(ID3D11Texture2D),
-                                                                  reinterpret_cast<void **>(&dsv_tex))))
-                            {
-                                D3D11_TEXTURE2D_DESC dtd {};
-                                dsv_tex->GetDesc(&dtd);
-                                if (dtd.Format != DXGI_FORMAT_UNKNOWN)
-                                {
-                                    static std::atomic_uint64_t dsv_switch_log { 0 };
-                                    const std::uint64_t dsl =
-                                        dsv_switch_log.fetch_add(1, std::memory_order_relaxed) + 1;
-                                    const std::uint32_t dsv_fmt =
-                                        static_cast<std::uint32_t>(dtd.Format);
-                                    if (depth_tex != dsv_tex)
-                                    {
-                                        dsv_tex->AddRef(); // depth_tex 接管一个引用
-                                        depth_tex->Release();
-                                        depth_tex = dsv_tex;
-                                        if (dsl <= 4 || dsl % 256 == 0)
-                                            LOG_DEBUG(blog::cat::upscale, "ffx12_depth_dsv switch fmt=" +
-                                                std::to_string(dsv_fmt) +
-                                                " size=" + std::to_string(dtd.Width) + "x" +
-                                                std::to_string(dtd.Height));
-                                    }
-                                }
-                                dsv_tex->Release();
-                            }
-                            dsv_res->Release();
-                        }
-                        cur_dsv->Release();
+                        depth_tex = scene_depth.Get();
+                        static std::atomic_uint64_t dsv_switch_log { 0 };
+                        const auto count = dsv_switch_log.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (count <= 4 || count % 256 == 0)
+                            LOG_DEBUG(blog::cat::upscale, "ffx12_depth_dsv switch fmt=" +
+                                std::to_string(static_cast<std::uint32_t>(details.Format)) +
+                                " size=" + std::to_string(details.Width) + "x" + std::to_string(details.Height));
                     }
                 }
                 ffx12::FrameInput sdk_in {};
@@ -12699,7 +10807,6 @@ bool try_fsr2_translation_draw(
                 sdk_in.motion = motion_tex;
                 sdk_in.transparency = transparency_tex;
                 sdk_in.output_target = output_tex;
-                sdk_in.reset = g_config.ffx12_force_reset || st->reset_next;
                 sdk_in.use_reactive_mask = g_config.fsr2_use_reactive_mask;
                 sdk_in.use_transparency_mask = g_config.fsr2_use_transparency_mask;
                 // RCAS 锐化：此前 `Fsr2SharpnessPercent` 只被读取、**从不使用**（与
@@ -12707,23 +10814,6 @@ bool try_fsr2_translation_draw(
                 // 默认 0 ⇒ enable_sharpening=false，行为与现状一致；设 >0 才真正打开。
                 sdk_in.enable_sharpening = g_config.fsr2_sharpness_percent > 0;
                 sdk_in.sharpness = static_cast<float>(g_config.fsr2_sharpness_percent) / 100.0f;
-                // 接管空窗检测（2026-08-24 实证）：UI 全屏/场景切换由另一实例或原生接管，
-                // 距上次 dispatch 超 500ms（= 其他路径接管期）→ 恢复时强制 FSR2 reset，清历史残留。
-                {
-                    const std::uint64_t now_tick = GetTickCount64();
-                    if (st->last_dispatch_tick != 0 && now_tick - st->last_dispatch_tick > 500)
-                    {
-                        sdk_in.reset = true;
-                        if (st->last_gap_log_tick == 0 || now_tick - st->last_gap_log_tick > 5000)
-                        {
-                            st->last_gap_log_tick = now_tick;
-                            LOG_DEBUG(blog::cat::upscale, "ffx12_reset reason=takeover_gap ms=" +
-                                std::to_string(now_tick - st->last_dispatch_tick) +
-                                " inst=" + hex64(match_inst & 0xFFFFFFFFull));
-                        }
-                    }
-                    st->last_dispatch_tick = now_tick; // 本帧尝试接管即刷新（无论成败，防连续触发）
-                }
                 sdk_in.render_w = draw_info->render_width;
                 sdk_in.render_h = draw_info->render_height;
                 sdk_in.display_w = draw_info->output_width;
@@ -12982,45 +11072,22 @@ bool try_fsr2_translation_draw(
                 sdk_in.camera_far = g_config.ffx12_camera_far;
                 sdk_in.camera_fov_vertical =
                     0.7853981634f * g_config.ffx12_fov_scale;
-                // 帧时间：FSR 语义 = 游戏帧时长（运动矢量按帧归一化的时间步）。
-                // 旧实现按"两次 dispatch"的 GetTickCount64 墙钟间隔：同帧多 dispatch
-                // 得 ~0ms（clamp 1），跨帧又受 15.6ms 分辨率量化（1/15/47/100 跳变），
-                // 稳定段 dt 从未等于帧时长 → 运动时 temporal 权重错 → 动态 AA 失效。
-                // 现按游戏帧号变化用 QPC 高精度计时；同帧重复 dispatch 沿用上次 dt
-                // （同一时间步），并只在帧号变化时推进计时基准。
+                // FFX/NGX 需要真正的游戏帧 delta；这里不是逐 Draw 的诊断计时。
+                using Clock = std::chrono::steady_clock;
+                const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    Clock::now().time_since_epoch()).count();
+                const auto attempt = st->timeline.prepare(call_gen, call_params.frame_index, sdk234_now,
+                    static_cast<std::uint64_t>(now_us), g_config.ffx12_force_reset);
+                sdk_in.frame_time_delta_ms = attempt.delta_ms;
+                sdk_in.reset = attempt.reset;
+                if (attempt.gap_ms > neo::graphics::FrameTimeline::k_takeover_gap_ms &&
+                    (st->last_gap_log_tick == 0 || sdk234_now - st->last_gap_log_tick > 5000))
                 {
-                    LARGE_INTEGER qpc_freq {};
-                    LARGE_INTEGER qpc_now {};
-                    QueryPerformanceFrequency(&qpc_freq);
-                    QueryPerformanceCounter(&qpc_now);
-                    const std::uint64_t now_us =
-                        qpc_freq.QuadPart != 0 ? static_cast<std::uint64_t>(qpc_now.QuadPart) *
-                                                     1000000ull / static_cast<std::uint64_t>(qpc_freq.QuadPart)
-                                               : 0ull;
-                    const std::uint64_t now_frame = call_params.frame_index;
-                    if (st->last_dispatch_us == 0)
-                    {
-                        sdk_in.frame_time_delta_ms = 16.7f; // 首帧兜底
-                    }
-                    else if (now_frame != st->last_frame_index)
-                    {
-                        const std::uint64_t delta_us =
-                            now_us > st->last_dispatch_us ? now_us - st->last_dispatch_us : 0ull;
-                        sdk_in.frame_time_delta_ms =
-                            delta_us != 0 ? static_cast<float>(delta_us) / 1000.0f : 16.7f;
-                    }
-                    // 同帧多 dispatch：沿用上次 dt（时间步不变）
-                    sdk_in.frame_time_delta_ms = std::clamp(sdk_in.frame_time_delta_ms, 1.0f, 100.0f);
-                    if (st->last_dispatch_us == 0 || now_frame != st->last_frame_index)
-                    {
-                        st->last_dispatch_us = now_us;
-                        st->last_frame_index = now_frame;
-                    }
-                    st->last_frame_tick = GetTickCount64();
+                    st->last_gap_log_tick = sdk234_now;
+                    LOG_DEBUG(blog::cat::upscale, "ffx12_reset reason=takeover_gap ms=" +
+                        std::to_string(attempt.gap_ms) + " inst=" + hex64(match_inst & 0xFFFFFFFFull));
                 }
 
-                // 一次性原生参数探测（诊断用）—— 已抽为独立函数，见上方
-                // probe_native_params_once；纯诊断、不改状态。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
                 probe_native_params_once(context, call_params, color_tex, depth_tex, motion_tex);
 #endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
@@ -13169,7 +11236,8 @@ bool try_fsr2_translation_draw(
                     st->dbg_depth = d_ptr;
                 }
 
-                if (ffx12::dispatch(sdk_in, context, call_params.instance))
+                const auto delivery = ffx12::dispatch(sdk_in, context, call_params.instance);
+                if (delivery != ffx12::DispatchResult::failed)
                 {
                     // ---- 【功能 · B124】① 记下本路**自己的** color 采样来源 ----
                     // ⚠️ 这一行**不是诊断**：它是 B124 归属修法的"输入归属证据"
@@ -13188,8 +11256,8 @@ bool try_fsr2_translation_draw(
                     st->acc_in_tick = GetTickCount64();
                     st->acc_in_frame = call_params.frame_index;
                     st->acc_in_match_path = match_path;
-                    st->acc_in_slots = (color_slot & 0xFFu) | ((depth_slot & 0xFFu) << 8) |
-                        ((motion_slot & 0xFFu) << 16) | ((output_slot & 0xFFu) << 24);
+                    st->acc_in_slots = (draw_info->color_srv_slot & 0xFFu) | ((draw_info->depth_srv_slot & 0xFFu) << 8) |
+                        ((draw_info->motion_srv_slot & 0xFFu) << 16) | ((draw_info->output_rtv_slot & 0xFFu) << 24);
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（去向计数 + 输入/输出键 + 归属路径/槽位 —— 只喂日志）
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                     // ---- 【仅诊断 · B124 验收探针】凭**输入归属**被认下的派发 ----
@@ -13218,11 +11286,8 @@ bool try_fsr2_translation_draw(
                         }
                     }
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_input_own —— 只喂日志）
-                    // 仅成功输出后才消费 generation；失败不得让下一次重试拿到旧 history。
-                    st->last_gen = call_gen;
-                    st->last_dispatched_frame = call_params.frame_index;
-                    st->last_dispatched_frame_gen = call_gen;
-                    st->reset_next = false;
+                    // 代次和可复用纹理只在提交成功的同一路径上发布。
+                    st->timeline.commit(attempt);
                     if (!il2cpp_callsite::consume_render_token_for(match_inst, call_gen))
                     {
                         LOG_DEBUG(blog::cat::upscale, "ffx12_token_consume_miss inst=" +
@@ -13233,8 +11298,8 @@ bool try_fsr2_translation_draw(
                         sdk234_dispatch_count.fetch_add(1, std::memory_order_relaxed) + 1;
                     if (dcount <= 8 || dcount % 1024 == 0)
                     {
-                        LOG_INFO(blog::cat::upscale, "ffx12_result rc=DISPATCH_OK" +
-                            std::string(" gen=") + std::to_string(call_gen) +
+                        LOG_INFO(blog::cat::upscale, "ffx12_result rc=DISPATCH_OK copy_enqueued=1 evidence=" +
+                            std::string(ffx12::output_evidence(delivery)) + " gen=" + std::to_string(call_gen) +
                             " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                             " frame=" + std::to_string(call_params.frame_index) +
                             " reset=" + std::to_string(sdk_in.reset ? 1 : 0) +
@@ -13396,9 +11461,9 @@ bool try_fsr2_translation_draw(
                             " mvscale=" + std::to_string(sdk_in.motion_scale_x) + "," +
                             std::to_string(sdk_in.motion_scale_y) +
                             " mvfactor=" + std::to_string(g_config.ffx12_motion_scale) +
-                            " slots=" + std::to_string(color_slot) + "/" +
-                            std::to_string(depth_slot) + "/" + std::to_string(motion_slot) +
-                            "/" + std::to_string(output_slot) +
+                            " slots=" + std::to_string(draw_info->color_srv_slot) + "/" +
+                            std::to_string(draw_info->depth_srv_slot) + "/" + std::to_string(draw_info->motion_srv_slot) +
+                            "/" + std::to_string(draw_info->output_rtv_slot) +
                             " fmt=" + std::to_string(f_color) + "/" + std::to_string(f_depth) +
                             "/" + std::to_string(f_motion) + "/" + std::to_string(f_output) +
                             " reset=" + std::to_string(dbg_reset ? 1 : 0) +
@@ -13455,11 +11520,6 @@ bool try_fsr2_translation_draw(
                         }
                     }
                     fsr2_family_takeover::notify_accumulate_result(true, GetTickCount64());
-                    if (st->last_sdk_output != nullptr)
-                        st->last_sdk_output->Release();
-                    st->last_sdk_output = output_tex;
-                    st->last_sdk_output->AddRef();
-                    st->last_sdk_output_gen = call_gen;
                     // 记录 sdk234 写过的输出（GetResource 原始指针，防覆盖：同输出后续 draw 跳过）
                     g_sdk234_output_ptr = reinterpret_cast<std::uint64_t>(sdk234_out_res);
                     g_sdk234_output_tick.store(GetTickCount64(), std::memory_order_relaxed);
@@ -13474,7 +11534,7 @@ bool try_fsr2_translation_draw(
                     //      reuse 路径可写新缓冲，但它的次数是配对 draw 量级，本批未插桩。
                     //   ⚠️ 只门控**日志输出**：把新输出记进 out_a/out_b（下面的功能代码）不变。
                     if (g_config.ffx12_single_instance_diag && draw_out_ptr != 0 &&
-                        st->out_a != draw_out_ptr && st->out_b != draw_out_ptr)
+                        !st->output_history.owns(draw_out_ptr))
                     {
                         static std::atomic_uint64_t sdk234_output_learn_count { 0 };
                         const std::uint64_t olc =
@@ -13485,8 +11545,8 @@ bool try_fsr2_translation_draw(
                                 std::to_string(olc) +
                                 " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
                                 " out=" + hex64(draw_out_ptr) +
-                                " prev_out_a=" + hex64(st->out_a) +
-                                " prev_out_b=" + hex64(st->out_b) +
+                                " prev_out_a=" + hex64(st->output_history.first()) +
+                                " prev_out_b=" + hex64(st->output_history.second()) +
                                 " in_path=" + std::to_string(match_path) +
                                 " gen=" + std::to_string(call_gen) +
                                 " frame=" + std::to_string(call_params.frame_index) +
@@ -13494,30 +11554,9 @@ bool try_fsr2_translation_draw(
                         }
                     }
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_output_learn —— 只喂日志）
-                    if (st->out_a == 0 || st->out_a == draw_out_ptr)
-                    {
-                        st->out_a = draw_out_ptr;
-                        st->out_a_tick = GetTickCount64();
-                    }
-                    else if (st->out_b == 0 || st->out_b == draw_out_ptr)
-                    {
-                        st->out_b = draw_out_ptr;
-                        st->out_b_tick = GetTickCount64();
-                    }
-                    else
-                    {
-                        st->out_b = st->out_a;
-                        st->out_b_tick = st->out_a_tick;
-                        st->out_a = draw_out_ptr;
-                        st->out_a_tick = GetTickCount64();
-                    }
-                    color_tex->Release();
-                    depth_tex->Release();
-                    motion_tex->Release();
-                    if (transparency_tex) transparency_tex->Release();
-                    output_tex->Release();
+                    st->output_history.publish(*output_tex, call_gen, draw_out_ptr);
                     return true;
-                } // if (ffx12::dispatch(...))
+                }
                 else
                 {
                     // sdk234 dispatch 失败：立即转储失败痕迹（P0-3：rc/阶段记在 sdk_msgs，
@@ -13584,11 +11623,6 @@ bool try_fsr2_translation_draw(
 #endif
                 invalidate_direct_attempt("RESOURCES_INVALID");
             }
-            if (color_tex) color_tex->Release();
-            if (depth_tex) depth_tex->Release();
-            if (motion_tex) motion_tex->Release();
-            if (transparency_tex) transparency_tex->Release();
-            if (output_tex) output_tex->Release();
             // 失败由 invalidate_direct_attempt 终结旧 token；函数末的 direct-only gate
             // 继续截断原生 accumulate draw，等待下一枚有效 token 以 reset 重建历史。
         }
@@ -13604,7 +11638,7 @@ bool try_fsr2_translation_draw(
 #endif
         // 诊断：sdk234 未接管原因（低频，只读，已抽为独立函数）
         log_sdk234_skip_reason(st, match_inst, draw_out_ptr, sdk234_now,
-            st != nullptr ? st->last_dispatch_tick : 0,
+            st != nullptr ? st->timeline.last_write_tick() : 0,
             draw_info->render_width, draw_info->render_height);
     }
 
@@ -14084,238 +12118,146 @@ void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_
 // 必须用**极低采样率**（如每 4096 次 draw 只测 1 次），且先验证探针本身无扰动。
 // ---------------------------------------------------------------------------
 
-void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location)
+// 2026-11-15：两个 Draw 入口共用一条接管流水线，确保 family、后端和回退顺序不会各自漂移。
+template <bool Indexed, typename Draw>
+void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    const perf_probe::DrawShapeSlot &shape,
+#endif
+    Draw &&draw)
 {
-    // 【诊断】PerfProbe：draw 钩子整体（**抽样**计时，绝不逐 draw 取时间）。
-    // 放在函数最前面 ⇒ 所有 return 路径都被计入（这正是要测的"钩子总开销"）。
-    // ⚠️ 2026-09-27（B105）：直方图槽 0 的落桶**搬进了 SampledScope 的析构**
-    // （见 PerfProbe.h）——旧写法在这里的每条 return 上手写
-    // `draw_cost_histogram(0).record(perf_scope.elapsed_ns())`，而 `elapsed_ns()`
-    // 要到析构才被填 ⇒ 恒记 0（真机 `draw_all mean_us=0.000000`）。
+    if (!context)
+    {
+        draw();
+        return;
+    }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
-                                        perf_probe::draw_call_counter(),
-                                        perf_probe::draw_sample_counter(),
-                                        perf_probe::draw_sample_stride(),
-                                        perf_probe::k_draw_all_slot);
+        perf_probe::draw_call_counter(), perf_probe::draw_sample_counter(),
+        perf_probe::draw_sample_stride(), perf_probe::k_draw_all_slot);
     perf_probe::maybe_flush();
-#endif
-    // 【诊断】draw 直方图槽 1 = **内省窗口**（只包住 inspect_target_upscaler_draw；
-    // 未进入内省的 draw 记 0）⇒ 两槽样本集合一致，"draw_all − draw_inspect" 才有意义。
-    // 见 PerfProbe.h 里 DrawInspectScope 的口径说明与 B105。
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
-#endif
-    // 【诊断】B107 形状分桶：**调用入口**的实参就是最强的判别式候选
-    // （`IndexCount` / `StartIndexLocation` / `BaseVertexLocation`）。
-    // 这里只做"打包 + 计数"（探针关时只读一次开关，零原子操作）；
-    // `mark_draw_shape_identified` 由内省函数在**识别成功**处调用（calls/hits 两列）。
-    // ⚠️ 刻意**不读拓扑**：那要额外一次 `IAGetPrimitiveTopology` COM 调用，
-    // 本身就要花钱 ⇒ 先用"已经拿在手里的实参"分桶（见 PerfProbe.h 的说明）。
-    const perf_probe::DrawShapeMarkArmed perf_draw_shape = perf_probe::make_draw_shape_mark(
-        perf_probe::DrawShapeSlot::indexed(index_count, start_index_location, base_vertex_location));
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    const auto perf_draw_shape = perf_probe::make_draw_shape_mark(shape);
     perf_probe::mark_draw_shape_call(perf_draw_shape);
+#else
+    const perf_probe::DrawShapeMarkArmed perf_draw_shape {};
 #endif
-    // passthrough 机制已整体移除（实测让 OptiScaler 丢失 FFX 输入识别）。
-    // 所有显卡统一桥直连；OptiScaler 共存时并行（各自独立链路，实测无冲突；
-    // N/Intel 上 OptiScaler 用于提供 DLSS/XeSS，不依赖桥让路）。
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     capture_runtime_snapshot_if_requested();
+    constexpr const char *entry_name = Indexed ? "draw_indexed" : "draw";
 #endif
     static std::atomic_bool hook_logged { false };
     if (!hook_logged.load(std::memory_order_relaxed) &&
         !hook_logged.exchange(true, std::memory_order_relaxed))
-        LOG_INFO(blog::cat::core, "draw_indexed_hook_active");
+        LOG_INFO(blog::cat::core, Indexed ? "draw_indexed_hook_active" : "draw_hook_active");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    record_color_source_call("draw_indexed", index_count, 0, 0);
-    maybe_dump_target_color_chain(context, index_count);
+    record_color_source_call(entry_name, element_count, 0, 0);
+    maybe_dump_target_color_chain(context, element_count);
 #endif
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
-    record_final_scene_probe_draw(index_count, true);
+    record_final_scene_probe_draw(element_count, Indexed);
 #endif
-    record_hdr_composite_candidate(index_count, true);
+    record_hdr_composite_candidate(element_count, Indexed);
+
+    const auto upscale = [&](auto &)
+    {
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    poll_fsr2_transient_capture_hotkey();
+        poll_fsr2_transient_capture_hotkey();
 #endif
-    // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
-    if (fsr2_family_skip_gate(context, index_count, true))
-        return;
-    // ⚠️ 内省窗口只包住这一次调用（B105）：`perf_inspect_scope` 在出口按情况记
-    // "本次耗时"或"未内省 = 0"，两槽样本集合因此恒等。
+        // 没有新成功接管的证据时不得跳过游戏自带的预处理。
+        if (fsr2_family_skip_gate(context, element_count, Indexed))
+            return true;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_inspect_scope.start();
+        perf_inspect_scope.start();
 #endif
-    const auto target_draw_info = inspect_target_upscaler_draw(context, index_count, perf_draw_shape);
+        std::optional<neo::graphics::FrameBindings> bindings;
+        const auto target = inspect_target_upscaler_draw(context, element_count, bindings, perf_draw_shape);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_inspect_scope.stop();
+        perf_inspect_scope.stop();
 #endif
-    if (target_draw_info && g_config.fsr2_translation_mode >= 3)
-        observe_fsr2_dynamic_color_target(*target_draw_info);
-    maybe_track_fsr2_color_candidate(context, index_count);
+        if (target && g_config.fsr2_translation_mode >= 3)
+            observe_fsr2_dynamic_color_target(*target);
+        maybe_track_fsr2_color_candidate(context, element_count);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    if (target_draw_info)
-        begin_fsr2_transient_capture(context, *target_draw_info);
-    maybe_dump_color_candidate_inputs(context, index_count);
-    maybe_dump_same_frame_fsr2_inputs(context, index_count);
-    // 旧翻译层 probe 停用（旧方案隔离）
+        if (target)
+            begin_fsr2_transient_capture(context, *target);
+        maybe_dump_color_candidate_inputs(context, element_count);
+        maybe_dump_same_frame_fsr2_inputs(context, element_count);
 #endif
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    const bool fsr2_translation_handled = try_fsr2_translation_draw(context, index_count, target_draw_info, [&]
-        {
-            g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
-        });
-    note_family_notify(fsr2_translation_handled, target_draw_info ? &*target_draw_info : nullptr);
+        const bool handled = try_fsr2_translation_draw(context, target, bindings);
+        note_family_notify(handled, target ? &*target : nullptr);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    finish_fsr2_transient_capture_fallback();
+        finish_fsr2_transient_capture_fallback();
 #endif
-    if (fsr2_translation_handled)
-        return;
+        return handled;
+#else
+        return false;
 #endif
-
-    if (try_hdr_sdr_tone_map_draw(context, index_count, [&]
-        {
-            g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
-        }))
-        return;
-
+    };
+    const auto tone_map = [&](auto &original) { return try_hdr_sdr_tone_map_draw(context, element_count, original); };
+    const auto spatial = [&](auto &original)
+    {
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    if (try_spatial_copy_draw(context, index_count, [&]
-        {
-            g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
-        }))
-        return;
-
-    if (g_config.enable_similarity_probe ||
-        (g_config.trace_pixel_shader_draws && g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
-        record_similarity_draw("draw_indexed", index_count);
+        return try_spatial_copy_draw(context, element_count, original);
+#else
+        (void)original;
+        return false;
 #endif
+    };
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
     bool final_scene_snapshot_boundary = false;
     std::uint64_t final_scene_snapshot_frame = 0;
-    final_scene_snapshot_boundary =
-        matches_final_scene_boundary(index_count, true, final_scene_snapshot_frame);
 #endif
-    g_original_draw_indexed(context, index_count, start_index_location, base_vertex_location);
+    neo::graphics::execute_draw(draw, upscale, tone_map, spatial, [&]
+    {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+        if (g_config.enable_similarity_probe || (g_config.trace_pixel_shader_draws &&
+            g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
+            record_similarity_draw(entry_name, element_count);
+#endif
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
-    if (final_scene_snapshot_boundary)
-        queue_final_scene_snapshot(context, final_scene_snapshot_frame);
+        final_scene_snapshot_boundary = matches_final_scene_boundary(element_count, Indexed, final_scene_snapshot_frame);
 #endif
+    }, [&]
+    {
+#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
+        if (final_scene_snapshot_boundary)
+            queue_final_scene_snapshot(context, final_scene_snapshot_frame);
+#endif
+    });
 }
 
-// ---------------------------------------------------------------------------
-void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location)
+void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT count, UINT start, INT base)
 {
-    // 【诊断】PerfProbe：与 hooked_draw_indexed 同一处置（抽样计时，含所有 return 路径；
-    // 直方图槽 0 的落桶在 SampledScope 析构里，见 B105）。
+    route_game_draw<true>(context, count,
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::SampledScope perf_scope(perf_probe::Segment::draw_hook,
-                                        perf_probe::draw_call_counter(),
-                                        perf_probe::draw_sample_counter(),
-                                        perf_probe::draw_sample_stride(),
-                                        perf_probe::k_draw_all_slot);
-    perf_probe::maybe_flush();
+        perf_probe::DrawShapeSlot::indexed(count, start, base),
 #endif
-    // 【诊断】与 hooked_draw_indexed 同一处置（内省窗口；未内省记 0）。
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::DrawInspectScope perf_inspect_scope(perf_scope.sampled());
-#endif
-    // 【诊断】B107 形状分桶（与 hooked_draw_indexed 同一处置，形状种类 = `dr`）。
-    // 两个入口共用一张形状表 ⇒ 日志里能直接看出"这 490 次调用里有多少走的是
-    // 非索引路径"（`dr` 行）—— 这也是"索引数/顶点数"判别式的一部分。
-    const perf_probe::DrawShapeMarkArmed perf_draw_shape = perf_probe::make_draw_shape_mark(
-        perf_probe::DrawShapeSlot::non_indexed(vertex_count, start_vertex_location));
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_probe::mark_draw_shape_call(perf_draw_shape);
-#endif
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    capture_runtime_snapshot_if_requested();
-#endif
-    static std::atomic_bool hook_logged { false };
-    if (!hook_logged.load(std::memory_order_relaxed) &&
-        !hook_logged.exchange(true, std::memory_order_relaxed))
-        LOG_INFO(blog::cat::core, "draw_hook_active");
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    record_color_source_call("draw", vertex_count, 0, 0);
-    maybe_dump_target_color_chain(context, vertex_count);
-#endif
-#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
-    record_final_scene_probe_draw(vertex_count, false);
-#endif
-    record_hdr_composite_candidate(vertex_count, false);
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    poll_fsr2_transient_capture_hotkey();
-#endif
-    // Phase 1：FSR2 合成族预处理 pass 跳过（仅当上一帧累积 pass 被桥成功替换且未超时）
-    if (fsr2_family_skip_gate(context, vertex_count, false))
-        return;
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_inspect_scope.start();
-#endif
-    const auto target_draw_info = inspect_target_upscaler_draw(context, vertex_count, perf_draw_shape);
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    perf_inspect_scope.stop();
-#endif
-    if (target_draw_info && g_config.fsr2_translation_mode >= 3)
-        observe_fsr2_dynamic_color_target(*target_draw_info);
-    maybe_track_fsr2_color_candidate(context, vertex_count);
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    if (target_draw_info)
-        begin_fsr2_transient_capture(context, *target_draw_info);
-    maybe_dump_color_candidate_inputs(context, vertex_count);
-    maybe_dump_same_frame_fsr2_inputs(context, vertex_count);
-    // 旧翻译层 probe 停用（旧方案隔离）
-#endif
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
-    const bool fsr2_translation_handled = try_fsr2_translation_draw(context, vertex_count, target_draw_info, [&]
-        {
-            g_original_draw(context, vertex_count, start_vertex_location);
-        });
-    note_family_notify(fsr2_translation_handled, target_draw_info ? &*target_draw_info : nullptr);
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    finish_fsr2_transient_capture_fallback();
-#endif
-    if (fsr2_translation_handled)
-        return;
-#endif
+        [&] { g_original_draw_indexed(context, count, start, base); });
+}
 
-    if (try_hdr_sdr_tone_map_draw(context, vertex_count, [&]
-        {
-            g_original_draw(context, vertex_count, start_vertex_location);
-        }))
-        return;
-
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    if (try_spatial_copy_draw(context, vertex_count, [&]
-        {
-            g_original_draw(context, vertex_count, start_vertex_location);
-        }))
-        return;
-
-    if (g_config.enable_similarity_probe ||
-        (g_config.trace_pixel_shader_draws && g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
-        record_similarity_draw("draw", vertex_count);
+void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT count, UINT start)
+{
+    route_game_draw<false>(context, count,
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        perf_probe::DrawShapeSlot::non_indexed(count, start),
 #endif
-#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
-    bool final_scene_snapshot_boundary = false;
-    std::uint64_t final_scene_snapshot_frame = 0;
-    final_scene_snapshot_boundary =
-        matches_final_scene_boundary(vertex_count, false, final_scene_snapshot_frame);
-#endif
-    g_original_draw(context, vertex_count, start_vertex_location);
-#if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
-    if (final_scene_snapshot_boundary)
-        queue_final_scene_snapshot(context, final_scene_snapshot_frame);
-#endif
+        [&] { g_original_draw(context, count, start); });
 }
 
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)
 {
     const HRESULT hr = g_original_map(context, resource, subresource, map_type, map_flags, mapped);
+    // WARP 的阻塞读回也会恢复运行时槽。普通写 Map 和 Draw 不执行这条检查。
+    if ((map_type == D3D11_MAP_READ || map_type == D3D11_MAP_READ_WRITE) && context &&
+        (!g_original_draw.bound_on(context) || !g_original_draw_indexed.bound_on(context)))
+    {
+        const bool installed = install_context_hooks(context);
+        static std::atomic_uint32_t receipts { 0 };
+        if (receipts.fetch_add(1, std::memory_order_relaxed) < 8)
+            LOG_INFO(blog::cat::hook, "read_map_context_reinstalled patch_ok=" + std::to_string(installed));
+    }
     if (SUCCEEDED(hr) && resource != nullptr && mapped != nullptr && mapped->pData != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
@@ -14541,52 +12483,80 @@ void STDMETHODCALLTYPE hooked_clear_dsv(ID3D11DeviceContext *context, ID3D11Dept
     g_original_clear_dsv(context, dsv, flags, depth, stencil);
 }
 
-void install_context_hooks(ID3D11DeviceContext *context)
+std::span<const com_vtable::MethodPatch> context_patch_plan()
 {
-    if (context == nullptr)
-        return;
-
-    ID3D11DeviceContext *execution = interface_layout::execution_context(context);
-    if (execution != nullptr)
+    // 配置在安装入口前已冻结；保护开关和读回复用一次构造的计划。
+    static const auto configured = []
     {
-        if (execution != context)
-        {
-            install_context_hooks(execution);
-            execution->Release();
-            return;
-        }
-        execution->Release();
-    }
-
-    std::vector<std::pair<std::size_t, void *>> patches {
-        { k_idx_ps_set_shader_resources, reinterpret_cast<void *>(&hooked_ps_set_shader_resources) },
-        { k_idx_ps_set_shader, reinterpret_cast<void *>(&hooked_ps_set_shader) },
-        { k_idx_ps_set_constant_buffers, reinterpret_cast<void *>(&hooked_ps_set_constant_buffers) },
-        { k_idx_om_set_render_targets, reinterpret_cast<void *>(&hooked_om_set_render_targets) },
-        { k_idx_om_set_render_targets_and_uavs, reinterpret_cast<void *>(&hooked_om_set_render_targets_and_uavs) },
-        { k_idx_draw_indexed, reinterpret_cast<void *>(&hooked_draw_indexed) },
-        { k_idx_draw, reinterpret_cast<void *>(&hooked_draw) },
-        { k_idx_map, reinterpret_cast<void *>(&hooked_map) },
-        { k_idx_unmap, reinterpret_cast<void *>(&hooked_unmap) },
-        { k_idx_rs_set_viewports, reinterpret_cast<void *>(&hooked_rs_set_viewports) },
-        { k_idx_copy_resource, reinterpret_cast<void *>(&hooked_copy_resource) },
-        { k_idx_update_subresource, reinterpret_cast<void *>(&hooked_update_subresource) },
-    };
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    patches.insert(patches.end(), {
-        { k_idx_vs_set_constant_buffers, reinterpret_cast<void *>(&hooked_vs_set_constant_buffers) },
-        { k_idx_vs_set_shader, reinterpret_cast<void *>(&hooked_vs_set_shader) },
-        { k_idx_cs_set_shader_resources, reinterpret_cast<void *>(&hooked_cs_set_shader_resources) },
-        { k_idx_cs_set_uavs, reinterpret_cast<void *>(&hooked_cs_set_uavs) },
-        { k_idx_cs_set_shader, reinterpret_cast<void *>(&hooked_cs_set_shader) },
-        { k_idx_cs_set_constant_buffers, reinterpret_cast<void *>(&hooked_cs_set_constant_buffers) },
-        { k_idx_dispatch, reinterpret_cast<void *>(&hooked_dispatch) },
-        { k_idx_copy_subresource_region, reinterpret_cast<void *>(&hooked_copy_subresource_region) },
-        { k_idx_clear_rtv, reinterpret_cast<void *>(&hooked_clear_rtv) },
-        { k_idx_clear_dsv, reinterpret_cast<void *>(&hooked_clear_dsv) },
-    });
+        // 2026-11-15：发布版 Mode 2 按需路径直接查询执行上下文；这些 Set 槽原先只透传。
+        // 只在配置确实消费状态镜像时安装它们；保留独立纹理观察和开发构建的诊断。
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+        constexpr bool release = true;
+#else
+        constexpr bool release = false;
 #endif
-    patch_vtable_methods(context, context_vtable_size(context), patches);
+        const auto plan = neo::graphics::context_observation(release,
+            g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state,
+            g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm, g_config.dx11_on12_swapchain);
+        std::vector<com_vtable::MethodPatch> patches {
+            route_slot(g_original_draw_indexed),
+            route_slot(g_original_draw),
+            route_slot(g_original_map),
+            route_slot(g_original_unmap),
+            route_slot(g_original_copy_resource),
+            route_slot(g_original_update_subresource),
+        };
+        if (plan.mirror_state)
+        {
+            patches.insert(patches.end(), {
+                route_slot(g_original_ps_set_shader_resources),
+                route_slot(g_original_ps_set_shader),
+                route_slot(g_original_ps_set_constant_buffers),
+                route_slot(g_original_rs_set_viewports),
+            });
+        }
+        if (plan.track_targets)
+            patches.push_back(route_slot(g_original_om_set_render_targets));
+        if (plan.track_uavs)
+            patches.push_back(route_slot(g_original_om_set_render_targets_and_uavs));
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+        patches.insert(patches.end(), {
+            route_slot(g_original_vs_set_constant_buffers),
+            route_slot(g_original_vs_set_shader),
+            route_slot(g_original_cs_set_shader_resources),
+            route_slot(g_original_cs_set_uavs),
+            route_slot(g_original_cs_set_shader),
+            route_slot(g_original_cs_set_constant_buffers),
+            route_slot(g_original_dispatch),
+            route_slot(g_original_copy_subresource_region),
+            route_slot(g_original_clear_rtv),
+            route_slot(g_original_clear_dsv),
+        });
+#endif
+        return patches;
+    }();
+    return configured;
+}
+
+bool install_context_hooks(ID3D11DeviceContext *context)
+{
+    return context && neo::graphics::bind_execution_dispatch(context, context_patch_plan(),
+        route_slot(g_original_set_multithread_protected));
+}
+
+BOOL STDMETHODCALLTYPE hooked_set_multithread_protected(ID3D11Multithread *protection, BOOL enable)
+{
+    const BOOL previous = g_original_set_multithread_protected(protection, enable);
+    if (!protection) return previous;
+
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> execution;
+    const HRESULT hr = protection->QueryInterface(IID_PPV_ARGS(execution.GetAddressOf()));
+    const bool installed = SUCCEEDED(hr) && install_context_hooks(execution.Get());
+    static std::atomic_uint32_t receipts { 0 };
+    if (receipts.fetch_add(1, std::memory_order_relaxed) < 16)
+        LOG_INFO(blog::cat::hook, "multithread_context_reinstalled requested=" + std::to_string(enable != FALSE) +
+            " previous=" + std::to_string(previous != FALSE) + " patch_ok=" + std::to_string(installed));
+    return previous;
 }
 
 HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer)
@@ -14790,26 +12760,26 @@ bool install_device_hooks(ID3D11Device *device)
         return false;
 
 
-    std::vector<std::pair<std::size_t, void *>> patches {
-        { k_idx_device_create_buffer, reinterpret_cast<void *>(&hooked_create_buffer) },
-        { k_idx_device_create_pixel_shader, reinterpret_cast<void *>(&hooked_create_pixel_shader) },
+    std::vector<com_vtable::MethodPatch> patches {
+        route_slot(g_original_create_buffer),
+        route_slot(g_original_create_pixel_shader),
     };
     if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
     {
-        patches.emplace_back(k_idx_device_create_texture_2d, reinterpret_cast<void *>(&hooked_create_texture_2d));
+        patches.push_back(route_slot(g_original_create_texture_2d));
     }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     patches.insert(patches.end(), {
-        { k_idx_device_create_vertex_shader, reinterpret_cast<void *>(&hooked_create_vertex_shader) },
-        { k_idx_device_create_compute_shader, reinterpret_cast<void *>(&hooked_create_compute_shader) },
+        route_slot(g_original_create_vertex_shader),
+        route_slot(g_original_create_compute_shader),
     });
 #endif
-    bool installed = patch_vtable_methods(device, interface_layout::device(device), patches);
+    bool installed = com_vtable::patch(device, interface_layout::device(device), patches);
 
     if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
     {
-        const std::vector<std::pair<std::size_t, void *>> texture_patches {
-            { k_idx_device_create_texture_2d, reinterpret_cast<void *>(&hooked_create_texture_2d) },
+        const std::vector<com_vtable::MethodPatch> texture_patches {
+            route_slot(g_original_create_texture_2d),
         };
         auto patch_extended_interface = [&](REFIID interface_id, const char *interface_name, std::size_t minimum)
         {
@@ -14817,7 +12787,7 @@ bool install_device_hooks(ID3D11Device *device)
             if (FAILED(device->QueryInterface(interface_id, reinterpret_cast<void **>(&extended))) || extended == nullptr)
                 return;
             const auto interface_key = reinterpret_cast<std::uint64_t>(extended);
-            const bool extended_installed = patch_vtable_methods(extended, interface_layout::device(
+            const bool extended_installed = com_vtable::patch(extended, interface_layout::device(
                 reinterpret_cast<ID3D11Device *>(extended), minimum), texture_patches);
             installed = extended_installed && installed;
             LOG_DEBUG(blog::cat::hook, std::string("texture_device_interface_hook interface=") + interface_name +
@@ -14987,26 +12957,26 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
     }
 
     const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
-    std::vector<std::pair<std::size_t, void *>> patches;
+    std::vector<com_vtable::MethodPatch> patches;
     if (should_hook_present)
-        patches.emplace_back(k_idx_present, reinterpret_cast<void *>(&hooked_present));
+        patches.push_back(route_slot(g_original_present));
     if (should_hook_general_swapchain_controls)
     {
-        patches.emplace_back(k_idx_set_fullscreen_state, reinterpret_cast<void *>(&hooked_set_fullscreen_state));
-        patches.emplace_back(k_idx_get_fullscreen_state, reinterpret_cast<void *>(&hooked_get_fullscreen_state));
-        patches.emplace_back(k_idx_resize_buffers, reinterpret_cast<void *>(&hooked_resize_buffers));
-        patches.emplace_back(k_idx_resize_target, reinterpret_cast<void *>(&hooked_resize_target));
+        patches.push_back(route_slot(g_original_set_fullscreen_state));
+        patches.push_back(route_slot(g_original_get_fullscreen_state));
+        patches.push_back(route_slot(g_original_resize_buffers));
+        patches.push_back(route_slot(g_original_resize_target));
     }
     else if (should_hook_native_ldr_resize)
     {
-        patches.emplace_back(k_idx_resize_buffers, reinterpret_cast<void *>(&hooked_resize_buffers));
+        patches.push_back(route_slot(g_original_resize_buffers));
     }
     if (should_hook_color && has_color_interface)
     {
-        patches.emplace_back(k_idx_check_color_space_support, reinterpret_cast<void *>(&hooked_check_color_space_support));
-        patches.emplace_back(k_idx_set_color_space1, reinterpret_cast<void *>(&hooked_set_color_space1));
+        patches.push_back(route_slot(g_original_check_color_space_support));
+        patches.push_back(route_slot(g_original_set_color_space1));
         if (supports_hdr_metadata)
-            patches.emplace_back(k_idx_set_hdr_metadata, reinterpret_cast<void *>(&hooked_set_hdr_metadata));
+            patches.push_back(route_slot(g_original_set_hdr_metadata));
 
         DXGI_SWAP_CHAIN_DESC desc {};
         if (SUCCEEDED(swapchain->GetDesc(&desc)))
@@ -15032,7 +13002,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
 #endif
         }
     }
-    patch_vtable_methods(hook_instance, hook_method_count, patches);
+    com_vtable::patch(hook_instance, hook_method_count, patches);
     if (swapchain4 != nullptr)
         swapchain4->Release();
     if (swapchain3 != nullptr)
@@ -15062,8 +13032,8 @@ void install_factory_hooks(IDXGIFactory *factory)
         return;
 
 
-    patch_vtable_methods(factory, interface_layout::factory(factory), {
-        { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
+    com_vtable::patch(factory, interface_layout::factory(factory), {
+        route_slot(g_original_factory_create_swap_chain),
     });
 }
 
@@ -15073,9 +13043,9 @@ void install_factory2_hooks(IDXGIFactory2 *factory)
         return;
 
 
-    patch_vtable_methods(factory, interface_layout::factory(factory, 25), {
-        { k_idx_factory_create_swap_chain, reinterpret_cast<void *>(&hooked_factory_create_swap_chain) },
-        { k_idx_factory2_create_swap_chain_for_hwnd, reinterpret_cast<void *>(&hooked_factory2_create_swap_chain_for_hwnd) },
+    com_vtable::patch(factory, interface_layout::factory(factory, 25), {
+        route_slot(g_original_factory_create_swap_chain),
+        route_slot(g_original_factory2_create_swap_chain_for_hwnd),
     });
 }
 
@@ -15114,31 +13084,23 @@ void install_factory_hooks_from_device(ID3D11Device *device)
     dxgi_device->Release();
 }
 
-void observe_created_device(ID3D11Device *device, ID3D11DeviceContext *context)
+void bind_created_graphics(ID3D11Device *device, ID3D11DeviceContext *execution)
 {
-    // 2026-11-15：真实 WARP device-only 负控证实，创建时省略 context 输出会
-    // 漏装所有绘制捕获。这里只补全成功返回对象所属的配对，不改变调用者输出。
-    ID3D11Device *owned_device = nullptr;
-    ID3D11DeviceContext *owned_context = nullptr;
-    if (!device && context)
-    {
-        context->GetDevice(&owned_device);
-        device = owned_device;
-    }
-    if (!context && device)
-    {
-        device->GetImmediateContext(&owned_context);
-        context = owned_context;
-    }
     install_device_hooks(device);
     install_factory_hooks_from_device(device);
-    install_context_hooks(context);
+    install_context_hooks(execution);
     route_from_d3d11_device(device);
-    if (owned_context)
-        owned_context->Release();
-    if (owned_device)
-        owned_device->Release();
 }
+
+const neo::graphics::IngressSink k_graphics_ingress {
+    &bind_created_graphics,
+    [](IDXGISwapChain *chain)
+    {
+        if (swapchain_hook_needed())
+            install_swapchain_hooks(chain);
+    },
+    &set_output_size,
+};
 
 HRESULT create_device_and_swapchain_with(create_device_and_swapchain_fn next,
     IDXGIAdapter *adapter,
@@ -15183,15 +13145,9 @@ HRESULT create_device_and_swapchain_with(create_device_and_swapchain_fn next,
 
     if (creation.outermost() && SUCCEEDED(hr))
     {
-        observe_created_device(device != nullptr ? *device : nullptr, context != nullptr ? *context : nullptr);
-        if (swapchain != nullptr && *swapchain != nullptr)
-        {
-            DXGI_SWAP_CHAIN_DESC created_desc {};
-            if (SUCCEEDED((*swapchain)->GetDesc(&created_desc)))
-                set_output_size(created_desc.BufferDesc.Width, created_desc.BufferDesc.Height, "CreateDeviceAndSwapChain");
-            if (swapchain_hook_needed())
-                install_swapchain_hooks(*swapchain);
-        }
+        neo::graphics::publish_creation(hr, { neo::graphics::CreationPath::combined,
+            device ? *device : nullptr, context ? *context : nullptr, swapchain ? *swapchain : nullptr },
+            k_graphics_ingress);
         LOG_INFO(blog::cat::core, "hooked D3D11CreateDeviceAndSwapChain");
     }
     return hr;
@@ -15225,7 +13181,8 @@ HRESULT create_device_with(create_device_fn next,
 
     if (creation.outermost() && SUCCEEDED(hr))
     {
-        observe_created_device(device != nullptr ? *device : nullptr, context != nullptr ? *context : nullptr);
+        neo::graphics::publish_creation(hr, { neo::graphics::CreationPath::device,
+            device ? *device : nullptr, context ? *context : nullptr }, k_graphics_ingress);
         LOG_INFO(blog::cat::core, "hooked D3D11CreateDevice");
     }
     return hr;
@@ -15296,10 +13253,9 @@ HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory
 #endif
     if (SUCCEEDED(hr))
     {
-        if (desc != nullptr)
-            set_output_size(desc->BufferDesc.Width, desc->BufferDesc.Height, "CreateSwapChain");
-        if (swapchain_hook_needed())
-            install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
+        using namespace neo::graphics;
+        publish_creation(hr, { CreationPath::factory, nullptr, nullptr, swapchain ? *swapchain : nullptr,
+            desc ? Extent { desc->BufferDesc.Width, desc->BufferDesc.Height } : Extent {} }, k_graphics_ingress);
         if (desc != nullptr)
             LOG_INFO(blog::cat::core, "hooked CreateSwapChain size=" + std::to_string(desc->BufferDesc.Width) + "x" + std::to_string(desc->BufferDesc.Height));
         else
@@ -15342,10 +13298,9 @@ HRESULT STDMETHODCALLTYPE hooked_factory2_create_swap_chain_for_hwnd(IDXGIFactor
 #endif
     if (SUCCEEDED(hr))
     {
-        if (desc != nullptr)
-            set_output_size(desc->Width, desc->Height, "CreateSwapChainForHwnd");
-        if (swapchain_hook_needed())
-            install_swapchain_hooks(swapchain != nullptr ? *swapchain : nullptr);
+        using namespace neo::graphics;
+        publish_creation(hr, { CreationPath::factory_hwnd, nullptr, nullptr, swapchain ? *swapchain : nullptr,
+            desc ? Extent { desc->Width, desc->Height } : Extent {} }, k_graphics_ingress);
         if (desc != nullptr)
             LOG_INFO(blog::cat::core, "hooked CreateSwapChainForHwnd size=" + std::to_string(desc->Width) + "x" + std::to_string(desc->Height));
         else
@@ -15756,56 +13711,6 @@ static void route_from_d3d11_device(ID3D11Device *d3d11_device)
         record_adapter_info(vendor, device_id, desc_text);
 }
 
-// ---------------------------------------------------------------------------
-// il2cpp 特征识别结果缓存（每个进程只算一次）
-//
-// 为什么需要缓存：`detect_ffx12_method_rvas()` 要遍历 .rdata/.data（本机实测约 62 MB
-// → 约 780 万个 u64）后再排序去重，一次性开销不可忽略；而现在有**两个**功能需要
-// 同一个相机锚点（il2cpp 调用点钩子、TransparentJitter 修复），各算一次等于把启动
-// 开销翻倍。
-//
-// 为什么两个功能**互不依赖**：只开 `TransparentJitter` 时也必须能工作 ——
-// 若把它塞进 `if (g_config.fsr2_il2cpp_hook)` 里，就会出现"ini 里设了没用"的
-// 静默失效。
-// ---------------------------------------------------------------------------
-struct Il2CppRvaCache
-{
-    bool detected = false;
-    std::uint32_t render = 0;
-    std::uint32_t ucb = 0;
-    std::uint32_t camera = 0;
-};
-
-const Il2CppRvaCache &il2cpp_rva_cache()
-{
-    // 线程安全的神奇静态：只在第一次调用时做特征识别，之后直接返回缓存。
-    static const Il2CppRvaCache cache = []()
-        {
-            Il2CppRvaCache result;
-            const std::uint64_t base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
-            result.detected =
-                il2cpp_callsite::detect_ffx12_method_rvas(base, result.render, result.ucb, result.camera);
-            return result;
-        }();
-    return cache;
-}
-
-// 主模块的 SizeOfImage（候选目标越界检查用）。失败返回 0（调用方据此拒绝安装）。
-std::uint64_t main_module_image_size()
-{
-    const auto *base = reinterpret_cast<const std::uint8_t *>(GetModuleHandleW(nullptr));
-    if (base == nullptr)
-        return 0;
-    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return 0;
-    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-        return 0;
-    return nt->OptionalHeader.SizeOfImage;
-}
-
 // 【正式功能】TransparentJitter 修复的日志出口与帧号来源。
 // 该模块刻意不依赖 BridgeLogger ⇒ 这里注入；关闭修复时**不注册**（零开销）。
 void transparent_jitter_log(const char *line)
@@ -15842,7 +13747,10 @@ void initialize()
     g_similarity_path = g_module_dir / L"Dx11FsrBridge.similarity.txt";
     g_ps_trace_path = g_module_dir / L"Dx11FsrBridge.ps_trace.jsonl";
 #endif
-    load_config();
+    auto loaded = neo::runtime::read_config(g_module_dir);
+    g_config = std::move(loaded.config);
+    g_backend_auto_requested = loaded.backend_auto;
+    g_logging_enabled.store(g_config.enable_logging, std::memory_order_relaxed);
 
     // 不再做显卡型号识别/402c 双路径——所有显卡统一 preload 默认 provider
     // （Ffx12DllPath，默认 payload\AMD\amd_fidelityfx_upscaler_dx12.dll），
@@ -15917,7 +13825,8 @@ void initialize()
 #endif
 
     g_active = true;
-    LOG_INFO(blog::cat::core, "Dx11FsrBridge active pid=" + std::to_string(GetCurrentProcessId()));
+    LOG_INFO(blog::cat::core, "Dx11FsrBridge active pid=" + std::to_string(GetCurrentProcessId()) +
+        " runtime=neo observation_schema=neo.1");
     blog::log_effective_config();
 #if defined(DX11FSRBRIDGE_SERVER_DEBUG_RUNTIME)
     wchar_t process_path[MAX_PATH] {};
@@ -15960,16 +13869,24 @@ void initialize()
         const std::uint64_t exe_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
         // 特征识别优先（不依赖硬编码 RVA——国服/国际服/版本更新通用）：
         // g_MethodPointers + FFX_FSR2 30 方法尺寸序列 gap 匹配；失败用配置（硬编码兜底）。
-        // 结果走缓存：TransparentJitter 修复用同一个锚点（见 il2cpp_rva_cache 的注释）。
-        const Il2CppRvaCache &detected = il2cpp_rva_cache();
-        if (detected.detected)
+        // 结果走缓存：TransparentJitter 修复用同一个锚点。
+        const auto &detected = neo::game::current_version();
+        if (detected.camera_compatible)
+            hook_cfg.camera_rva = detected.camera;
+        if (detected.render_compatible)
         {
             hook_cfg.render_rva = detected.render;
-            hook_cfg.update_cmd_buffer_rva = detected.ucb;
-            hook_cfg.camera_rva = detected.camera;
+            hook_cfg.update_cmd_buffer_rva = detected.update;
             LOG_INFO(blog::cat::hook, "fsr2_il2cpp_rva_feature_match render=" + hex64(detected.render) +
-                " ucb=" + hex64(detected.ucb) +
-                " camera=" + hex64(detected.camera));
+                " ucb=" + hex64(detected.update) +
+                " camera=" + hex64(detected.camera) +
+                " exact_gaps=" + std::to_string(detected.exact_gaps));
+        }
+        else
+        {
+            LOG_INFO(blog::cat::hook, std::string("fsr2_il2cpp_rva_fallback status=") +
+                neo::game::discovery_status(detected.status) +
+                " compatible_prologue=0 source=config_checked");
         }
         LOG_DEBUG(blog::cat::upscale, "ffx12_camera_config probe=" +
             std::to_string(g_config.ffx12_probe_camera ? 1 : 0) +
@@ -15985,7 +13902,11 @@ void initialize()
             LOG_INFO(blog::cat::probe, camera_target);
         }
         const char *install_reason = nullptr;
-        if (il2cpp_callsite::install(exe_base, hook_cfg, &install_reason))
+        const bool render_range = neo::game::module_contains_executable(
+            exe_base, hook_cfg.render_rva, sizeof(neo::game::k_render_head)) &&
+            neo::game::module_contains_executable(exe_base, hook_cfg.update_cmd_buffer_rva, sizeof(neo::game::k_ucb_head));
+        if (!render_range) install_reason = "outside_executable_section";
+        if (render_range && il2cpp_callsite::install(exe_base, hook_cfg, &install_reason))
             LOG_INFO(blog::cat::hook, "fsr2_il2cpp_hook_installed mode=" +
                 (g_config.fsr2_il2cpp_skip_render ? std::string("skip") : std::string("observe")) +
                 " render_va=" + hex64(exe_base + hook_cfg.render_rva));
@@ -16012,7 +13933,8 @@ void initialize()
         }
         if (g_config.ffx12_camera_hook)
         {
-            if (il2cpp_callsite::install_camera(exe_base, hook_cfg))
+            if (neo::game::module_contains_executable(exe_base, hook_cfg.camera_rva,
+                sizeof(neo::game::k_camera_head)) && il2cpp_callsite::install_camera(exe_base, hook_cfg))
                 LOG_DEBUG(blog::cat::upscale, "ffx12_camera_hook_installed va=" +
                     hex64(exe_base + hook_cfg.camera_rva));
             else
@@ -16021,7 +13943,8 @@ void initialize()
         }
         if (g_config.ffx12_projection_hook)
         {
-            if (il2cpp_callsite::install_projection_setter(exe_base, hook_cfg))
+            if (neo::game::module_contains_executable(exe_base, hook_cfg.projection_setter_rva,
+                sizeof(neo::game::k_projection_head)) && il2cpp_callsite::install_projection_setter(exe_base, hook_cfg))
                 LOG_DEBUG(blog::cat::upscale, "ffx12_projection_hook_installed va=" +
                     hex64(exe_base + hook_cfg.projection_setter_rva));
             else
@@ -16039,7 +13962,7 @@ void initialize()
     if (g_config.transparent_jitter)
     {
         const std::uint64_t jitter_base = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
-        const Il2CppRvaCache &jitter_detected = il2cpp_rva_cache();
+        const auto &jitter_detected = neo::game::current_version();
         transparent_jitter::Config jitter_cfg;
         // 生产路径恒为 (hook=1, force=1)：装上钩子 + 改写那一个 bool 实参。
         // `TransparentJitter=0` 已经在上面短路，所以这里没有"装钩但不改"的第三种状态。
@@ -16047,13 +13970,16 @@ void initialize()
         jitter_cfg.force = true;
         // 锚点：特征识别优先，配置 RVA 兜底（load_config 已按 exe 名套用国际服的默认值）。
         // 无论走哪条，install 都会先用 14 字节序言校验 —— 地址错只会"拒绝安装"，不会误 patch。
-        jitter_cfg.camera_rva = jitter_detected.detected ? jitter_detected.camera : g_config.ffx12_camera_rva;
-        jitter_cfg.image_size = main_module_image_size();
-        jitter_cfg.anchor_source = jitter_detected.detected ? "feature" : "config";
+        jitter_cfg.camera_rva = jitter_detected.camera_compatible ? jitter_detected.camera : g_config.ffx12_camera_rva;
+        jitter_cfg.image_size = jitter_detected.image_size;
+        jitter_cfg.anchor_source = jitter_detected.camera_compatible ? "feature" : "config";
         transparent_jitter::set_log_sink(&transparent_jitter_log);
         transparent_jitter::set_frame_provider(&transparent_jitter_frame);
         const char *jitter_reason = nullptr;
-        if (!transparent_jitter::install(jitter_base, jitter_cfg, &jitter_reason))
+        const bool camera_range = neo::game::module_contains_executable(
+            jitter_base, jitter_cfg.camera_rva, sizeof(neo::game::k_camera_head));
+        if (!camera_range) jitter_reason = "outside_executable_section";
+        if (!camera_range || !transparent_jitter::install(jitter_base, jitter_cfg, &jitter_reason))
         {
             // ⚠️ 如实报出失败原因：分不清"锚点没找到 / 序言不匹配（游戏更新）/
             // 分配失败"就只能靠猜，而三者处置完全不同（同 Il2CppCallSiteHook 的纪律）。
@@ -16061,7 +13987,7 @@ void initialize()
                 (jitter_reason != nullptr ? std::string(jitter_reason) : std::string("unknown")) +
                 " camera_rva=" + hex64(jitter_cfg.camera_rva) +
                 " image_size=" + std::to_string(jitter_cfg.image_size) +
-                " feature_detected=" + std::to_string(jitter_detected.detected ? 1 : 0));
+                " feature_detected=" + std::to_string(jitter_detected.camera_compatible ? 1 : 0));
         }
         // 成功时**不在这里再打一行**：模块自己打的 `transparent_jitter_installed ...`
         // 已经含定位来源 / setter RVA / 调用点静态常量 / 是否强制 —— 那是本功能在正式版里

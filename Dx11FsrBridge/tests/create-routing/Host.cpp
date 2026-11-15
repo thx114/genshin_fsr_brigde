@@ -1,11 +1,13 @@
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_5.h>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include "DrawCapture.h"
 
 namespace
@@ -15,11 +17,24 @@ namespace
 constexpr bool k_ngx_swapchain_hooks = DX11FSRBRIDGE_TEST_NGX != 0;
 int failures = 0;
 HANDLE capture_receipt = nullptr;
+HANDLE hwnd_receipt = nullptr;
+HANDLE draw_receipt = nullptr;
+std::atomic_uint draw_entries = 0;
+unsigned expected_draw_entries = 3;
 
 void WINAPI capture_debug_line(LPCSTR line)
 {
     if (std::strstr(line, "fsr2_translation_candidate render=64x64 output=128x128"))
         SetEvent(capture_receipt);
+    if (hwnd_receipt && std::strstr(line, "hooked CreateSwapChainForHwnd size="))
+        SetEvent(hwnd_receipt);
+    if (draw_receipt)
+    {
+        const unsigned entry = std::strstr(line, "draw_indexed_hook_active") ? 2 :
+            std::strstr(line, "draw_hook_active") ? 1 : 0;
+        if (entry && ((draw_entries.fetch_or(entry) | entry) & expected_draw_entries) == expected_draw_entries)
+            SetEvent(draw_receipt);
+    }
 }
 
 void expect(bool condition, const char *what)
@@ -73,6 +88,279 @@ bool belongs_to(HMODULE module, void *address)
         reinterpret_cast<LPCWSTR>(address), &owner) && owner == module;
 }
 
+using Microsoft::WRL::ComPtr;
+
+bool same_identity(IUnknown *first, IUnknown *second)
+{
+    ComPtr<IUnknown> a, b;
+    return first && second && SUCCEEDED(first->QueryInterface(IID_PPV_ARGS(&a))) &&
+        SUCCEEDED(second->QueryInterface(IID_PPV_ARGS(&b))) && a.Get() == b.Get();
+}
+
+std::array<void *, 2> draw_routes(ID3D11DeviceContext *context)
+{
+    auto **table = *reinterpret_cast<void ***>(context);
+    return {table[12], table[13]};
+}
+
+void print_context(const char *label, ID3D11DeviceContext *context)
+{
+    if (!context) return;
+    ComPtr<IUnknown> identity;
+    context->QueryInterface(IID_PPV_ARGS(&identity));
+    std::printf("context %s ptr=%p IUnknown=%p vtable=%p\n", label, context, identity.Get(),
+        *reinterpret_cast<void ***>(context));
+    const auto routes = draw_routes(context);
+    for (unsigned n = 0; n < routes.size(); ++n)
+    {
+        HMODULE owner = nullptr;
+        wchar_t path[MAX_PATH] {};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(routes[n]), &owner))
+            GetModuleFileNameW(owner, path, MAX_PATH);
+        std::printf("  %s=%p module=%ls\n", n == 0 ? "DrawIndexed" : "Draw", routes[n], path);
+    }
+}
+
+void check_alternate_draws(ID3D11Device *device, ID3D11DeviceContext *context)
+{
+    for (const auto &[entry, description] : std::array {
+        std::pair {CaptureEntry::instanced, "DrawInstanced pixels"},
+        std::pair {CaptureEntry::indexed_instanced, "DrawIndexedInstanced pixels"},
+        std::pair {CaptureEntry::indirect, "DrawInstancedIndirect pixels"},
+        std::pair {CaptureEntry::indexed_indirect, "DrawIndexedInstancedIndirect pixels"},
+        std::pair {CaptureEntry::command_list, "deferred Draw / ExecuteCommandList pixels"},
+        std::pair {CaptureEntry::dispatch, "Dispatch pixels"}})
+    {
+        expect(draw_capture(device, context, entry), description);
+        context->ClearState();
+    }
+}
+
+struct ForHwndFixture
+{
+    using Create = decltype(&D3D11CreateDevice);
+    ComPtr<IDXGIFactory2> factory;
+    ComPtr<IDXGIAdapter> adapter;
+    ComPtr<ID3D11Device> device, witness;
+    ComPtr<ID3D11DeviceContext> context;
+
+    HRESULT init(bool warp, bool mixed)
+    {
+        // 混合用例明确经过加载器所用的 F6 DXGI 代理导出。系统工厂有时仅因
+        // 后台 GPU 枚举已安装共享方法 detour 才进 F6，不能把这种时序当前置条件。
+        const auto create = mixed ? reinterpret_cast<decltype(&CreateDXGIFactory1)>(
+            GetProcAddress(GetModuleHandleW(L"OptiScaler.dll"), "CreateDXGIFactory1")) : &CreateDXGIFactory1;
+        if (!create) return E_NOINTERFACE;
+        // 2026-11-15：F6 的初始化线程可能晚于 LoadLibrary 返回；普通链不能冒充
+        // 混合正控。传入的隔离配置须将 debug 日志写到 ./OptiScaler.log。
+        // 以本宿主实际进入 F6 factory 的回执为闸门，超时失败，不以固定延时放行。
+        const auto deadline = GetTickCount64() + 10000;
+        wchar_t executable[MAX_PATH] {};
+        GetModuleFileNameW(nullptr, executable, MAX_PATH);
+        const auto marker = "hkCreateDXGIFactory1 Caller: " + std::filesystem::path(executable).filename().string();
+        unsigned attempts = 0;
+        for (;;)
+        {
+            factory.Reset();
+            const auto hr = create(IID_PPV_ARGS(&factory));
+            if (FAILED(hr)) return hr;
+            ++attempts;
+            if (!mixed) break;
+            std::ifstream log("OptiScaler.log");
+            std::string line;
+            bool ready = false;
+            while (std::getline(log, line))
+                if (line.find(marker) != std::string::npos) { ready = true; break; }
+            if (ready)
+            {
+                std::printf("F6 factory hook receipt observed after %u calls\n", attempts);
+                break;
+            }
+            if (GetTickCount64() >= deadline) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            Sleep(20);
+        }
+        if (!warp) return factory->EnumAdapters(0, &adapter);
+        ComPtr<IDXGIFactory4> factory4;
+        const auto qi = factory.As(&factory4);
+        return FAILED(qi) ? qi : factory4->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
+    }
+
+    HRESULT create_device(Create create, bool target)
+    {
+        return create(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, target ? device.GetAddressOf() : witness.GetAddressOf(), nullptr,
+            target ? context.GetAddressOf() : nullptr);
+    }
+
+    void run(HMODULE bridge, Create create, bool device_first, bool returned, bool mixed, bool mirrored,
+        bool multithread)
+    {
+        // 设备先用例只通过另一设备登记同一 factory；不能借此登记待测 context。
+        const HRESULT created = create_device(create, !device_first);
+        expect(SUCCEEDED(created) && device && context, "same-adapter device creation succeeds");
+        if (FAILED(created) || !device || !context) return;
+        const auto observed = [&](ID3D11DeviceContext *which) {
+            const auto routes = draw_routes(which);
+            return belongs_to(bridge, routes[0]) && belongs_to(bridge, routes[1]);
+        };
+        print_context("original-before-ForHwnd", context.Get());
+        expect(observed(context.Get()) == !device_first, "original Draw routes before ForHwnd match load order");
+        if (!mixed)
+            expect(belongs_to(bridge, (*reinterpret_cast<void ***>(factory.Get()))[15]),
+                "the actual factory receiver is hooked, not just another instance");
+
+        DXGI_SWAP_CHAIN_DESC1 desc {};
+        // 混合用例沿实际会话的窗口链描述走 F6 的 DX11-w-DX12 包装，不退回普通链充当正控。
+        desc.Width = mixed ? 2560 : 128;
+        desc.Height = mixed ? 1600 : 128;
+        desc.Format = mixed ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.BufferCount = mixed ? 1 : 2;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | (mixed ? DXGI_USAGE_SHADER_INPUT : 0);
+        desc.SwapEffect = mixed ? DXGI_SWAP_EFFECT_DISCARD : DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc.Flags = mixed ? DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH : 0;
+        ComPtr<IDXGISwapChain1> chain;
+        auto installed = draw_routes(context.Get());
+        if (!mixed)
+            expect(FAILED(factory->CreateSwapChainForHwnd(device.Get(), nullptr, &desc, nullptr, nullptr, &chain)) &&
+                !chain && draw_routes(context.Get()) == installed, "failed ForHwnd cannot change the context's routes");
+
+        const bool compare_alternates = returned && !mixed;
+        const unsigned rounds = mixed ? 1 : 2;
+        for (unsigned round = 0; round < rounds; ++round)
+        {
+            const HWND window = CreateWindowExW(0, L"STATIC", L"FSR bridge routing fixture", WS_POPUP,
+                0, 0, desc.Width, desc.Height, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            const auto hr = window ? factory->CreateSwapChainForHwnd(device.Get(), window, &desc, nullptr,
+                nullptr, &chain) : E_FAIL;
+            std::printf("CreateSwapChainForHwnd hr=%08lX chain=%p\n", static_cast<unsigned long>(hr), chain.Get());
+            expect(SUCCEEDED(hr) && chain, "real ForHwnd returns a swap chain");
+            if (!chain)
+            {
+                if (window) DestroyWindow(window);
+                return;
+            }
+            // 2026-11-15：混合宿主曾在普通交换链上通过绘制断言；必须另证实际
+            // 返回的是 F6 包装，才能把该用例计为 DX11-w-DX12 路径的正控。
+            if (mixed)
+                expect(belongs_to(GetModuleHandleW(L"OptiScaler.dll"),
+                    (*reinterpret_cast<void ***>(chain.Get()))[7]),
+                    "mixed ForHwnd returns an F6-owned GetDevice implementation");
+            ComPtr<ID3D11Device> chain_device;
+            const auto get_device = chain->GetDevice(IID_PPV_ARGS(&chain_device));
+            std::printf("swapchain GetDevice hr=%08lX device=%p original=%p\n",
+                static_cast<unsigned long>(get_device), chain_device.Get(), device.Get());
+            expect(SUCCEEDED(get_device) && same_identity(device.Get(), chain_device.Get()),
+                "returned chain belongs to the original DX11 device");
+            ComPtr<ID3D11DeviceContext> fetched;
+            if (chain_device) chain_device->GetImmediateContext(&fetched);
+            expect(same_identity(context.Get(), fetched.Get()), "chain's context has the original COM identity");
+            print_context("original-after-ForHwnd", context.Get());
+            print_context("swapchain-immediate", fetched.Get());
+            ComPtr<ID3D11DeviceContext4> extended;
+            const auto query = fetched ? fetched.As(&extended) : E_POINTER;
+            std::printf("context4 QI hr=%08lX\n", static_cast<unsigned long>(query));
+            if (extended)
+            {
+                auto *execution = static_cast<ID3D11DeviceContext *>(extended.Get());
+                print_context("swapchain-context4", execution);
+                expect(same_identity(fetched.Get(), execution), "extended context retains the COM identity");
+                expect(observed(execution), "extended interface has both production Draw routes");
+            }
+            expect(observed(context.Get()) && fetched && observed(fetched.Get()),
+                "original and chain-derived contexts both have production Draw routes");
+            if (compare_alternates || mirrored || !mixed)
+            {
+                const auto table = *reinterpret_cast<void ***>(context.Get());
+                const bool expect_mirror = mirrored || !DX11FSRBRIDGE_TEST_RELEASE;
+                // 公开 ID3D11DeviceContext 槽：4 个状态 setter 与 OMSetRenderTargets。
+                for (const auto method : { 8, 9, 16, 33, 44 })
+                    expect(belongs_to(bridge, table[method]) == expect_mirror,
+                        "same execution context binds only configuration-required state observers");
+            }
+            if (round == 0)
+                installed = draw_routes(context.Get());
+            else
+                expect(draw_routes(context.Get()) == installed, "repeat observation keeps the same Draw routes");
+            expect(WaitForSingleObject(hwnd_receipt, 5000) == WAIT_OBJECT_0,
+                "production success receipt proves real ForHwnd entered the bridge");
+            ResetEvent(hwnd_receipt);
+
+            auto *draw_context = returned ? fetched.Get() : context.Get();
+            auto *draw_device = returned ? chain_device.Get() : device.Get();
+            if (multithread && draw_context && draw_device)
+            {
+                ComPtr<ID3D11Multithread> protection;
+                expect(SUCCEEDED(draw_context->QueryInterface(IID_PPV_ARGS(protection.GetAddressOf()))) && protection,
+                    "execution context exposes multithread protection");
+                if (!protection) return;
+                ComPtr<ID3D11DeviceContext> execution;
+                expect(SUCCEEDED(protection.As(&execution)) && same_identity(draw_context, execution.Get()),
+                    "protection QI reaches the same execution context");
+                const auto all_routes = [&]
+                {
+                    auto **table = *reinterpret_cast<void ***>(draw_context);
+                    for (const auto slot : {12, 13, 14, 15, 47, 48})
+                        if (!belongs_to(bridge, std::atomic_ref<void *>(table[slot]).load(std::memory_order_acquire)))
+                            return false;
+                    for (const auto slot : {8, 9, 16, 33, 44})
+                        if (belongs_to(bridge, std::atomic_ref<void *>(table[slot]).load(std::memory_order_acquire)) !=
+                            (mirrored || !DX11FSRBRIDGE_TEST_RELEASE)) return false;
+                    return belongs_to(bridge, (*reinterpret_cast<void ***>(protection.Get()))[5]);
+                };
+                const BOOL initial = protection->GetMultithreadProtected();
+                std::size_t switches = 0;
+                for (const BOOL wanted : {TRUE, TRUE, FALSE, FALSE, TRUE})
+                {
+                    const BOOL prior = protection->GetMultithreadProtected();
+                    expect(protection->SetMultithreadProtected(wanted) == prior &&
+                        protection->GetMultithreadProtected() == wanted, "switch preserves BOOL result and new state");
+                    expect(all_routes(), "switch retains precisely the configured capture routes");
+                    const bool indexed_first = ++switches % 2 == 0;
+                    for (const auto entry : indexed_first ? std::array {CaptureEntry::indexed, CaptureEntry::draw} :
+                        std::array {CaptureEntry::draw, CaptureEntry::indexed})
+                    {
+                        expect(draw_capture(draw_device, draw_context, entry), "switched Draw preserves exact pixels");
+                        expect(all_routes(), "Draw and blocking readback retain capture routes");
+                    }
+                    draw_context->ClearState();
+                    expect(all_routes(), "ClearState retains capture routes");
+                }
+                protection->Enter();
+                const BOOL prior = protection->SetMultithreadProtected(TRUE);
+                protection->Leave();
+                expect(prior == TRUE && all_routes(), "caller-held protection allows a nested switch");
+                protection->SetMultithreadProtected(initial);
+                expect(all_routes(), "restoring initial protection retains capture routes");
+            }
+            if (draw_context && draw_device)
+            {
+                if (compare_alternates && round == 0)
+                    check_alternate_draws(draw_device, draw_context);
+                if (round == rounds - 1)
+                {
+                    // 下一次 ForHwnd 回执穿过同一日志队列，避免把尚未消费的候选当作负控成功。
+                    if (compare_alternates)
+                        expect(draw_entries.load() == 0 && WaitForSingleObject(capture_receipt, 0) == WAIT_TIMEOUT,
+                            "alternate calls produce pixels but do not enter the two production Draw hooks");
+                    if (expected_draw_entries & 2)
+                        expect(draw_capture(draw_device, draw_context, CaptureEntry::indexed),
+                            "selected immediate context DrawIndexed preserves real pixels");
+                    if (expected_draw_entries & 1)
+                        expect(draw_capture(draw_device, draw_context),
+                            "selected immediate context Draw preserves real pixels");
+                    draw_context->ClearState();
+                }
+            }
+            chain.Reset();
+            DestroyWindow(window);
+        }
+        expect(WaitForSingleObject(draw_receipt, 5000) == WAIT_OBJECT_0,
+            "selected immediate context reached the requested production Draw entrypoints");
+    }
+};
+
 HRESULT call_combined(FARPROC target)
 {
     return reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(target)(nullptr,
@@ -83,7 +371,7 @@ HRESULT call_combined(FARPROC target)
 
 int wmain(int argc, wchar_t **argv)
 {
-    if (argc != 7)
+    if (argc != 7 && argc != 9)
         return 2;
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -118,7 +406,16 @@ int wmain(int argc, wchar_t **argv)
         mode == L"wrapping-boundary-retry";
     const bool nested = mode == L"nested" || mode == L"nested-success" || creation_boundary;
     const bool success = mode == L"success" || mode == L"nested-success" || swapchain_mode || creation_boundary;
-    const bool cached_factory = mode.find(L"cached-factory") != std::wstring::npos;
+    const bool for_hwnd = mode.find(L"for-hwnd") != std::wstring::npos;
+    const bool device_first = for_hwnd && mode.find(L"device-first") != std::wstring::npos;
+    const bool returned = for_hwnd && mode.ends_with(L"-returned");
+    const bool mirrored = for_hwnd && mode.ends_with(L"-mirrored");
+    const bool mixed = argc == 9;
+    const bool bridge_before_f6 = mixed && mode.find(L"bridge-first") != std::wstring::npos;
+    if (mixed && (!for_hwnd || !mode.starts_with(L"hardware"))) return 2;
+    if (for_hwnd && mode.starts_with(L"warp"))
+        expected_draw_entries = mode.ends_with(L"-indexed") ? 2 : 1;
+    const bool cached_factory = for_hwnd || mode.find(L"cached-factory") != std::wstring::npos;
     const bool free_bridge = mode.find(L"free-library") != std::wstring::npos;
     const HMODULE first = LoadLibraryW(argv[2]);
     const HMODULE second = LoadLibraryW(argv[3]);
@@ -169,19 +466,42 @@ int wmain(int argc, wchar_t **argv)
     const auto run = std::filesystem::path(executable).parent_path() /
         (L"create-routing-run-" + std::to_wstring(GetCurrentProcessId()));
     std::filesystem::create_directories(run);
+    const auto load_f6 = [&] {
+        // 只在宿主目录装入调用者明确指定的副本，不从游戏或启动器选择 DLL/配置。
+        const auto opti_path = run / L"OptiScaler.dll";
+        std::filesystem::copy_file(argv[7], opti_path, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(argv[8], run / L"OptiScaler.ini", std::filesystem::copy_options::overwrite_existing);
+        return SetCurrentDirectoryW(run.c_str()) && LoadLibraryW(opti_path.c_str());
+    };
+    if (mixed && !bridge_before_f6 && !load_f6()) return 17;
+    ForHwndFixture hwnd_fixture;
+    const auto init_fixture = [&] {
+        const auto hr = cached_device ? hwnd_fixture.init(mode.starts_with(L"warp"), mixed) : E_NOINTERFACE;
+        std::printf("ForHwnd fixture init hr=%08lX\n", static_cast<unsigned long>(hr));
+        return SUCCEEDED(hr) && (!device_first || SUCCEEDED(hwnd_fixture.create_device(cached_device, true)));
+    };
+    if (for_hwnd && !bridge_before_f6 && !init_fixture()) return 16;
     const auto bridge_path = run / L"Dx11FsrBridge.dll";
     std::filesystem::copy_file(argv[1], bridge_path, std::filesystem::copy_options::overwrite_existing);
     std::ofstream(run / L"Dx11FsrBridge.ini") <<
         "[Dx11FsrBridge]\nEnabled=1\nTransparentJitter=0\nFsr2Il2CppHook=0\nRenderScaleMenu=0\nFfx12Backend=ngx\n"
-        "[Log]\nto_debugger=1\n";
+        << (mirrored ? "Fsr2Mode2OnDemandState=0\n" : "Fsr2Mode2OnDemandState=1\n")
+        << "[Log]\nto_debugger=1\n";
     const HMODULE bridge = LoadLibraryW(bridge_path.c_str());
     if (!bridge)
         return 6;
+    if (bridge_before_f6 && (!load_f6() || !init_fixture())) return 17;
     if (real_device)
     {
         // 2026-11-15：文件流可一直缓冲到退出；在隔离进程的既有调试sink上
         // 等生产消息回执，不能把ExitProcess或固定延时当作日志队列已排空。
         capture_receipt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (for_hwnd)
+        {
+            hwnd_receipt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            draw_receipt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!hwnd_receipt || !draw_receipt) return 12;
+        }
         if (!capture_receipt || !set_import(bridge, "OutputDebugStringA",
             reinterpret_cast<FARPROC>(&capture_debug_line), nullptr))
             return 12;
@@ -200,7 +520,8 @@ int wmain(int argc, wchar_t **argv)
     const auto combined2 = GetProcAddress(second, names[1]);
     const auto device1 = GetProcAddress(first, names[0]);
     const auto combined1 = GetProcAddress(first, names[1]);
-    expect(belongs_to(bridge, reinterpret_cast<void *>(device1)) &&
+    expect(mixed ? device1 && device2 && combined1 && combined2 :
+        belongs_to(bridge, reinterpret_cast<void *>(device1)) &&
         belongs_to(bridge, reinterpret_cast<void *>(device2)) &&
         belongs_to(bridge, reinterpret_cast<void *>(combined1)) &&
         belongs_to(bridge, reinterpret_cast<void *>(combined2)), "both creation APIs actually enter production bridge");
@@ -291,6 +612,9 @@ int wmain(int argc, wchar_t **argv)
                 expect(chain->ResizeTarget(&target) == E_ABORT,
                     "interleaved ResizeTarget retains matching receiver, layout and original");
     }
+    else if (for_hwnd)
+        hwnd_fixture.run(bridge, cached_device, device_first, returned, mixed, mirrored,
+            mode.find(L"multithread") != std::wstring::npos);
     else if (real_device)
     {
         wchar_t system[MAX_PATH] {};
@@ -341,6 +665,7 @@ int wmain(int argc, wchar_t **argv)
             expect(level >= D3D_FEATURE_LEVEL_11_0, "real GetFeatureLevel preserves runtime private dispatch");
             expect(SUCCEEDED(device->GetDeviceRemovedReason()), "real device status remains callable");
             expect(draw_capture(device, context), "real shaders draw both outputs and preserve exact pixels");
+            context->ClearState();
             ID3D11DeviceContext *fetched = nullptr;
             device->GetImmediateContext(&fetched);
             expect(fetched != nullptr, "real GetImmediateContext remains callable");

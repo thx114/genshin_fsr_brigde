@@ -2,19 +2,25 @@
 
 #include <Windows.h>
 #include <cstddef>
+#include <initializer_list>
 #include <mutex>
-#include <utility>
+#include <span>
 #include <vector>
 
 namespace com_vtable
 {
+struct MethodPatch
+{
+    std::size_t index;
+    void *(*bind)(void *target);
+};
+
 // 2026-11-15：真实 D3D11 GetFeatureLevel 还通过私有槽69转发。公开接口长度
 // 只能约束补丁索引，不能决定运行时虚表的完整长度；保留原表也保留其私有调用。
 inline bool patch(void *instance, std::size_t public_methods,
-    const std::vector<std::pair<std::size_t, void *>> &patches,
-    void *(*bind)(void *, void *))
+    std::span<const MethodPatch> patches)
 {
-    if (!instance || !bind)
+    if (!instance || patches.empty())
         return false;
     static std::mutex mutex;
     std::lock_guard lock(mutex);
@@ -33,7 +39,7 @@ inline bool patch(void *instance, std::size_t public_methods,
     };
     std::vector<Entry> entries;
     entries.reserve(patches.size());
-    for (const auto &[index, callback] : patches)
+    for (const auto &[index, bind] : patches)
     {
         if (index >= public_methods)
             return false;
@@ -43,7 +49,7 @@ inline bool patch(void *instance, std::size_t public_methods,
         for (const auto &entry : entries)
             if (entry.slot == table + index)
                 return false;
-        void *replacement = bind(callback, observed);
+        void *replacement = bind(observed);
         if (!replacement)
             return false;
         entries.push_back({ table + index, observed, replacement });
@@ -87,5 +93,10 @@ inline bool patch(void *instance, std::size_t public_methods,
     }
     restore.committed = true;
     return true;
+}
+
+inline bool patch(void *instance, std::size_t public_methods, std::initializer_list<MethodPatch> patches)
+{
+    return patch(instance, public_methods, std::span<const MethodPatch>(patches.begin(), patches.size()));
 }
 }

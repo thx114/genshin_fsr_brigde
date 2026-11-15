@@ -73,6 +73,9 @@ tools/*
 !tools/FpsUnlockInstaller/
 !tools/FpsUnlockInstaller/**
 !tools/fsr2-dump-analyze.py
+!tools/Test-NeoProviders.ps1
+!tools/Test-NeoF6Interop.ps1
+
 !tools/Fetch-NgxHeaders.ps1
 Dx11FsrBridge/Dx11FsrBridge.server-debug.ini
 Build-Package.ps1

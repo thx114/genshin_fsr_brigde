@@ -1,5 +1,7 @@
 #include "Il2CppCallSiteHook.h"
 #include "PerfProbe.h"
+#include "game/VersionDiscovery.h"
+#include "game/AnchorPatterns.h"
 
 #include <Windows.h>
 
@@ -15,29 +17,23 @@ namespace il2cpp_callsite
 namespace
 {
 
-constexpr std::size_t k_patch_len = 12;
+constexpr std::size_t k_patch_len = sizeof(neo::game::k_render_head);
 constexpr std::size_t k_stub_len = 64;
 // ConfigureJitteredProjectionMatrix starts with seven pushes followed by
 // `sub rsp, 0x140` (7 bytes).  A 12-byte patch cuts that instruction, so the
 // camera hook needs an independent 14-byte trampoline boundary.
-constexpr std::size_t k_camera_patch_len = 14;
+constexpr std::size_t k_camera_patch_len = sizeof(neo::game::k_camera_head);
 constexpr std::size_t k_camera_stub_len = 96;
-constexpr std::uint8_t k_camera_head[k_camera_patch_len] = {
-    0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x53,
-    0x48, 0x81, 0xEC, 0x40, 0x01, 0x00, 0x00,
-};
-constexpr std::size_t k_projection_patch_len = 16;
+using neo::game::k_camera_head;
+constexpr std::size_t k_projection_patch_len = sizeof(neo::game::k_projection_head);
 constexpr std::size_t k_projection_stub_len = 96;
-constexpr std::uint8_t k_projection_head[k_projection_patch_len] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
-    0xEC, 0x20, 0x48, 0x8B, 0xFA, 0x48, 0x8B, 0xD9,
-};
+using neo::game::k_projection_head;
 
 // 7.0 序言期望字节（实测，见 fsr2-callsite-70.md）
 // Render: push r15 r14 r13 r12 rsi rdi rbp rbx
-constexpr std::uint8_t k_render_head[12] = {0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53};
+using neo::game::k_render_head;
 // UpdateCommandBuffer: push rsi rdi rbp rbx; sub rsp,0x28
-constexpr std::uint8_t k_ucb_head[8] = {0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xEC, 0x28};
+using neo::game::k_ucb_head;
 
 // ---- 2026-08-26（AA 修复）：相机参数捕获全局（声明须在 shutdown() 之前）----
 std::uint8_t *g_camera_render = nullptr;
@@ -74,7 +70,7 @@ struct PerInstanceParams
     RenderToken pending[4] {};
     std::size_t next_pending = 0;
 };
-PerInstanceParams g_inst_params[8] {};
+std::array<PerInstanceParams, k_render_instance_capacity> g_inst_params {};
 std::size_t g_inst_count = 0;
 std::mutex g_inst_mutex;
 // pending 环形槽溢出计数（4 槽满时覆盖最旧 token 是静默的）。
@@ -131,11 +127,11 @@ __declspec(noinline) void on_render_enter(void *this_ptr, void *context_ptr)
                     break;
                 }
             }
-            if (slot >= 8)
+            if (slot >= g_inst_params.size())
             {
                 // 超过容量：LRU 覆盖最旧的（用 generation 最小者）
                 std::size_t oldest = 0;
-                for (std::size_t i = 1; i < 8; ++i)
+                for (std::size_t i = 1; i < g_inst_params.size(); ++i)
                     if (g_inst_params[i].generation < g_inst_params[oldest].generation)
                         oldest = i;
                 slot = oldest;
@@ -230,44 +226,12 @@ void build_stub(bool skip_render, std::uint8_t *render, std::uint8_t *stub)
 
 } // namespace
 
-// RVA 自动识别：扫描 exe 代码段（BaseOfCode..SizeOfCode）找 render 序言
-// （k_render_head）且在 render_rva - ucb_rva 偏移处为 ucb 序言（k_ucb_head）的候选。
-// 返回候选 RVA（供配置对齐——国际服/版本更新偏移不同）。
 std::vector<std::uint32_t> scan_render_candidates(std::uint64_t exe_base,
-                                                  std::uint32_t render_rva, std::uint32_t ucb_rva)
+    std::uint32_t render_rva, std::uint32_t ucb_rva)
 {
-    std::vector<std::uint32_t> candidates;
-    if (exe_base == 0 || render_rva <= ucb_rva)
-        return candidates;
-    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe_base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return candidates;
-    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(exe_base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return candidates;
-    const std::size_t text_size = nt->OptionalHeader.SizeOfCode;
-    if (text_size == 0 || text_size > (1u << 30))
-        return candidates;
-    const std::uint8_t *text = reinterpret_cast<const std::uint8_t *>(exe_base + nt->OptionalHeader.BaseOfCode);
-    const std::ptrdiff_t ucb_delta = static_cast<std::ptrdiff_t>(render_rva) - static_cast<std::ptrdiff_t>(ucb_rva);
-    for (std::size_t i = 0; i + sizeof(k_render_head) <= text_size; ++i)
-    {
-        if (std::memcmp(text + i, k_render_head, sizeof(k_render_head)) != 0)
-            continue;
-        // ucb 在 render 上方 ucb_delta 处（text 偏移 = i - ucb_delta）
-        if (i < static_cast<std::size_t>(ucb_delta))
-            continue;
-        const std::size_t ucb_off = i - static_cast<std::size_t>(ucb_delta);
-        if (ucb_off + sizeof(k_ucb_head) > text_size)
-            continue;
-        if (std::memcmp(text + ucb_off, k_ucb_head, sizeof(k_ucb_head)) != 0)
-            continue;
-        // 配对命中：render 在 ucb 上方 ucb_delta 处（与国服相对布局一致）
-        candidates.push_back(static_cast<std::uint32_t>(nt->OptionalHeader.BaseOfCode + i));
-        if (candidates.size() >= 8)
-            break;
-    }
-    return candidates;
+    if (ucb_rva == 0 || render_rva <= ucb_rva)
+        return {};
+    return neo::game::find_prologue_pairs(exe_base, k_render_head, k_ucb_head, render_rva - ucb_rva);
 }
 
 // 失败路径统一出口（2026-09-23）：
@@ -296,6 +260,18 @@ void build_jmp_patch(std::uint8_t *patch, std::size_t len, const std::uint8_t *s
     patch[10] = 0xFF;
     patch[11] = 0xE0;
 }
+bool matches_head(const std::uint8_t *code, std::span<const std::uint8_t> expected)
+{
+    __try
+    {
+        return std::memcmp(code, expected.data(), expected.size()) == 0;
+    }
+    __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+    {
+        return false;
+    }
+}
 } // namespace
 
 bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
@@ -311,11 +287,11 @@ bool install(std::uint64_t exe_base, const Config &cfg, const char **out_reason)
     std::uint8_t *ucb = reinterpret_cast<std::uint8_t *>(exe_base + cfg.update_cmd_buffer_rva);
 
     // 序言验证（RVA 或版本不匹配时安全放弃）
-    if (std::memcmp(render, k_render_head, sizeof(k_render_head)) != 0)
+    if (!matches_head(render, k_render_head))
         return fail_install("render_prologue_mismatch", out_reason);
-    if (ucb >= render || render - ucb != static_cast<std::ptrdiff_t>(cfg.render_rva - cfg.update_cmd_buffer_rva))
+    if (cfg.update_cmd_buffer_rva == 0 || cfg.update_cmd_buffer_rva >= cfg.render_rva)
         return fail_install("ucb_relation_mismatch", out_reason);
-    if (std::memcmp(ucb, k_ucb_head, sizeof(k_ucb_head)) != 0)
+    if (!matches_head(ucb, k_ucb_head))
         return fail_install("ucb_prologue_mismatch", out_reason);
 
     // 保存原字节
@@ -503,36 +479,31 @@ bool last_params_for(std::uint64_t instance, CapturedParams &out, std::uint64_t 
     return false;
 }
 
-bool latest_pending_render_token_for(std::uint64_t instance,
-                                     std::uint32_t render_w, std::uint32_t render_h,
-                                     RenderToken &out)
+RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t render_h)
 {
+    constexpr std::uint64_t k_token_lifetime_ms = 250;
+    RenderSnapshot snapshot;
     std::lock_guard lock(g_inst_mutex);
-    if (instance == 0 || render_w == 0 || render_h == 0)
-        return false;
-    const std::uint64_t now = GetTickCount64();
+    snapshot.observed_tick = GetTickCount64();
+    snapshot.count = g_inst_count;
     for (std::size_t i = 0; i < g_inst_count; ++i)
     {
-        const PerInstanceParams &entry = g_inst_params[i];
-        if (entry.instance != instance)
-            continue;
-        // Render 可能在渲染线程 draw 之前连续记录多个 token。按“最新”选择
-        // 会把较早 token 一起淘汰，造成 gen/frame 跳号；时域 AA 尤其在局部
-        // 动态时会短暂失效。按 generation 顺序消费最早的有效 token。
-        std::uint64_t best_generation = UINT64_MAX;
-        for (const RenderToken &token : entry.pending)
+        const auto &entry = g_inst_params[i];
+        auto &observation = snapshot.entries[i];
+        observation.instance = entry.instance;
+        if (!render_w || !render_h) continue;
+        for (const auto &token : entry.pending)
         {
-            if (token.generation != 0 && token.generation < best_generation &&
-                token.capture_tick <= now && now - token.capture_tick <= 250 &&
-                token.params.render_w == render_w && token.params.render_h == render_h)
-            {
-                best_generation = token.generation;
-                out = token;
-            }
+            if (!token.generation || token.capture_tick > snapshot.observed_tick ||
+                snapshot.observed_tick - token.capture_tick > k_token_lifetime_ms ||
+                token.params.render_w != render_w || token.params.render_h != render_h)
+                continue;
+            // 连续记录多帧时按捕获顺序推进历史，不能用最新 token 跳过同实例的较早帧。
+            if (!observation.pending.generation || token.generation < observation.pending.generation)
+                observation.pending = token;
         }
-        return best_generation != 0;
     }
-    return false;
+    return snapshot;
 }
 
 bool consume_render_token_for(std::uint64_t instance, std::uint64_t generation)
@@ -684,7 +655,7 @@ bool install_camera(std::uint64_t exe_base, const Config &cfg)
 
     std::uint8_t *target = reinterpret_cast<std::uint8_t *>(exe_base + cfg.camera_rva);
     // 只接受经当前游戏运行时探针确认的完整序言，避免错误 RVA 或跨指令覆盖。
-    if (std::memcmp(target, k_camera_head, k_camera_patch_len) != 0)
+    if (!matches_head(target, k_camera_head))
         return false;
 
     DWORD old_protect = 0;
@@ -766,7 +737,7 @@ bool install_projection_setter(std::uint64_t exe_base, const Config &cfg)
     if (exe_base == 0 || cfg.projection_setter_rva == 0)
         return false;
     std::uint8_t *target = reinterpret_cast<std::uint8_t *>(exe_base + cfg.projection_setter_rva);
-    if (std::memcmp(target, k_projection_head, k_projection_patch_len) != 0)
+    if (!matches_head(target, k_projection_head))
         return false;
     DWORD old_protect = 0;
     if (!perf_probe::virtual_protect_counted(target, k_projection_patch_len, PAGE_EXECUTE_READWRITE, &old_protect))
@@ -811,112 +782,6 @@ std::size_t projection_matrix(float *out, std::size_t capacity, std::uint64_t *c
     if (camera_ptr != nullptr)
         *camera_ptr = g_projection_camera;
     return 16;
-}
-
-// 特征识别（优先于硬编码 RVA）：g_MethodPointers 全量指针 + FFX_FSR2 30 方法尺寸
-// 序列 gap 匹配（唯一命中——国服/国际服/版本更新通用）。内存版（游戏 exe 已加载——
-// 扫描 .rdata/.data 中指向 il2cpp 段的 u64 指针）。
-bool detect_ffx12_method_rvas(std::uint64_t exe_base,
-                              std::uint32_t &render_rva,
-                              std::uint32_t &ucb_rva,
-                              std::uint32_t &camera_rva)
-{
-    render_rva = ucb_rva = camera_rva = 0;
-    if (exe_base == 0)
-        return false;
-    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(exe_base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-        return false;
-    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(exe_base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
-        return false;
-
-    const std::uint8_t *base = reinterpret_cast<const std::uint8_t *>(exe_base);
-    // 1) 段表：找 il2cpp 段（方法代码）与数据段（.rdata/.data——g_MethodPointers 所在）
-    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
-    std::uint64_t il2_va = 0, il2_end = 0;
-    struct DataSec { std::uint64_t va, size; };
-    std::vector<DataSec> data_secs;
-    for (std::uint16_t i = 0; i < nt->FileHeader.NumberOfSections; ++i)
-    {
-        const IMAGE_SECTION_HEADER &s = sec[i];
-        char name[9] {};
-        std::memcpy(name, s.Name, 8);
-        const std::uint64_t va = s.VirtualAddress;
-        if (std::strcmp(name, "il2cpp") == 0)
-        {
-            il2_va = va;
-            il2_end = va + s.Misc.VirtualSize;
-        }
-        else if (s.Characteristics & IMAGE_SCN_MEM_READ &&
-                 !(s.Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
-                 (std::strcmp(name, ".rdata") == 0 || std::strcmp(name, ".data") == 0))
-        {
-            data_secs.push_back({va, s.Misc.VirtualSize});
-        }
-    }
-    if (il2_va == 0 || data_secs.empty())
-        return false;
-    const std::uint64_t il2_lo = il2_va, il2_hi = il2_end;
-
-    // 2) 收集数据段中指向 il2cpp 段的 u64（g_MethodPointers 候选）
-    std::vector<std::uint32_t> rvas;
-    for (const DataSec &ds : data_secs)
-    {
-        const std::size_t cnt = static_cast<std::size_t>(ds.size / 8);
-        for (std::size_t i = 0; i < cnt; ++i)
-        {
-            const std::uint64_t v = *reinterpret_cast<const std::uint64_t *>(base + ds.va + i * 8);
-            if (v >= exe_base + il2_lo && v < exe_base + il2_hi)
-                rvas.push_back(static_cast<std::uint32_t>(v - exe_base));
-        }
-    }
-    if (rvas.size() < 64)
-        return false;
-    std::sort(rvas.begin(), rvas.end());
-    rvas.erase(std::unique(rvas.begin(), rvas.end()), rvas.end());
-
-    // 3) 30 方法尺寸序列 gap 匹配（方法顺序/尺寸 = FFX_FSR2 结构特征——非 RVA 硬编码）
-    static constexpr std::uint32_t k_seq[30] = {
-        0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0xD0,0x10,0x170,0x30,0x20,0x10,0x130,0x20,0xB0,
-        0x70,0x3E0,0x1D0,0x1CE0,0x18C0,0x120,0x70,0xFA0,0x280,0x260,0x110,0xA0};
-    const auto tol_for = [](std::uint32_t s) -> std::int32_t {
-        if (s == 0xFA0) return 0x400;
-        if (s <= 0x20) return 0x10;
-        if (s <= 0x100) return 0x40;
-        return 0x100;
-    };
-    int best_idx = -1, best_exact = -1;
-    std::int64_t best_drift = 0;
-    for (std::size_t i = 0; i + 30 < rvas.size(); ++i)
-    {
-        int exact = 0;
-        std::int64_t drift = 0;
-        bool ok = true;
-        for (int k = 0; k < 29; ++k)
-        {
-            const std::int64_t gap = static_cast<std::int64_t>(rvas[i + k + 1]) - rvas[i + k];
-            const std::int64_t dev = gap - k_seq[k];
-            if (dev > tol_for(k_seq[k]) || dev < -tol_for(k_seq[k])) { ok = false; break; }
-            if (dev == 0) ++exact;
-            drift += dev;
-        }
-        if (ok && drift >= -0x1000 && drift <= 0x1000 && exact > best_exact)
-        {
-            best_idx = static_cast<int>(i);
-            best_exact = exact;
-            best_drift = drift;
-        }
-    }
-    if (best_idx < 0 || best_exact < 20)
-        return false;
-
-    // 4) 输出：get_downscaleRatio=idx0；ConfigureJitteredProjectionMatrix=idx19；
-    //    UpdateCommandBuffer=idx24；Render=idx25
-    render_rva = rvas[best_idx + 25];
-    ucb_rva = rvas[best_idx + 24];
-    camera_rva = rvas[best_idx + 19];
-    return true;
 }
 
 } // namespace il2cpp_callsite

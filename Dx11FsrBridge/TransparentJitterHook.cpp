@@ -1,4 +1,5 @@
 #include "TransparentJitterHook.h"
+#include "game/AnchorPatterns.h"
 #include "PerfProbe.h"
 
 #include <Windows.h>
@@ -21,11 +22,8 @@ constexpr std::size_t k_stub_len = 96;
 // ---- 锚点：FFX_FSR2.ConfigureJitteredProjectionMatrix 的序言（14 字节）----
 // push r15; push r14; push rsi; push rdi; push rbx; sub rsp,0x140
 // 与 Il2CppCallSiteHook.cpp 的 k_camera_head 相同（那边用它装相机钩子）。
-constexpr std::size_t k_camera_head_len = 14;
-constexpr std::uint8_t k_camera_head[k_camera_head_len] = {
-    0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x53,
-    0x48, 0x81, 0xEC, 0x40, 0x01, 0x00, 0x00,
-};
+using neo::game::k_camera_head;
+constexpr std::size_t k_camera_head_len = sizeof(k_camera_head);
 
 // ---- 调用点分类签名 ----
 // 两者共享前 10 字节（mov [rsp+8],rbx; push rdi; sub rsp,0x20），第 10 字节起分叉：

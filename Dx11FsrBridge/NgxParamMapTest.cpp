@@ -96,7 +96,8 @@ using namespace ngx_param_map;
 // 注意 :1417 那行 MVLowRes 前面**没有 if**（缩进只是排版）⇒ 无条件执行。
 std::uint32_t oracle_create_flags(bool is_hdr, bool depth_inverted, bool mv_jittered)
 {
-    std::uint32_t flags = 0;
+    // 旧 oracle 保留四个原始位；无曝光纹理的输入额外要求 SDK 自动曝光。
+    std::uint32_t flags = 0x40u;
     if (is_hdr)             flags |= (1u << 0);   // IsHDR
                             flags |= (1u << 1);   // MVLowRes，恒设
     if (mv_jittered)        flags |= (1u << 2);   // MVJittered
@@ -190,11 +191,11 @@ float halton(int i, int b)
 }
 
 // ===========================================================================
-// [1] map_create_flags —— 全部 8 种组合 + 4 个位逐个钉
+// [1] map_create_flags —— 8 种组合，含始终启用的 AutoExposure
 // ===========================================================================
 void test_create_flags()
 {
-    std::printf("[1] map_create_flags: 2^3 combinations vs oracle + MVLowRes constant\n");
+    std::printf("[1] map_create_flags: 2^3 combinations vs oracle + MVLowRes and AutoExposure constants\n");
 
     for (int mask = 0; mask < 8; ++mask)
     {
@@ -207,15 +208,16 @@ void test_create_flags()
         const std::uint32_t want = oracle_create_flags(in.is_hdr, in.depth_inverted, in.mv_jittered);
         CHECK(out.flags == want);
 
-        // 4 个位逐位对账（不是只看整体值 —— 整体错位时逐位能指出是哪一位）。
+        // 逐位对账（不是只看整体值 —— 整体错位时逐位能指出是哪一位）。
         CHECK(((out.flags & kFlagIsHdr) != 0) == in.is_hdr);
         CHECK(((out.flags & kFlagDepthInverted) != 0) == in.depth_inverted);
         CHECK(((out.flags & kFlagMvJittered) != 0) == in.mv_jittered);
         // ★ 恒设位：与其余三个输入**无关**，8 种组合都必须为 1。
         CHECK((out.flags & kFlagMvLowRes) != 0);
 
-        // 不得出现任何未声明的位（1<<4 / 1<<5 DoSharpening / 1<<6 / 1<<7 / 1<<8 一律不设）。
-        CHECK((out.flags & ~(kFlagIsHdr | kFlagMvLowRes | kFlagMvJittered | kFlagDepthInverted)) == 0);
+        CHECK((out.flags & kFlagAutoExposure) != 0);
+        CHECK((out.flags & ~(kFlagIsHdr | kFlagMvLowRes | kFlagMvJittered |
+            kFlagDepthInverted | kFlagAutoExposure)) == 0);
     }
 
     // 常量本身的值（NGX 头 nvsdk_ngx_defs.h:291-294 的口径）。
@@ -223,15 +225,16 @@ void test_create_flags()
     CHECK(kFlagMvLowRes == 1u << 1);
     CHECK(kFlagMvJittered == 1u << 2);
     CHECK(kFlagDepthInverted == 1u << 3);
+    CHECK(kFlagAutoExposure == 1u << 6);
 
     // 全开 / 全关的两个具体值（便于人眼核对）。
     {
         CreateFlagsInput on {};
         on.is_hdr = true; on.depth_inverted = true; on.mv_jittered = true;
-        CHECK(map_create_flags(on).flags == 0xFu);            // 1|2|4|8
+        CHECK(map_create_flags(on).flags == 0x4Fu);
         CreateFlagsInput off {};
         off.is_hdr = false; off.depth_inverted = false; off.mv_jittered = false;
-        CHECK(map_create_flags(off).flags == 0x2u);           // 只剩 MVLowRes
+        CHECK(map_create_flags(off).flags == 0x42u);          // MVLowRes | AutoExposure
     }
 }
 

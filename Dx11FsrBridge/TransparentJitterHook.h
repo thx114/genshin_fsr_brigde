@@ -52,7 +52,7 @@
 //
 // 定位方式（**不写死 RVA** —— 国服/国际服是两份不同构建，写死地址是客户端专用的）：
 //   ① 锚点 = `FFX_FSR2.ConfigureJitteredProjectionMatrix`，由既有的
-//      `il2cpp_callsite::detect_ffx12_method_rvas()`（g_MethodPointers + 30 方法尺寸
+//      `neo::game::current_version()`（g_MethodPointers + 30 方法尺寸
 //      序列 gap 匹配）给出；装钩前校验其 14 字节序言。
 //   ② 在锚点函数体内扫 `call rel32`，按**被调用者的序言形状**分类：
 //      - 16 字节 == Matrix4x4 setter（`Camera.set_projectionMatrix`）；

@@ -42,7 +42,7 @@ namespace ngx_param_map
 // a) CreateFlags 计算
 // ===========================================================================
 // 位定义逐字取自 third_party/ngx/nvsdk_ngx_defs.h 中 NVSDK_NGX_DLSS_Feature_Flags_*
-// 的四个枚举子（IsHDR / MVLowRes / MVJittered / DepthInverted）。
+// 的建特征标志；数值与 SDK 头逐位核对。
 // ★ 这里**复制**而不是 include 那个头：该头**已随仓库正式分发**（third_party/ngx/，
 //   由上游"NGX 头随仓库分发"那一提交入库，是被跟踪的文件，**并非忽略项**），
 //   但本层必须能在**裁剪了该目录的检出**下编译 —— 只取部分目录、或 CI 只 checkout
@@ -54,18 +54,9 @@ constexpr std::uint32_t kFlagMvLowRes      = 1u << 1;   // NVSDK_NGX_DLSS_Featur
 constexpr std::uint32_t kFlagMvJittered    = 1u << 2;   // NVSDK_NGX_DLSS_Feature_Flags_MVJittered
 constexpr std::uint32_t kFlagDepthInverted = 1u << 3;   // NVSDK_NGX_DLSS_Feature_Flags_DepthInverted
 
-// 与重构前 `NgxBackend.cpp` 的 `build_create_flags()`（§3.8.2）**逐字等价**的决策部分
-// （不含日志、不含 M4-a 位图、不含 resolve_is_hdr 的全局探测）。
-//
-// 重构前原文（保留在此供逐位比对，★ 不改）：
-//     ev.flags = 0;
-//     if (ev.is_hdr)                              ev.flags |= IsHDR;        // 1<<0
-//                                                 ev.flags |= MVLowRes;     // 1<<1，恒设
-//     if (ffx12::motion_vectors_jittered())       ev.flags |= MVJittered;   // 1<<2，默认不设
-//     if (ffx12::depth_inverted())                ev.flags |= DepthInverted;// 1<<3
-//
-// ★ MVLowRes **恒设**：重构前那一行是**无条件**语句（缩进成 if 块的样子，
-//   但它前面没有 if）—— 这是本层最容易被"顺手整理"掉的一位，单测专门钉它。
+constexpr std::uint32_t kFlagAutoExposure  = 1u << 6;   // NVSDK_NGX_DLSS_Feature_Flags_AutoExposure
+
+// 源只提供低分辨率 MV、颜色、深度和 pre-exposure，不提供曝光纹理；请求 SDK 自动曝光。
 struct CreateFlagsInput
 {
     bool is_hdr;

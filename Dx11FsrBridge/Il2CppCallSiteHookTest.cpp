@@ -190,6 +190,7 @@ void run_per_instance_test()
     const render_fn fn = reinterpret_cast<render_fn>(g_render);
     fn(inst_a, nullptr);
     fn(inst_b, nullptr);
+    *reinterpret_cast<std::uint32_t *>(inst_a + 0x50) = 43;
     fn(inst_a, nullptr);
 
     // per-instance params 相互隔离
@@ -200,7 +201,7 @@ void run_per_instance_test()
     const std::uint64_t b_ptr = reinterpret_cast<std::uint64_t>(inst_b);
     CHECK(il2cpp_callsite::last_params_for(a_ptr, pa, ga), "per-instance: last_params_for(A) true");
     CHECK(il2cpp_callsite::last_params_for(b_ptr, pb, gb), "per-instance: last_params_for(B) true");
-    CHECK(pa.frame_index == 42 && pb.frame_index == 7, "per-instance: frame index isolated");
+    CHECK(pa.frame_index == 43 && pb.frame_index == 7, "per-instance: frame index isolated");
     CHECK(pa.render_w == 960 && pb.render_w == 1280, "per-instance: render size isolated");
     CHECK(pa.jitter_x == 0.25f && pb.jitter_x == 0.5f, "per-instance: jitter isolated");
 
@@ -222,10 +223,31 @@ void run_per_instance_test()
     }
     CHECK(found_a && found_b, "per-instance: both instances listed");
 
+    const auto token_for = [](const il2cpp_callsite::RenderSnapshot &snapshot, std::uint64_t instance)
+    {
+        for (std::size_t i = 0; i < snapshot.count; ++i)
+            if (snapshot.entries[i].instance == instance) return snapshot.entries[i].pending;
+        return il2cpp_callsite::RenderToken {};
+    };
+    const auto first = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h);
+    const auto older_a = token_for(first, a_ptr);
+    CHECK(first.count == 2 && older_a.generation > 0 && older_a.generation < ga && older_a.params.frame_index == 42,
+        "snapshot uses oldest pending frame for a concrete instance and size");
+    CHECK(!token_for(first, b_ptr).generation, "snapshot includes known instance without mismatched pending token");
+    CHECK(il2cpp_callsite::consume_render_token_for(a_ptr, older_a.generation), "consume exactly the first A frame");
+    const auto next = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h);
+    CHECK(token_for(next, a_ptr).generation == ga && token_for(next, a_ptr).params.frame_index == 43,
+        "new snapshot exposes the following A frame");
+    CHECK(il2cpp_callsite::consume_render_token_for(a_ptr, ga), "next A frame consumed");
+    const auto empty = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h);
+    CHECK(empty.count == 2 && !token_for(empty, a_ptr).generation, "known A with no pending frame is not a token");
+    const auto other = il2cpp_callsite::snapshot_render_tokens(pb.render_w, pb.render_h);
+    CHECK(token_for(other, b_ptr).generation == gb, "consuming A does not remove B frame");
+
     // 全局兼容接口仍返回"最近一次 Render"（= A 的第二次）
     il2cpp_callsite::CapturedParams gp {};
     const bool got = il2cpp_callsite::last_params(gp);
-    CHECK(got && gp.frame_index == 42, "per-instance: global last_params still latest (A)");
+    CHECK(got && gp.frame_index == 43, "per-instance: global last_params still latest (A)");
 
     il2cpp_callsite::shutdown();
     CHECK(!il2cpp_callsite::active(), "per-instance: inactive after shutdown");

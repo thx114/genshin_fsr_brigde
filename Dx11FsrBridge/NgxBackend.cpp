@@ -44,9 +44,7 @@
 #include <cstdio>         // _vsnwprintf_s / std::snprintf
 #include <cstdlib>        // std::wcstoull 兜底
 #include <cstring>        // memcpy / strlen
-#include <limits>         // std::numeric_limits<float>::quiet_NaN()（cb_uploaded_* 初值）
 #include <string>         // std::wstring / std::string（flags_to_string / warn_to_string）
-#include <unordered_map>  // 仅日志/诊断辅助；实例本身是全局单例（v8）
 #include <utility>        // std::move
 #include <vector>         // g_feature_dirs / g_feature_dir_ptrs
 
@@ -55,7 +53,6 @@
 #include <dxgi.h>         // IDXGIAdapter / IDXGIDevice（GetFeatureRequirements 反查）
 #include <d3dcompiler.h>  // D3DCompile（两个自写 CS）
 #include <shlobj.h>       // ★ T-2 增（§3.4.4）：SHGetKnownFolderPath / FOLDERID_LocalAppData
-#include <tlhelp32.h>     // ★ B154 增：CreateToolhelp32Snapshot / Module32FirstW（枚举已加载的 provider）
 #include <wrl/client.h>   // Microsoft::WRL::ComPtr
 
 // ---- ③ 本项目 ----
@@ -63,6 +60,9 @@
 #include "Ffx12Backend.h" // ffx12::FrameInput / ffx12::backend()
 #include "Ffx12ShaderSource.h" // g_depth_extract_hlsl / g_motion_decode_d11_hlsl
 #include "NgxBackend.h"
+#include "ngx/FeatureHandle.h"
+#include "ngx/ProviderDiscovery.h"
+#include "ngx/FrameResources.h"
 // A 阶段重构（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
 // 本 TU 只负责"取输入 → 调纯函数 → 写输出"；公式全部在 NgxParamMap.cpp，
 // 由 NgxParamMapTest.cpp 做离线位级回归（NGX=OFF 也能构建）。
@@ -120,53 +120,11 @@ static_assert(ngx_param_map::kFlagMvJittered == NVSDK_NGX_DLSS_Feature_Flags_MVJ
               "NgxParamMap::kFlagMvJittered 与 NGX 头不一致");
 static_assert(ngx_param_map::kFlagDepthInverted == NVSDK_NGX_DLSS_Feature_Flags_DepthInverted,
               "NgxParamMap::kFlagDepthInverted 与 NGX 头不一致");
+static_assert(ngx_param_map::kFlagAutoExposure == NVSDK_NGX_DLSS_Feature_Flags_AutoExposure);
 
 namespace ngx {
 
 namespace {
-
-// ============================================================================
-// §3.4.6 十个函数指针 typedef（**逐字照抄，不得改**）
-// ★ 粘贴顺序：typedef 必须先于 §3.3.4.2 的十个全局函数指针变量，否则 C2065。
-// ============================================================================
-#define NGX_CALL __cdecl   // x64 下无影响；显式写与头文件语义一致
-
-using PFN_NGX_Init_Ext =
-    NVSDK_NGX_Result (NGX_CALL *)(unsigned long long, const wchar_t *,
-                                  ID3D11Device *, NVSDK_NGX_Version,
-                                  const NVSDK_NGX_FeatureCommonInfo *);   // ★ 第 5 参是 fc，不是 Parameter
-
-using PFN_NGX_GetCapabilityParameters =
-    NVSDK_NGX_Result (NGX_CALL *)(NVSDK_NGX_Parameter **);
-
-using PFN_NGX_AllocateParameters =
-    NVSDK_NGX_Result (NGX_CALL *)(NVSDK_NGX_Parameter **);
-
-using PFN_NGX_DestroyParameters =
-    NVSDK_NGX_Result (NGX_CALL *)(NVSDK_NGX_Parameter *);
-
-using PFN_NGX_GetScratchBufferSize =
-    NVSDK_NGX_Result (NGX_CALL *)(NVSDK_NGX_Feature, const NVSDK_NGX_Parameter *, size_t *);
-
-using PFN_NGX_CreateFeature =
-    NVSDK_NGX_Result (NGX_CALL *)(ID3D11DeviceContext *, NVSDK_NGX_Feature,
-                                  NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);   // ★ 非 const 形态
-
-using PFN_NGX_ReleaseFeature =
-    NVSDK_NGX_Result (NGX_CALL *)(NVSDK_NGX_Handle *);
-
-using PFN_NGX_EvaluateFeature =
-    NVSDK_NGX_Result (NGX_CALL *)(ID3D11DeviceContext *, const NVSDK_NGX_Handle *,
-                                  const NVSDK_NGX_Parameter *,
-                                  PFN_NVSDK_NGX_ProgressCallback);   // 第 4 参恒传 nullptr
-
-using PFN_NGX_Shutdown1 =
-    NVSDK_NGX_Result (NGX_CALL *)(ID3D11Device *);
-
-using PFN_NGX_GetFeatureRequirements =
-    NVSDK_NGX_Result (NGX_CALL *)(IDXGIAdapter *,
-                                  const NVSDK_NGX_FeatureDiscoveryInfo *,
-                                  NVSDK_NGX_FeatureRequirement *);
 
 // ============================================================================
 // §3.4.1 的 qpc_us()：**必须在 NgxBackend.cpp 里自己定义一份**
@@ -257,138 +215,44 @@ static constexpr std::uint64_t kFeatureCreateRetryMinMs = 2000;
 // ============================================================================
 struct NgxInstance
 {
-    // ---- 身份与尺寸 ----
-    std::uint64_t key            = 0;      // instance_key；与传入值不同即触发切换重建。**0 是合法值**（B-7）
-    std::uint32_t rw = 0, rh = 0;          // 建池时的 render 尺寸
-    std::uint32_t dw = 0, dh = 0;          // 建池时的 display 尺寸
-    DXGI_FORMAT   color_fmt  = DXGI_FORMAT_UNKNOWN;   // = in.color 的实际格式（TYPELESS）
-    DXGI_FORMAT   output_fmt = DXGI_FORMAT_UNKNOWN;   // = in.output_target 的实际格式（TYPELESS）
+    std::uint64_t key = 0; // 0 也是合法 key；池是否已发布由资源本身表示。
+    neo::ngx::FrameResources pool;
+    neo::ngx::FeatureHandle feature;
+    int feature_preset = 0;
+    unsigned feature_flags_bits = 0;
+    bool first = true; // 新 feature / 跨 key 复用必须 Reset；只有成功提交才清。
 
-    // ---- 自建资源池（5 张纹理，全部 MiscFlags=0，见 §3.12.4）----
-    // ★ T-2 只声明字段、**不创建任何资源**（资源池是 T-4 的交付物）。
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> color;     // render 尺寸，绑定 SRV（两条 CS 的 t0 来源）
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> depth;     // render 尺寸，绑定 UAV（深度 CS 的输出）
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> motion;    // render 尺寸，绑定 UAV（motion CS 的 u0）
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> reactive;  // render 尺寸 R8_UNORM，绑定 UAV（motion CS 的 u1）
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> output;    // **display** 尺寸，**必须含 D3D11_BIND_UNORDERED_ACCESS**（F-47b）
-                                                       // 且**保持 TYPELESS**（= output_fmt），否则 CopyResource 会失败
-
-    // ---- 池内视图（仅供我们自己的 CS 绑定；**不进 NGX 参数**，见 §3.9.6 的 set_tex 强制）----
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>  color_srv;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> depth_uav;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> motion_uav;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> reactive_uav;
-    // **没有 output_uav / depth_srv / motion_srv / reactive_srv**：v1 不用，不要加。
-
-    // ---- 输入侧 SRV（§3.6.4）----
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> depth_src_srv;   // 深度 CS 的 t0，格式三分支
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> motion_src_srv;  // motion CS 的 t0，固定 R10G10B10A2_UNORM
-    ID3D11Texture2D *depth_src_last  = nullptr;   // ★ 裸指针，**不是 ComPtr**（只做身份比对，**不做 Release**）
-    ID3D11Texture2D *motion_src_last = nullptr;   // ★ 同上。只做身份比对，**不做 Release**（纹理归游戏）
-
-    // ---- b0 常数缓冲（16 B，两条 CS 共用）----
-    Microsoft::WRL::ComPtr<ID3D11Buffer> cb;
-    float cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();  // 缓存判据（照 Ffx12Backend.cpp:1680-1683）
-    float cb_uploaded_flip  = std::numeric_limits<float>::quiet_NaN();
-
-    // ---- NGX feature ----
-    NVSDK_NGX_Handle *feature = nullptr;   // CreateFeature 的句柄；**实例切换销毁前必须 ReleaseFeature**（v8：无驱逐）
-    int  feature_preset       = 0;         // **仅日志与 Q18 对账用，不在重建判据内**（ini 无热重载 ⇒ 运行期不变）
-    // ★ v7 改（S-81）：**同一对象生命周期内永不清除**。尺寸/格式变化只释放资源、不重试 CreateFeature。
-    //   只有设备更换/丢失触发 shutdown_all() 时随实例表整体销毁 —— 那是"对象没了"，不是"清锁重试"。
-    //   ⚠️ 上面这条 S-81 结论**已被部分推翻**（2026-11-13，见下方"为什么放宽"），原文保留不删。
     bool feature_create_failed = false;
+    CreateFeatureInputKey feature_fail_key {};
+    bool feature_fail_key_valid = false;
+    std::uint32_t feature_fail_rc = 0;
+    std::uint64_t feature_fail_tick = 0;
+    std::uint32_t eval_fail_streak = 0;
+    std::uint64_t eval_fail_total = 0;
+    std::uint32_t pool_rebuilds = 0;
 
-    // ---- 2026-11-13 改（§5 / 推翻 S-81 的"永久"）：**失败输入 key** ----
-    // 为什么放宽：S-81 的前提是"CreateFeature 失败的根因不会自愈"。该前提对
-    //   PathListInfo 配错成立，但**对参数性失败不成立**。实机日志（用户提供的事故记录）：
-    //     00:18:00  render_scale_written index=8 scale=0.999000
-    //     00:18:02  create_feature ok=0 rc=0xBAD00010      <- UnsupportedParameter（参数性）
-    //     00:18:30  selection_changed index=3 scale=0.500000   <- 用户已把精度改回安全值
-    //     00:18:30  DISPATCH_FAILED ...                    <- 仍一路失败 43517 次到日志结束
-    //   ⇒ 用户改回安全精度后本应自愈，却因锁存而进程内永久失败，只能重启游戏。
-    // 放宽到什么程度（**必须窄**，见 :2005 记过的 0xBAD0000B 每帧重试教训）：
-    //   ① 只有 rc == NVSDK_NGX_Result_FAIL_UnsupportedParameter 的失败**不置** g_release_all；
-    //      其余一切 rc（含未知 rc、含 0xBAD0000B）维持原样置 g_release_all（白名单，不是黑名单）。
-    //   ② 且只有**下列 10 个输入**中的任何一个变化才允许重试一次 —— 它们就是下面这份 key。
-    //   ③ 再叠一个最小重试间隔（kFeatureCreateRetryMinMs）。
-    //      ⚠️ 2026-11-13（独立审查第 4 条）：③ 的理由**已订正**。原写「防止尺寸逐帧抖动在
-    //        参数持续失败时把重试变成每帧一次 CreateFeature」—— 该理由**不成立**：
-    //        构成 key 的 10 个字段全是低频、事件驱动的量（没有一个是帧级量），
-    //        "尺寸逐帧抖动"在本 key 上不会发生。③ 的真实理由是 **CreateFeature 失败时会
-    //        阻塞**（见 :1891 附近"每帧阻塞"与 kFeatureCreateRetryMinMs 的注释），
-    //        需要给连续失败一个频率上限。原文保留（要求：被推翻的旧注释不删，就地标注）。
-    //
-    // key 的字段选择依据（为什么是这几个、而不是别的）：
-    //   · render / display 宽高 —— 直接进 Width/Height/OutWidth/OutHeight 与子矩形；
-    //   · 选档结果 —— resolve_create_quality(...) 的返回值（= 实际写进 PerfQualityValue 的那个值）；
-    //   · g_render_preset —— 六个 NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_* 的值；
-    //   · HDR / create flags —— IsHDR 等位由 resolve_is_hdr 决定，见 build_create_flags；
-    //   · color_fmt / output_fmt —— ★ 2026-11-13（独立审查第 5 条）补入。它们决定
-    //     IsHDR 位的来源判定，也决定资源池按什么格式建（create_pool 直读这两个字段）。
-    //     漏掉它们的反例：后缓冲 R10G10B10A2 → R16G16B16A16_FLOAT 而 create_flags 不变
-    //     ⇒ 旧 key 判"相同" ⇒ 该重试的自愈被漏掉。
-    // ★ HDR **必须**取 resolve_is_hdr 的决策，不能用 g_hdr：后者只是回写镜像、与真实决策
-    //   可能不同（见 :1076-1077 的 M2 修复注释）。
-    // ★ 刻意**不**把尺寸/格式之外的运行期状态（jitter、frame_index、reset）纳入 key：
-    //   它们每帧都变 ⇒ key 每帧都"变化" ⇒ 等于无条件解锁，正是 §一.5 / :2005 的禁区。
-    CreateFeatureInputKey feature_fail_key {};       // 失败时那一次的输入 key（类型见下方定义）
-    bool                 feature_fail_key_valid = false;   // 区分"没记录过"与"记录过且全 0"
-    std::uint32_t        feature_fail_rc = 0;        // 失败那一次的 rc，供"同一个 rc / 不同 rc"日志
-    std::uint64_t        feature_fail_tick = 0;      // 失败时刻（GetTickCount64），供最小重试间隔
+    void clear_create_failure()
+    {
+        feature_create_failed = false;
+        feature_fail_key = {};
+        feature_fail_key_valid = false;
+        feature_fail_rc = 0;
+        feature_fail_tick = 0;
+    }
 
-    // ---- T-8 修复（M4-a）：本次 CreateFeature **实际**使用的 CreateFlags 可变输入快照 ----
-    // 为什么必须记录而不是每帧重算后直接用：
-    //   ① Create_Flags 只在 create_feature 时写进 g_params，EvaluateFeature **不会**重算它；
-    //   ② 所以「本次 feature 是按哪一组输入建的」这个事实只能由 create_feature 当场记下。
-    //
-    // ★ 形态选择：**打包成一个 unsigned 位图**，而不是若干个独立 bool 对。
-    //   理由：比较退化成一次整数不等，且新增一个可变输入只需占用一个 bit、
-    //   并在 flags_input_bits() 里加一行 —— 不会出现「加了字段却忘了加比较」的漏项。
-    //   本项目最怕的正是这种静默失效（改了一处、另一处没跟上，编译期零告警）。
-    //   位定义见 flags_input_bits()：bit0=IsHDR / bit1=DepthInverted(T-9) / bit2=MVJittered。
-    //
-    // ★ feature_flags_valid 区分「从没建过 feature」与「建过、且当时的位图是 0」——
-    //   没有它，首次 dispatch 会把 bits=0 误判成"值变了"从而多走一次无意义的重建。
-    unsigned feature_flags_bits  = 0;
-    bool     feature_flags_valid = false;
-
-    // ---- 运行期状态 ----
-    // ★ v8 补（MAJOR-1）：key 默认 0 是合法值，无法用 key==0 表示"尚未建过"。
-    bool          key_valid        = false;
-    bool          first            = true; // 初值 true；尺寸变化置 true；成功 EvaluateFeature 后置 false（F-32）
-    std::uint32_t eval_fail_streak = 0;    // 连续 EvaluateFeature 失败次数；达 3 置 g_release_all（D9 条件 3）
-    std::uint64_t eval_fail_total  = 0;    // 累计失败次数（**只用于日志**，不参与任何判定）
-    std::uint32_t pool_rebuilds    = 0;    // 本实例建池次数（**只用于日志**）
-    std::uint32_t lru_evict        = 0;    // **v8 起恒为 0**（单实例无驱逐）；保留字段仅为日志格式兼容
-    std::uint64_t last_used_tick   = 0;    // 最后使用时刻（GetTickCount64）；v8 起不用于 LRU，仅日志
+    void clear_pool()
+    {
+        pool = {};
+        key = 0;
+        clear_create_failure();
+        eval_fail_streak = 0;
+    }
 };
 
-// ============================================================================
-// §3.3.4.2 全局状态块
-// ★ 形态纪律（T-2）：**只有 g_release_all / g_logged_config / g_ngx_log_count 是 std::atomic**，
-//   其余状态位与全部配置项都是普通 bool/int（SDS 指定）。g_release_all 是唯一被跨 TU 无锁读取的
-//   变量（Dx11FsrBridge.cpp 的 draw 钩子直接读，§3.3.3），所以它必须是 atomic；其余只在
-//   ffx12::dispatch() 持 g_mutex 的调用栈内访问。
-// ============================================================================
-
-// ---- 进程级状态位 ----
 std::atomic<bool> g_release_all { false };   // D9 全局放手；0→1 后不可逆，只读于两道 gate
 bool g_inited    = false;   // ensure_init 成功过（**失败路径不置位**，见 §3.4.2 与 B-9 的更正）
 bool g_available = false;   // SuperSampling 可用
 
-// ---- provider / DLSS 运行时取证（2026-11-14）----
-// 为什么要把 ensure_init 里的局部量搬到这里：ProviderHit（§3.4.3A）在 ensure_init 里是
-//   **栈上局部量**，原先唯一消费点是紧随其后的一行 "provider resolved=" 日志；而"这局到底
-//   谁在超分"现在还要写进 "ngx_core init ok=1" 行（provider= 字段），出了作用域就取不到了。
-//   放在 g_inited / g_available 旁边（同为进程级事实），与 active() / available() 那组查询
-//   同级，不另起一段、也不在别处再造第二份口径（AGENTS.md §五.2）。
-// ★ 只存 kind，不存 ProviderHit 的 module / path：module 句柄按 §6-13 惯例不持有，
-//   而 path 已经打在紧邻的 "provider resolved=… module=…" 行上；再存一份**没有读取点**的
-//   副本只会变成死状态（本仓库对"加了字段却没人读"的历史事故有明确记录）。
-// ★ 形态纪律不变：它**不是** atomic —— 写方（ensure_init）与读方（日志）都在
-//   ffx12::dispatch() 持 g_mutex 的调用栈内，与 g_inited / g_available 的前提完全相同。
-const wchar_t *g_provider_kind = L"unknown";   // 指向字符串字面量（静态存储期），无需持有
 // DLSS 运行时版本（"310.9.16" = FileVersion 前三段）；"?" = 未取到。
 // 只在首次初始化成功时读一次（g_dlss_version_read 锁存）—— 读文件版本要打开文件，
 // 绝不能落在每帧/每 draw 路径上（§二.5 热路径红线）。
@@ -405,28 +269,10 @@ NVSDK_NGX_Parameter *g_params = nullptr;          // 全局一份，**不调 Res
 std::atomic<bool>   g_logged_config { false };    // 配置快照只打一次（§3.10.2 第 0 步）
 std::uint64_t       g_init_retry_after_us = 0;   // ★ 失败退避窗口（§3.4.1 / MAJ-13）；0 = 未失败过
 
-// ---- provider 来源（2026-11-10 增，B154：NgxProvider 键）----
-// 为什么单独一个状态位而不是直接看 ini：ensure_init 里要按它决定"试几条路"，
-// 而 ini 解析在 Dx11FsrBridge.cpp（另一个 TU）⇒ 只能由 set_provider_mode() 送进来。
-// ★ 三态值写死在这里（不靠 ini 字符串比较）：常量即契约，setter 与 ensure_init 共用。
-enum NgxProviderMode : int {
-    kProviderAuto     = 0,   // 默认：先 nvidia，失败再 external
-    kProviderNvidia   = 1,   // 只走真 NGX（注册表），失败即确定性失败（= v1 行为）
-    kProviderExternal = 2,   // 只走外部实现（OptiScaler 之类）
-};
-int g_provider_mode = kProviderAuto;
-
-// ---- 入口（10 个函数指针，§3.4.3 / §3.4.6）----
-PFN_NGX_Init_Ext                 g_init_ext   = nullptr;
-PFN_NGX_GetCapabilityParameters  g_get_caps   = nullptr;
-PFN_NGX_AllocateParameters       g_alloc      = nullptr;
-PFN_NGX_DestroyParameters        g_destroy    = nullptr;
-PFN_NGX_GetScratchBufferSize     g_scratch    = nullptr;
-PFN_NGX_CreateFeature            g_create     = nullptr;
-PFN_NGX_ReleaseFeature           g_release    = nullptr;
-PFN_NGX_EvaluateFeature          g_eval       = nullptr;
-PFN_NGX_Shutdown1                g_shutdown   = nullptr;
-PFN_NGX_GetFeatureRequirements   g_req        = nullptr;
+using neo::ngx::ProviderMode;
+ProviderMode g_provider_mode = ProviderMode::automatic;
+neo::ngx::ProviderApi g_provider;
+std::uint64_t g_f6_request = 0; // dispatch 在后端锁内串行。
 
 // ---- 自写 CS（全局，形状与尺寸无关；只编一次，§3.5）----
 // T-2 只声明；ensure_shaders 是 T-4 的交付物。
@@ -437,7 +283,8 @@ bool g_shader_compile_failed = false;     // 编译输入不变；进程生命�
 bool g_shader_object_failed = false;      // CreateComputeShader 设备对象失败；shutdown_all 后允许新设备重试
 
 // ---- 实例表 ----
-NgxInstance g_inst;   // v8（S-90）：全局唯一实例，不再是 unordered_map + LRU
+// 外部 provider 的 ReleaseFeature 可能等待 GPU；只在显式转场调用，不能在 DLL 静态析构中调用。
+NgxInstance &g_inst = *new NgxInstance {};
 
 // ★ v8 补（MAJOR-1）：上一次的 instance_key，**仅用于 ngx_inst switch from=… 日志**。
 std::uint64_t g_prev_key = 0;
@@ -564,6 +411,21 @@ unsigned g_config_warn = 0;
 //   ★ 改这里任何一个函数的行为，都必须同步改本段注释（§二.2：注释不得与代码矛盾）。
 void log_ngx_core(blog::Level lv, const wchar_t *fmt, ...);   // 无计数闸门（频次控制归调用方）
 void log_ngx_error(const wchar_t *fmt, ...);                  // 恒以 Level::Error 输出，无计数闸门
+
+bool retire_feature(NgxInstance &inst)
+{
+    const auto rc = inst.feature.retire();
+    if (rc == NVSDK_NGX_Result_Success)
+    {
+        inst.first = true;
+        return true;
+    }
+    // 只有一个实例。拒绝退休时保留整份所有权，进程剩余时间让原生路径接管。
+    if (!g_release_all.exchange(true, std::memory_order_relaxed))
+        log_ngx_error(L"ngx_core release_all reason=retirement_refused inst=0x%llX rc=0x%X",
+            static_cast<unsigned long long>(inst.key), rc);
+    return false;
+}
 
 // 2026-11-09（新增）：**按调用点独立限频**的 Error 日志。
 //   ★ 存在理由（缺陷原状）：上一版把计数闸门加在 log_ngx_error **内部**，所有调用点共用
@@ -965,18 +827,6 @@ std::string warn_to_string(unsigned int bits)
     return out;
 }
 
-// 2026-11-10（B154）：provider 模式的**窄串**名字（给 %hs 用）。
-// ★ 与上面的位名表分开：这里枚举的是"配置要什么"，不是告警。
-const char *provider_mode_name(int mode)
-{
-    switch (mode)
-    {
-    case kProviderNvidia:   return "nvidia";
-    case kProviderExternal: return "external";
-    default:                return "auto";
-    }
-}
-
 // ============================================================================
 // §3.10.1 的三个日志闸门（T-5）
 // ★ 三者的阈值**各不相同**，且都是 SDS 明文写死的，不要合并成一个函数 ——
@@ -1320,8 +1170,8 @@ static void log_config_snapshot()
     //   ⇒ 实测出现 hdr_flag=1 / src=ngx_hdr(1) / ffx12_hdr=0 这种自相矛盾的错误证据
     //   （ffx12_hdr=0 明明是 SDR，hdr_flag 却是 1）。这是“制造证据”，比不打印更糟。
     //
-    // ★ 本函数由 ensure_init() 第 0 步调用，此时 g_inst.key_valid 仍为 false、
-    //   g_inst.color_fmt 仍是初值 DXGI_FORMAT_UNKNOWN(0) —— 这是**正常且应如实体现**的：
+    // ensure_init 的首次配置快照可能没有活池；这不是当前输入的 HDR 判定。
+    //   g_inst.pool.shape.color_format 仍是初值 DXGI_FORMAT_UNKNOWN(0) —— 这是**正常且应如实体现**的：
     //   此时没有输入纹理，resolve_is_hdr 走 format 回退并把 src 置为 “unknown”
     //   （而不是伪装成已知值）。真正的决策取证行是 build_create_flags 里的
     //   ngx_hdr_decision（M1 修好后在默认 NgxLogLevel=1 下可见）。
@@ -1331,7 +1181,7 @@ static void log_config_snapshot()
     {
         // color_fmt：key_valid 为假时它必然是 UNKNOWN，显式取出来而不是硬写常量，
         // 这样万一将来快照点后移，也不会静默打印过期值。
-        const DXGI_FORMAT snap_fmt = g_inst.key_valid ? g_inst.color_fmt
+        const DXGI_FORMAT snap_fmt = g_inst.pool.ready() ? g_inst.pool.shape.color_format
                                                       : DXGI_FORMAT_UNKNOWN;
         const char *snap_src = "?";
         const bool snap_hdr = resolve_is_hdr(snap_fmt, &snap_src);
@@ -1351,228 +1201,12 @@ static void log_config_snapshot()
 
     // 2026-11-10（B154）：provider 来源（NgxProvider）。与成功时的 "provider resolved=" 分开命名：
     //   这一行说"配置要什么"，那一行说"实际用了谁" —— 两行一起才能区分"配置没生效"与"来源没找到"。
-    log_ngx_error(L"ngx_core provider_mode=%hs", provider_mode_name(g_provider_mode));
+    log_ngx_error(L"ngx_core provider_mode=%hs", neo::ngx::provider_mode_name(g_provider_mode));
 
     // §3.13 末：非法值位图（只在非零时打；warn_to_string 返回窄串 ⇒ %hs）。
     if (g_config_warn != 0)
         log_ngx_error(L"ngx_core config_warn bits=%hs", warn_to_string(g_config_warn).c_str());
 }
-
-// ============================================================================
-// §3.4.3A provider 解析（2026-11-10 增，B154）
-// 为什么要有这一层：v1 把"谁是 NGX 实现"写死成"注册表 FullPath 指向的那个 _nvngx.dll"。
-//   可注册表只是 NVIDIA 驱动的一条**发现路径**，不是 NGX 的唯一来源 —— OptiScaler 就导出
-//   同一套 NVSDK_NGX_D3D11_* 入口（v0.9.4-final 共 53 个 NVSDK_NGX_* 导出，D3D11 十项齐全）。
-//   于是非 N 卡机器上"注册表不存在"被当成确定性失败（fail_init 置不可逆的 g_release_all），
-//   ngx 后端整个会话报废 —— 这是把**观测源**和**动作**绑死（AGENTS.md §五.1）。
-// 本层只做一件事：给定"来源"，把 10 个入口绑定好；绑定之后的流程一字未变。
-// ============================================================================
-
-// ---- 10 个入口的统一绑定（原第 3 步，抽出来给两条来源复用）----
-// 返回 true = 10 个都在。失败时把**十个指针全部清回 nullptr**：
-//   同一进程里可能先后试过多个候选模块，留下"半套指针"会让后续出现"部分可用"
-//   这种不存在的状态（create_feature 会直接用 g_create / g_eval ⇒ 半套必然是指针空判）。
-static bool bind_entries_from(HMODULE module, std::string *missing)
-{
-    // ★ 名字一律用 §3.4.3 表里核实过的导出名；**不从 nvsdk_ngx.h 抄**（头文件与真实 DLL 有 4 处差异）。
-    g_init_ext = reinterpret_cast<PFN_NGX_Init_Ext>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_Init_Ext"));
-    g_get_caps = reinterpret_cast<PFN_NGX_GetCapabilityParameters>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_GetCapabilityParameters"));
-    g_create = reinterpret_cast<PFN_NGX_CreateFeature>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_CreateFeature"));
-    g_release = reinterpret_cast<PFN_NGX_ReleaseFeature>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_ReleaseFeature"));
-    g_eval = reinterpret_cast<PFN_NGX_EvaluateFeature>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_EvaluateFeature"));
-    g_shutdown = reinterpret_cast<PFN_NGX_Shutdown1>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_Shutdown1"));
-    g_alloc = reinterpret_cast<PFN_NGX_AllocateParameters>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_AllocateParameters"));
-    g_destroy = reinterpret_cast<PFN_NGX_DestroyParameters>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_DestroyParameters"));
-    g_scratch = reinterpret_cast<PFN_NGX_GetScratchBufferSize>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_GetScratchBufferSize"));
-    g_req = reinterpret_cast<PFN_NGX_GetFeatureRequirements>(
-        GetProcAddress(module, "NVSDK_NGX_D3D11_GetFeatureRequirements"));
-
-    // §4.2 第 3 行：**打印所有 null 的名字**，不是只报第一个 —— 少一个入口和少五个
-    // 在某台机器上是完全不同的诊断结论。
-    std::string miss;
-    auto note = [&miss](bool present, const char *name)
-    {
-        if (present)
-            return;
-        if (!miss.empty())
-            miss += ",";
-        miss += name;
-    };
-    note(g_init_ext != nullptr, "NVSDK_NGX_D3D11_Init_Ext");
-    note(g_get_caps != nullptr, "NVSDK_NGX_D3D11_GetCapabilityParameters");
-    note(g_create   != nullptr, "NVSDK_NGX_D3D11_CreateFeature");
-    note(g_release  != nullptr, "NVSDK_NGX_D3D11_ReleaseFeature");
-    note(g_eval     != nullptr, "NVSDK_NGX_D3D11_EvaluateFeature");
-    note(g_shutdown != nullptr, "NVSDK_NGX_D3D11_Shutdown1");
-    note(g_alloc    != nullptr, "NVSDK_NGX_D3D11_AllocateParameters");
-    note(g_destroy  != nullptr, "NVSDK_NGX_D3D11_DestroyParameters");
-    note(g_scratch  != nullptr, "NVSDK_NGX_D3D11_GetScratchBufferSize");
-    note(g_req      != nullptr, "NVSDK_NGX_D3D11_GetFeatureRequirements");
-    if (!miss.empty())
-    {
-        // 清回全套 nullptr（见函数头注释）；顺序与上面一致，方便对照
-        g_init_ext = nullptr;
-        g_get_caps = nullptr;
-        g_create   = nullptr;
-        g_release  = nullptr;
-        g_eval     = nullptr;
-        g_shutdown = nullptr;
-        g_alloc    = nullptr;
-        g_destroy  = nullptr;
-        g_scratch  = nullptr;
-        g_req      = nullptr;
-        log_ngx_error(L"ngx_core missing_entry names=%hs", miss.c_str());
-        if (missing != nullptr)
-            *missing = miss;
-        return false;
-    }
-    if (missing != nullptr)
-        missing->clear();
-    return true;
-}
-
-// ---- 命中的 provider（只用于日志与"要不要付 E1 的 500 ms"）----
-struct ProviderHit
-{
-    HMODULE module = nullptr;
-    const wchar_t *kind = L"unknown";   // nvidia_registry / nvngx_load / loaded_module
-    std::wstring path;                  // 诊断用（可为空）
-    bool nvidia = false;                // true = 真 NGX ⇒ 第 9 步要 Sleep(500)（E1）
-};
-
-// 注册表这条路的三个失败档位（v1 的三条 reason 原样对应）
-enum class ProviderStage { ok, no_registry, load_failed, missing_entry };
-
-const wchar_t *provider_stage_reason(ProviderStage stage)
-{
-    switch (stage)
-    {
-    case ProviderStage::no_registry:   return L"no_registry";
-    case ProviderStage::load_failed:   return L"load_failed";
-    case ProviderStage::missing_entry: return L"missing_entry";
-    default:                           return L"unknown";
-    }
-}
-
-// ---- 来源①：真 NGX（v1 的第 1-3 步原样搬进来）----
-// ⚠️ 无系统目录兜底：v0 的 %WINDIR%\System32\_nvngx.dll 是错的，真运行时在 DriverStore。
-// ★ 句柄不存：v1 不调 Shutdown1、也从不 FreeLibrary（模块与进程同寿，§6-13）。
-static ProviderStage try_nvidia_registry(ProviderHit *hit, unsigned *rc)
-{
-    *rc = 0;
-
-    wchar_t full_path[1024] {};
-    DWORD cb = sizeof(full_path);
-    const LSTATUS reg = RegGetValueW(HKEY_LOCAL_MACHINE,
-                                     L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
-                                     L"FullPath", RRF_RT_REG_SZ, nullptr,
-                                     full_path, &cb);
-    if (reg != ERROR_SUCCESS || full_path[0] == L'\0')
-    {
-        *rc = static_cast<unsigned>(reg);
-        return ProviderStage::no_registry;
-    }
-
-    const std::wstring nvngx_path = std::wstring(full_path) + L"\\_nvngx.dll";
-    const HMODULE module = LoadLibraryW(nvngx_path.c_str());
-    if (module == nullptr)
-    {
-        *rc = static_cast<unsigned>(GetLastError());
-        return ProviderStage::load_failed;
-    }
-
-    if (!bind_entries_from(module, nullptr))
-        return ProviderStage::missing_entry;
-
-    hit->module = module;
-    hit->kind   = L"nvidia_registry";
-    hit->path   = nvngx_path;
-    hit->nvidia = true;
-    return ProviderStage::ok;
-}
-
-// ---- 来源②-a：枚举已加载模块，找导出 NVSDK_NGX_D3D11_Init_Ext 的那个 ----
-// ★ 为什么不用"按文件名找 _nvngx.dll"：OptiScaler 劫持 LoadLibraryW 后返回的是**它自己**
-//   的 HMODULE，进程里并不存在名为 _nvngx.dll 的模块；文件名判据在"谁冒充 NGX"这件事上
-//   完全不可靠。导出面才是事实（AGENTS.md §五.1：观测源要落在源头）。
-// ★ CreateToolhelp32Snapshot 只在 ensure_init 首次（或退避后重试）调用，不在每帧路径上
-//   ⇒ 不触犯 §二.5 热路径红线。
-static bool scan_loaded_modules(ProviderHit *hit, unsigned *scanned)
-{
-    if (scanned != nullptr)
-        *scanned = 0;
-
-    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-                                                  GetCurrentProcessId());
-    if (snap == INVALID_HANDLE_VALUE)
-        return false;
-
-    bool found = false;
-    unsigned count = 0;
-    MODULEENTRY32W me {};
-    me.dwSize = sizeof(me);
-    for (BOOL ok = Module32FirstW(snap, &me); ok != FALSE; ok = Module32NextW(snap, &me))
-    {
-        ++count;
-        if (me.hModule == nullptr)
-            continue;
-        // 先做一次最便宜的存在性检查，避免对上百个模块各做 10 次 GetProcAddress
-        if (GetProcAddress(me.hModule, "NVSDK_NGX_D3D11_Init_Ext") == nullptr)
-            continue;
-        if (!bind_entries_from(me.hModule, nullptr))
-            continue;   // 只导出了部分入口 ⇒ 不是完整 provider，继续找
-        hit->module = me.hModule;
-        hit->kind   = L"loaded_module";
-        hit->path   = me.szExePath;
-        found = true;
-        break;
-    }
-    CloseHandle(snap);
-    if (scanned != nullptr)
-        *scanned = count;
-    return found;
-}
-
-// ---- 来源②-b：external 的全部两条路（先裸名装载，再枚举）----
-// ★ OptiScaler 的 kernel32 LoadLibraryW 钩子（LibraryLoad_Hooks.cpp:66-75）命中
-//   nvngxNamesW（nvngx.dll / nvngx / _nvngx.dll / _nvngx）时返回它自己 ⇒ 这里拿到的
-//   就是 OptiScaler 的 HMODULE。没有 OptiScaler 时它按常规装载失败（126），无害。
-// ★ 成功也**不** FreeLibrary：劫持路径返回的句柄不是正常 LoadLibrary 语义下的新增引用，
-//   对它 FreeLibrary 会打乱对方的引用计数（§6-13 的"不卸载"惯例同理）。
-static bool try_external(ProviderHit *hit, std::wstring *detail)
-{
-    const HMODULE module = LoadLibraryW(L"_nvngx.dll");
-    const unsigned load_err = (module == nullptr) ? static_cast<unsigned>(GetLastError()) : 0u;
-    if (module != nullptr && bind_entries_from(module, nullptr))
-    {
-        hit->module = module;
-        hit->kind   = L"nvngx_load";
-        hit->path   = L"_nvngx.dll";
-        return true;
-    }
-
-    unsigned count = 0;
-    if (scan_loaded_modules(hit, &count))
-        return true;
-
-    if (detail != nullptr)
-    {
-        wchar_t buf[96] {};
-        swprintf_s(buf, L"nvngx_load=0x%X modules=%u", load_err, count);
-        *detail = buf;
-    }
-    return false;
-}
-
 
 // ============================================================================
 // §3.4.2 每条失败路径的统一收尾
@@ -1664,63 +1298,19 @@ static bool ensure_init(ID3D11Device *dev)
         log_config_snapshot();
     }
 
-    // ---- 第 1..3 步：解析 provider 并绑定 10 个入口（2026-11-10 起有两条来源，B154）----
-    // 来源由 NgxProvider 决定（g_provider_mode）：nvidia / external / auto（默认：先 nvidia 再 external）。
-    // ★ 绑定之后的第 4..10 步与 v1 **逐字相同** —— 本改动只换「谁是 NGX 实现」，不换流程。
-    ProviderHit hit;
-    bool provided = false;
-    std::wstring fallback_detail;   // auto/external 失败时的诊断（只出现在 soft_fail 行里）
-
-    if (g_provider_mode != kProviderExternal)
+    const auto hit = neo::ngx::discover_provider(g_provider_mode);
+    if (!hit.missing_entries.empty())
+        log_ngx_error(L"ngx_core missing_entry names=%hs", hit.missing_entries.c_str());
+    if (!hit.source)
     {
-        unsigned nvidia_rc = 0;
-        const ProviderStage stage = try_nvidia_registry(&hit, &nvidia_rc);
-        if (stage == ProviderStage::ok)
-        {
-            provided = true;
-        }
-        else if (g_provider_mode == kProviderNvidia)
-        {
-            // 显式 nvidia：与 v1 逐条相同（三条 reason + rc 原样），不重试、不换来源
-            return fail_init(provider_stage_reason(stage), nvidia_rc);
-        }
-        else
-        {
-            wchar_t buf[64] {};
-            swprintf_s(buf, L"%s(0x%X)", provider_stage_reason(stage), nvidia_rc);
-            fallback_detail = buf;
-        }
+        return hit.retryable ? soft_fail_init(hit.detail) : fail_init(hit.failure, hit.error);
     }
-
-    if (!provided)
-    {
-        std::wstring ext_detail;
-        if (try_external(&hit, &ext_detail))
-        {
-            provided = true;
-        }
-        else
-        {
-            if (ext_detail.empty())
-                ext_detail = L"unknown";
-            if (!fallback_detail.empty())
-                fallback_detail += L" external=";
-            fallback_detail += ext_detail;
-            // ★ 不置 g_release_all：OptiScaler 可能还没加载完（§3.4.2A）
-            return soft_fail_init(fallback_detail);
-        }
-    }
+    g_provider = hit.api;
 
     // ---- 第 3 步收尾：来源取证（Error 级 ⇒ 默认 NgxLogLevel=1 就可见）----
     // 为什么要单独一行：`Ffx12Backend=ngx` 只说明"用户要 ngx"，这一行才说明"实际用的是谁"。
     log_ngx_error(L"ngx_core provider resolved=%s module=%s",
-                  hit.kind, hit.path.empty() ? L"(unknown)" : hit.path.c_str());
-    // 2026-11-14：同一份事实**另存一份到全局**，供第 10 步的 init 行打印 provider= 字段。
-    //   为什么不能只靠上面那行：init 行与它相隔 50 行、中间还有 6 条失败早退路径，
-    //   排查时要同时看到"谁在超分 + 运行时版本 + 初始化成功"才够一次定位；而 hit 是局部量。
-    //   存的是同一份数据（不重新解析），故不产生第二套口径。
-    g_provider_kind = hit.kind;
-
+                  hit.source, hit.path.empty() ? L"(unknown)" : hit.path.c_str());
     // ---- 第 4 步：组装 NVSDK_NGX_FeatureCommonInfo（§3.4.5）----
     NVSDK_NGX_FeatureCommonInfo fc {};
     fc.PathListInfo.Path   = g_feature_dir_ptrs.empty() ? nullptr : g_feature_dir_ptrs.data();
@@ -1739,13 +1329,13 @@ static bool ensure_init(ID3D11Device *dev)
 
     // ---- 第 6 步：Init_Ext(app_id, appdata, dev, NVSDK_NGX_Version_API, &fc) ← 第 5 参是 fc ----
     const NVSDK_NGX_Result init_rc =
-        g_init_ext(g_app_id, appdata.c_str(), dev, NVSDK_NGX_Version_API, &fc);
+        g_provider.init(g_app_id, appdata.c_str(), dev, NVSDK_NGX_Version_API, &fc);
     if (init_rc != NVSDK_NGX_Result_Success)
         return fail_init(L"init", static_cast<unsigned>(init_rc));
 
     // ---- 第 7 步：GetCapabilityParameters（全局一份，**不调 Reset()**）----
     NVSDK_NGX_Parameter *params = nullptr;
-    const NVSDK_NGX_Result caps_rc = g_get_caps(&params);
+    const NVSDK_NGX_Result caps_rc = g_provider.get_caps(&params);
     if (caps_rc != NVSDK_NGX_Result_Success || params == nullptr)
         return fail_init(L"no_params", static_cast<unsigned>(caps_rc));
     g_params = params;
@@ -1800,7 +1390,7 @@ static bool ensure_init(ID3D11Device *dev)
                   static_cast<unsigned>(NVSDK_NGX_Result_Success),
                   g_dlss_version.empty() ? L"?" : g_dlss_version.c_str(),
                   g_dlss_source.empty() ? L"none" : g_dlss_source.c_str(),
-                  g_provider_kind);
+                  hit.source);
 
     // ---- 第 10b 步（2026-11-13，OPEN-ISSUES §4）：为选档准备**独立的**查询参数对象 ----
     // 为什么放在这里、而不是第一次选档时懒建：
@@ -1996,7 +1586,7 @@ struct CreateFlagsEval
 };
 
 // 3.8.2：九 bit 只设四个。绝不设 DoSharpening（SR_DEPRECATED_SHARPENING 在 MSVC 下
-// 展开为 [[deprecated]]，引用即 C4996）；AutoExposure 也不设（桥从不提供曝光纹理）。
+// 展开为 [[deprecated]]，引用即 C4996）；桥不提供曝光纹理，由 SDK 自动曝光。
 // ★ 这是 **CreateFlags 的唯一构造点**：flags 与 bits 在同一个函数体内、对同一组输入求值一次。
 //   （flags_input_bits() 是它的「只算位图」精简版，只给每帧的重建判据用；
 //     两者必须对同一组输入给出同一个 bits —— 见 flags_input_bits 的注释。）
@@ -2046,7 +1636,6 @@ static CreateFlagsEval build_create_flags(DXGI_FORMAT color_fmt, bool log_decisi
     if (ev.is_hdr)                              ev.bits |= kFlagsInputIsHdr;
     if (ffx12::depth_inverted())                ev.bits |= kFlagsInputDepthInvert;
     if (ffx12::motion_vectors_jittered())       ev.bits |= kFlagsInputMvJittered;
-    // 1<<4 Reserved_0 / 1<<5 DoSharpening / 1<<6 AutoExposure / 1<<7 AlphaUpscaling / 1<<8 Reserved_8 一律不设
     // T-8：把决策来源打进日志（便于实机排查）。
     // ★★ M1 修复：**必须是 blog::Level::Error**。NgxLogLevel 默认 1 = error，而
     //   ngx_level_of(Info) = 2 ⇒ Info 档位在默认配置下**永不打印**，本行等于不存在，
@@ -2169,7 +1758,7 @@ static NVSDK_NGX_PerfQuality_Value perf_quality_for_create(NVSDK_NGX_PerfQuality
 //     生命周期：与 g_params 一样由 NGX 管理（nvsdk_ngx.h:27-30「allocated and released
 //     by SDK, no memory management on client side」）。SDK 同时说明这两种来源的表
 //     "must be freed using NVSDK_NGX_DestroyParameters"（nvsdk_ngx.h:398-401）⇒
-//     在 shutdown_all() 里对**我们自己要来的那一份**调 g_destroy，且只调一次。
+//     在 shutdown_all() 里对**我们自己要来的那一份**调 g_provider.destroy，且只调一次。
 //     ★ 为什么 g_params 仍然不 Destroy：那是既有契约（§3.9.5「由进程回收」），改动它
 //       属于本次范围外；新对象只是"我们多要了一份"，按 SDK 文档释放即可。
 //   ★ 防御：若实现返回**同一个指针**（OptiScaler 之类的单例实现可能如此），直接在
@@ -2201,7 +1790,7 @@ bool g_query_params_owned = false;
 // 查询对象**确定性地建不起来**的原因（non-null ⇒ 不再尝试）。为什么需要这个粘滞位：
 //   选档链不只在建 feature 时被调 —— dispatch 的 feature_create_failed 分支里，
 //   make_feature_input_key 会**每帧**调一次 resolve_create_quality（那时本来就要
-//   return false，但仍然是每帧）。若失败时每帧都重调一次 g_get_caps，就把一个纯查找
+//   return false，但仍然是每帧）。若失败时每帧都重调一次 g_provider.get_caps，就把一个纯查找
 //   变成了每帧一次 NGX 入口调用 —— AGENTS.md §二.5 的形态。
 //   ⇒ 失败一次即记下原因、永不再试，直到 shutdown_all 把整套状态清掉（换设备/换 provider
 //     是唯一值得重试的时机）。
@@ -2254,8 +1843,8 @@ static void release_query_params()
 {
     // ★ 顺序：先判 owned 再 Destroy，最后清标志。任何一条路径漏清标志都会导致
     //   下一次 shutdown_all 对已释放的指针再 Destroy 一次。
-    if (g_query_params != nullptr && g_query_params_owned && g_destroy != nullptr)
-        (void)g_destroy(g_query_params);
+    if (g_query_params != nullptr && g_query_params_owned && g_provider.destroy != nullptr)
+        (void)g_provider.destroy(g_query_params);
     g_query_params = nullptr;
     g_query_params_owned = false;
     // ★ 粘滞失败原因也一并清：本函数只在 shutdown_all 里调用（设备级关停），
@@ -2276,7 +1865,7 @@ static bool ensure_query_params(const char **why)
         if (why) *why = g_query_params_fail;
         return false;
     }
-    if (g_get_caps == nullptr)
+    if (g_provider.get_caps == nullptr)
     {
         g_query_params_fail = "no_entry";
         if (why) *why = g_query_params_fail;
@@ -2284,7 +1873,7 @@ static bool ensure_query_params(const char **why)
     }
 
     NVSDK_NGX_Parameter *qs = nullptr;
-    const NVSDK_NGX_Result rc = g_get_caps(&qs);
+    const NVSDK_NGX_Result rc = g_provider.get_caps(&qs);
     if (rc != NVSDK_NGX_Result_Success || qs == nullptr)
     {
         g_query_params_fail = "no_params";
@@ -2531,7 +2120,7 @@ static void apply_render_preset(int v)
 //   · perf_quality：就是 create_feature 第 4 项那个表达式（先 render 后 display）；
 //   · create_flags / is_hdr：取自**同一次** build_create_flags(color_fmt) 求值，
 //     保证两字段互相一致（见 CreateFlagsEval 的"一次求值、多处取用"注释）；
-//   · color_fmt 用调用方传进来的 inst.color_fmt（= 本帧实际参与 Set 的那份）。
+//   · color_fmt 用调用方传进来的 inst.pool.shape.color_format（= 本帧实际参与 Set 的那份）。
 
 // 从**已有的**一次 CreateFlagsEval 求值构造 key —— 供 create_feature 失败路径复用：
 //   那里已经为 Set() 调过一次 build_create_flags（存进 flag_eval），再调一次会多打一条
@@ -2541,10 +2130,10 @@ static CreateFeatureInputKey make_feature_input_key_from(const NgxInstance &inst
                                                          const CreateFlagsEval &ev)
 {
     CreateFeatureInputKey k;
-    k.render_w      = inst.rw;
-    k.render_h      = inst.rh;
-    k.display_w     = inst.dw;
-    k.display_h     = inst.dh;
+    k.render_w      = inst.pool.shape.render_width;
+    k.render_h      = inst.pool.shape.render_height;
+    k.display_w     = inst.pool.shape.output_width;
+    k.display_h     = inst.pool.shape.output_height;
     // 2026-11-13（OPEN-ISSUES §4）：本字段的口径 = "create_feature 实际 Set 进 NGX 的那个值"。
     //   §4 的改动把选档换成 resolve_create_quality（区间查询 → 回退比例表 → 兜底），
     //   这里若继续用旧的 perf_quality_for_create(quality_from_ratio(...))，key 里记的
@@ -2552,19 +2141,19 @@ static CreateFeatureInputKey make_feature_input_key_from(const NgxInstance &inst
     //   （key 相同 ⇒ 不重试）。⇒ 与 create_feature 走同一个函数。
     // ★ log_decision=false：失败路径不重复打 pq_select（决策已在 create_feature 里打过），
     //   且区间查询有缓存 ⇒ 这里通常不触发任何 NGX 调用。
-    k.perf_quality  = resolve_create_quality(inst.rw, inst.rh, inst.dw, inst.dh, false);
+    k.perf_quality  = resolve_create_quality(inst.pool.shape.render_width, inst.pool.shape.render_height, inst.pool.shape.output_width, inst.pool.shape.output_height, false);
     k.render_preset = g_render_preset;
     k.create_flags  = ev.flags;
     // 2026-11-13（独立审查第 5 条）：**格式也是 CreateFeature 的输入**，必须进 key。
     //   反例：后缓冲 R10G10B10A2 → R16G16B16A16_FLOAT。两者在 resolve_is_hdr 的回退层
     //   取值不同，但只要 IsHDR 位恰好不变（例如 swapchain 探测成功且判 SDR），
     //   create_flags 就不变 ⇒ 旧 key 判"相同"⇒ 该重试的自愈被漏掉。
-    //   格式另外还决定资源池按什么建（create_pool 直接读 inst.color_fmt/output_fmt），
+    //   格式另外还决定资源池按什么建（create_pool 直接读 inst.pool.shape.color_format/output_fmt），
     //   所以它对本判据是"实打实的输入"，不是旁证。
     //   ★ 取 inst 的字段而不是形参：与 create_feature 里 Set() 的取值来源同源
-    //     （那里也是 inst.color_fmt）。DXGI_FORMAT 在这里转 int，保持本 key 零 D3D 依赖。
-    k.color_fmt     = static_cast<int>(inst.color_fmt);
-    k.output_fmt    = static_cast<int>(inst.output_fmt);
+    //     （那里也是 inst.pool.shape.color_format）。DXGI_FORMAT 在这里转 int，保持本 key 零 D3D 依赖。
+    k.color_fmt     = static_cast<int>(inst.pool.shape.color_format);
+    k.output_fmt    = static_cast<int>(inst.pool.shape.output_format);
     k.is_hdr        = ev.is_hdr;     // ★ 取 resolve_is_hdr 的决策，**不是** g_hdr（见 :1076-1077）
     return k;
 }
@@ -2664,7 +2253,7 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     // 签名由 SDS 3.8.1 写死，但本函数不读 in（资源全在 inst 里）=> 显式标注避免 C4100。
     static_cast<void>(in);
 
-    // 出参初值 = "NGX 没有被调用"。下面**只有**在 g_create 真正返回之后才覆盖它
+    // 出参初值 = "NGX 没有被调用"。下面**只有**在 g_provider.create 真正返回之后才覆盖它
     //   ⇒ no_params / null_resource 两条早退路径自动保持哨兵值，不需要各自再写一遍
     //   （少一个写入点就少一处会漏的地方）。
     if (out_rc != nullptr)
@@ -2672,22 +2261,19 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
 
     // 释放旧 handle。返回值【不处理】：handle 已失效时 NGX 返回失败，不影响后续 CreateFeature。
     // 不调 g_params->Reset()（3.9.5）—— 那会清掉 CreateFeature 设的 7 项。
-    if (g_release && inst.feature) (void)g_release(inst.feature);
-    inst.feature = nullptr;
-
-    // 偏离 1（防御，不改变正常路径）：g_params / g_create 为 null 只可能是 ensure_init
+    // 偏离 1（防御，不改变正常路径）：g_params / g_provider.create 为 null 只可能是 ensure_init
     //   从未成功（T-5 的接线前提不成立）=> 直接失败，不空指针崩溃。
-    if (g_params == nullptr || g_create == nullptr)
+    if (g_params == nullptr || g_provider.create == nullptr)
     {
         log_ngx_error(L"ngx_core create_feature ok=0 preset=%d reason=no_params", g_render_preset);
         inst.feature_create_failed = true;
         // 2026-11-13（§5）：**本置位点不记录 key、也不参与 key 变化重试**。
-        //   理由：no_params 的根因是 ensure_init 从未成功（g_params/g_create 为空），
+        //   理由：no_params 的根因是 ensure_init 从未成功（g_params/g_provider.create 为空），
         //   那是**环境性**失败、与本节说的"输入 key"无关；写一份 key 只会误导后续排查
         //   （看起来像"参数性问题可自愈"）。retry_eligible 因此恒为 0。
         //   g_release_all 照旧置位 ⇒ 维持 S-81 原语义。
         // ★ 刻意**不**调 record_feature_create_failure：本路径没有"输入 key"可言
-        //   （g_params/g_create 为空，CreateFeature 根本没被调用）。若为了日志整齐
+        //   （g_params/g_provider.create 为空，CreateFeature 根本没被调用）。若为了日志整齐
         //   记一份全 0 的 key，日志里会出现 rw=0 rh=0 dh=0 这种**看起来像真 key** 的行
         //   —— 那正是 AGENTS.md §二.2 禁止的"制造错误证据"。上面的 ok=0 行已经
         //   用 reason=no_params 说明了原因，信息不缺。
@@ -2711,10 +2297,10 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
                 missing += ",";
             missing += name;
         };
-        note(inst.color.Get()  != nullptr, "color");
-        note(inst.depth.Get()  != nullptr, "depth");
-        note(inst.motion.Get() != nullptr, "motion");
-        note(inst.output.Get() != nullptr, "output");
+        note(inst.pool.color.Get()  != nullptr, "color");
+        note(inst.pool.depth.Get()  != nullptr, "depth");
+        note(inst.pool.motion.Get() != nullptr, "motion");
+        note(inst.pool.output.Get() != nullptr, "output");
         if (!missing.empty())
         {
             // 与 ok=1 行的区别：无 rc= 字段、带 reason=null_resource 与具体缺哪个资源名。
@@ -2733,14 +2319,14 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     }
 
     // 1. Width / Height
-    g_params->Set(NVSDK_NGX_Parameter_Width,  inst.rw);
-    g_params->Set(NVSDK_NGX_Parameter_Height, inst.rh);
+    g_params->Set(NVSDK_NGX_Parameter_Width,  inst.pool.shape.render_width);
+    g_params->Set(NVSDK_NGX_Parameter_Height, inst.pool.shape.render_height);
     // 2. OutWidth / OutHeight
-    g_params->Set(NVSDK_NGX_Parameter_OutWidth,  inst.dw);
-    g_params->Set(NVSDK_NGX_Parameter_OutHeight, inst.dh);
+    g_params->Set(NVSDK_NGX_Parameter_OutWidth,  inst.pool.shape.output_width);
+    g_params->Set(NVSDK_NGX_Parameter_OutHeight, inst.pool.shape.output_height);
     // 3. Render.Subrect.Dimensions（= 无动态分辨率时的全屏子矩形）
-    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,  inst.rw);
-    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, inst.rh);
+    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,  inst.pool.shape.render_width);
+    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, inst.pool.shape.render_height);
     // 4. PerfQualityValue
     // 2026-11-13（OPEN-ISSUES §4 治本）：选档改走 resolve_create_quality ——
     //   ① 先向 NGX 查询六个档位各自的合法 render 尺寸区间，挑区间包含当前 render 尺寸的那档；
@@ -2751,35 +2337,36 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     //   quality_from_ratio 内部的形参序是 (render_w, display_w)，两处不要弄反。
     // ★★ 本函数**只决定"选哪个档"**：create flags、资源、实例生命周期一律不动。
     // ★★★ 必须与 diag_check_create_params 的回读校验同源，否则 set_mismatch 误报。
-    const int perf_quality = resolve_create_quality(inst.rw, inst.rh, inst.dw, inst.dh, true);
+    const int perf_quality = resolve_create_quality(inst.pool.shape.render_width, inst.pool.shape.render_height, inst.pool.shape.output_width, inst.pool.shape.output_height, true);
     g_params->Set(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality);
     // 5. Create.Flags（3.8.2）
     // ★ T-8：同一份求值结果既用于 Set()、也用于日志与快照（见 CreateFlagsEval 的注释）。
-    const CreateFlagsEval flag_eval = build_create_flags(inst.color_fmt);
+    const CreateFlagsEval flag_eval = build_create_flags(inst.pool.shape.color_format);
     const unsigned int flags = flag_eval.flags;
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
     // 6. 四个纹理（走 set_tex，杜绝传视图）
-    set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.color.Get());
-    set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.depth.Get());
-    set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.motion.Get());
-    set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.output.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.pool.color.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.pool.depth.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.pool.motion.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.pool.output.Get());
     // 7. 六个 preset 键（v1 全设同一值）
     apply_render_preset(g_render_preset);
 
+    NVSDK_NGX_Handle *created = nullptr;
     const NVSDK_NGX_Result rr =
-        g_create(ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &inst.feature);
+        g_provider.create(ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &created);
+    const bool owned = inst.feature.adopt(rr, created, g_provider.release);
 
     // 2026-11-13（独立审查第二轮 · 建议 6）：**成功与失败都写出真实 rc**。
-    //   放在这里（g_create 之后、日志之前）而不是各 return 点各写一遍：本函数的结局
+    //   放在这里（g_provider.create 之后、日志之前）而不是各 return 点各写一遍：本函数的结局
     //   全部由 rr 决定 ⇒ 一处写入即可覆盖 rr != Success 的白名单 / 非白名单两条分支与成功分支。
     if (out_rc != nullptr)
         *out_rc = static_cast<unsigned int>(rr);
 
-    log_ngx_core(blog::Level::Error, L"ngx_core create_feature ok=%d preset=%d rc=0x%X",
-                 rr == NVSDK_NGX_Result_Success ? 1 : 0, g_render_preset, rr);
-    if (rr != NVSDK_NGX_Result_Success)
+    log_ngx_core(blog::Level::Error, L"ngx_core create_feature ok=%d preset=%d rc=0x%X handle=%d",
+                 owned ? 1 : 0, g_render_preset, rr, created != nullptr ? 1 : 0);
+    if (!owned)
     {
-        inst.feature = nullptr;
         inst.feature_create_failed = true;
         // 偏离 3：SDS 3.8.1 的代码块漏了下面这一行，但 4.2 第 10 行与 3.9.7 明文要求
         //   置 g_release_all（确定性失败，重试不会好，让原生接手）。
@@ -2875,7 +2462,7 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     // ★ 必须放在 rr == Success 之后：失败时 feature 没建起来，记快照毫无意义，
     //   而且会在 S-81 的锁存路径上留下一个"看着像已建"的假状态。
     inst.feature_flags_bits  = flag_eval.bits;
-    inst.feature_flags_valid = true;
+
 
     // flags 取证行（3.10.1 第 5 层）。注意：本行与 3.10.2 的配置快照第 3 行
     //   （ngx_core hdr_flag=1 src=ngx_hdr(1) ffx12_hdr=0）是两条不同的行、两套格式串，
@@ -2886,7 +2473,7 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     //   ⇒ SDR 会话打出 hdr_flag=1 而 create_flags 含 IsHDR，等于用日志给错误决策背书。
     //   现在：hdr_flag 直接取 flags 的 IsHDR 位（= build_create_flags 实际写进 NGX 的那一位），
     //   src_ngx_hdr 取同一次 resolve_is_hdr 的决策（与 M1 的 ngx_hdr_decision 行严格一致）。
-    //   ⇒ 二者同源于**本函数里 build_create_flags(inst.color_fmt) 的那一次调用**：
+    //   ⇒ 二者同源于**本函数里 build_create_flags(inst.pool.shape.color_format) 的那一次调用**：
     //     hdr_flag 是 flag_eval.flags 的 IsHDR 位，src_ngx_hdr 是同一个 flag_eval.is_hdr，
     //     而 ev.flags 的 IsHDR 位在 build_create_flags 内就是由 ev.is_hdr 置的。
     //   ★ 这保证的是「**本函数的单次求值内**二者一致」，不是「永远不会矛盾」：
@@ -2894,9 +2481,9 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     //     别的输入置 IsHDR 位而不同步 is_hdr，二者就会分叉。改动上述任一处时须一并复核本行。
     // ★ 字段名一个都不删：§7.1-8 的 grep 判据依赖 hdr_flag= / src_ngx_hdr= / ffx12_hdr=。
     log_ngx_core(blog::Level::Error,
-        L"ngx_core create_flags=0x%X bits=%hs autoexposure=0 "
+        L"ngx_core create_flags=0x%X bits=%hs autoexposure=%d "
         L"src=ngx_no_exposure_texture hdr_flag=%d src_ngx_hdr=%d ffx12_hdr=%d src_kind=%hs",
-        flags, flags_to_string(flags).c_str(),
+        flags, flags_to_string(flags).c_str(), (flags & NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) != 0,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? 1 : 0,
         flag_eval.is_hdr ? 1 : 0, ffx12::hdr_input() ? 1 : 0, flag_eval.hdr_src);
     return true;
@@ -2937,367 +2524,45 @@ static void log_ngx_inst_reuse(std::uint64_t from, std::uint64_t to)
 }
 
 // 五张纹理的 desc 差异全部用这张表表达，不要每个字段手抄一遍
-struct PoolDesc { DXGI_FORMAT fmt; UINT bind; const char *name; };
-
-static bool make_pool_texture(ID3D11Device *dev, const PoolDesc &d,
-                              UINT w, UINT h, ComPtr<ID3D11Texture2D> &out, int inst_id)
+// 尺寸/格式属于资源池，创建标志属于 feature；只改变 HDR 等标志不重建引导纹理。
+static bool ensure_instance(std::uint64_t key, ID3D11Device &device, const neo::ngx::FrameShape &shape)
 {
-    D3D11_TEXTURE2D_DESC td {};
-    td.Width            = w;
-    td.Height           = h;
-    td.MipLevels        = 1;
-    td.ArraySize        = 1;
-    td.Format           = d.fmt;
-    td.SampleDesc.Count = 1;
-    td.Usage            = D3D11_USAGE_DEFAULT;
-    td.BindFlags        = d.bind;
-    td.CPUAccessFlags   = 0;
-    td.MiscFlags        = 0;          // ★ §3.12.4：不要 SHARED / NT 共享
-    const HRESULT hr = dev->CreateTexture2D(&td, nullptr, out.GetAddressOf());
-    if (FAILED(hr))
+    auto &inst = g_inst;
+    const bool same_shape = inst.pool.ready() && inst.pool.shape == shape;
+    const bool same_key = inst.pool.ready() && inst.key == key;
+    if (same_key && same_shape) return true;
+
+    if (cross_key_reuse() && same_shape && inst.feature &&
+        flags_input_bits(shape.color_format) == inst.feature_flags_bits)
     {
-        // 非致命重复性错误（每帧重试建池）⇒ 按槽独立限频，见 log_ngx_error_throttled 的注释。
-        // ★ 为什么不是致命：create_pool 失败只让本帧放弃，不置 g_release_all（S-81 的锁存由
-        //   调用方按尺寸/格式变化决定），因此高频重复是可能的、也必须限频。
-        log_ngx_error_throttled<log_throttle_slot::Slot::PoolTexFail>(
-            L"ngx_inst pool tex fail inst=%d name=%hs w=%u h=%u fmt=%d hr=0x%08X",
-            inst_id, d.name, w, h, static_cast<int>(d.fmt),
-            static_cast<unsigned>(hr));
-        return false;
-    }
-    return true;
-}
-
-// ============================================================================
-// ★★ T-4 第 2 轮修复（MAJOR-1）：create_pool / destroy_instance 共用的「清本池资源」段。
-//
-// 为什么要抽出来：create_pool 现在要满足「先清后建」契约（可从任意状态调用），而
-// destroy_instance 里本来就有同一段清理。两处共用一份，避免下一次改动只改一边。
-//
-// ★★ 本函数**只清资源**，绝不碰 feature_create_failed / key_valid / feature 句柄：
-//   create_pool 在已建池实例上重入时会调用它，而 S-81 规定「尺寸/格式变化**不清锁、不重试**」。
-//   若这里顺手把 feature_create_failed 置 false，0xBAD0000B 就会每帧重试 ——
-//   这是本次修复最容易写错的地方。锁存与 key_valid 归 destroy_instance() 管，
-//   feature 是裸 handle 也归 destroy_instance() 手工 Release。
-//
-// ★ 定义位置必须早于 create_pool 与 destroy_instance（否则 C3861）。
-// ============================================================================
-static void release_pool_resources(NgxInstance &inst)
-{
-    // ---- 5 张纹理（§3.12.3 规则 2 要求 Reset 的全部 5 张）----
-    inst.color.Reset();  inst.depth.Reset();  inst.motion.Reset();
-    inst.reactive.Reset(); inst.output.Reset();
-
-    // ---- 池内视图 + cb：1 SRV + 3 UAV + 1 cb ----
-    // ★ 只 Reset 真实存在的字段。**没有** output_uav / depth_srv / motion_srv / reactive_srv
-    //   （§3.3.4.1 明文「v1 不用，不要加」；写过它们会 C2039）
-    inst.color_srv.Reset();
-    inst.depth_uav.Reset(); inst.motion_uav.Reset();
-    inst.reactive_uav.Reset(); inst.cb.Reset();
-
-    // ---- 输入侧 SRV 与身份缓存（depth_src_last / motion_src_last 是裸指针，只置空不 Release）----
-    inst.depth_src_srv.Reset(); inst.motion_src_srv.Reset();
-    inst.depth_src_last = nullptr;  inst.motion_src_last = nullptr;
-
-    // ★★ 必须同步复位 cb 的缓存判据（SDS §3.12.3 规则 2 明文要求「cb + 3 UAV + 3 SRV」——
-    //   SDS 早期把 SRV 数误记为 4，实际只有 color_srv + depth_src_srv + motion_src_srv 这 3 个，
-    //   而 cb 的缓存判据是 cb 状态的一部分）。否则陷阱 1 / 1b 会在两条路径上复活：
-    //     ① 实例重建路径（make/destroy 之间）；
-    //     ② 已建池实例上的 create_pool 重入路径（T-5 §3.7 第 5 步）。
-    //   create_pool 每次新建 cb（内容 = D3D11 零值），但 cb_uploaded_* 若是旧值，
-    //   upload_cb 会判定「值没变」直接 return ⇒ 新 cb 保持全 0 ⇒ 深度 CS 写出全 0
-    //   （表现：静止还行、一动就糊）。
-    //   （E1 实测：实例切换后 cb.b0.x = 0.0，期望 1.0；重入路径同理）
-    //   纪律：cb 缓存的生命周期 == cb 对象的生命周期。
-    inst.cb_uploaded_depth = std::numeric_limits<float>::quiet_NaN();
-    inst.cb_uploaded_flip  = std::numeric_limits<float>::quiet_NaN();
-}
-
-// TYPELESS 资源建 SRV 时必须显式给 typed 格式（D3D11 规定）：
-// TYPELESS 在 CreateTexture2D 合法，但在 CreateShaderResourceView 的 desc 里**非法**，
-// 会返回 E_INVALIDARG(0x80070057)。这是编译期零告警、只在运行期炸的形态。
-// ★ 本机实测（2026-11-08）：SDR 下游戏给 R8G8B8A8_TYPELESS(27)，
-//   旧代码只映射 R10G10B10A2_TYPELESS ⇒ 每帧 color_srv fail ⇒ NGX 完全不出图；
-//   开 HDR 时游戏给 R8G8B8A8_UNORM(28)（已是 typed）⇒ 侥幸绕过，缺陷被掩盖。
-static DXGI_FORMAT srv_typed_format(DXGI_FORMAT f)
-{
-    switch (f)
-    {
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    // ---- T-8 m1：补齐 3 个既有 typed 格式 ----
-    // 这三个**本身已是 typed**，形式上 default 也能原样返回 —— 那为什么还要显式列出来？
-    //   因为这三种是本机/目标平台真会出现的 SDR 半浮点与广色域格式，而 default 分支的语义是
-    //   "我不认识它、默认它合法"。T-7 的 BLOCKER 正是"default 把未知格式原样放行"造成的，
-    //   所以凡是**已知会出现**的 typed 格式都写明在这里：既是文档，也让将来若改 default 策略
-    //   （例如对未知格式 fail-closed）时不会误伤这三个。
-    // ★ 注意：这三个不是 TYPELESS 的孪生，映射是恒等映射（typed -> 同名 typed）。
-    case DXGI_FORMAT_R16G16B16A16_UNORM:    return DXGI_FORMAT_R16G16B16A16_UNORM;      // 11
-    case DXGI_FORMAT_R16G16B16A16_SNORM:    return DXGI_FORMAT_R16G16B16A16_SNORM;      // 13
-    // R10G10B10_XR_BIAS_A2_UNORM(89)：DXGI 里**没有**它的 TYPELESS 孪生（TYPELESS 只有
-    //   R10G10B10A2_TYPELESS(23)），所以它是"本身已是 typed、无需映射"的那一类，
-    //   这里同样是恒等映射 —— 列出来只为覆盖"广色域 10-bit 后缓冲"这一已知形态。
-    case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM: return DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM;  // 89
-    default:                                 return f;   // 其余已是 typed，原样返回
-    }
-}
-
-// ★★ T-4 第 2 轮修复（MAJOR-1）：「create_pool 可从任意状态调用」是本函数的契约。
-//   旧实现在已建池实例上重入时用 GetAddressOf() 直接覆盖指针（不 Release）⇒
-//   每次重入泄漏 5 张纹理 + 4 个视图 + 1 个 cb；且 cb_uploaded_* 不复位 ⇒
-//   新 cb 全 0 且 upload_cb 被短路 ⇒ 陷阱 1b 复活。
-//   T-5 §3.7 第 5 步（尺寸/格式变化）直接再调一次本函数，不需要自己清理。
-static bool create_pool(ID3D11Device *dev, NgxInstance &inst,
-                        std::uint32_t rw, std::uint32_t rh,
-                        std::uint32_t dw, std::uint32_t dh,
-                        std::uint64_t key)
-{
-    // ---- 「先清后建」：必须在读 inst.color_fmt / inst.output_fmt **之前**完成 ----
-    // ★ 这里**只清资源**，绝不调用 destroy_instance()：那会把 feature_create_failed
-    //   置 false，而 S-81 规定「尺寸/格式变化不清锁、不重试」⇒ 0xBAD0000B 每帧重试。
-    release_pool_resources(inst);
-
-    // ---- 失败路径统一回滚 ----
-    // 契约的另一半：**返回 false 时 inst 上不留半成品**。
-    // 以前这条由 create_instance() 的 destroy_instance() 兜住，但那条兜底路径顺带清锁
-    // （feature_create_failed = false / key_valid = false），不是 create_pool 该管的事；
-    // 直接调用 create_pool 的路径（§3.7 第 5 步重入）则完全没人收尾。
-    // 这里只调 release_pool_resources：**不碰 feature / feature_create_failed / key_valid**。
-    const auto fail = [&inst]() { release_pool_resources(inst); return false; };
-
-    // 颜色/输出沿用游戏侧格式（§3.12.1 规则②：output 保持 TYPELESS）
-    const DXGI_FORMAT color_fmt  = inst.color_fmt;    // = in.color 的 desc.Format
-    const DXGI_FORMAT output_fmt = inst.output_fmt;   // = in.output_target 的 desc.Format
-
-    const PoolDesc texs[5] = {
-        { color_fmt,                 D3D11_BIND_SHADER_RESOURCE,                               "color"    },
-        { DXGI_FORMAT_R32_FLOAT,     D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, "depth"    },
-        { DXGI_FORMAT_R16G16_FLOAT,  D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, "motion"   },
-        { DXGI_FORMAT_R8_UNORM,      D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, "reactive" },
-        { output_fmt,                D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE, "output"   },
-    };
-    // ★★ 必须用 std::addressof，**不能用 &inst.X** ——
-    //   ComPtr 重载了 operator&（返回 ComPtrRef，其 operator T*() 的副作用是把 ptr_ 置空），
-    //   写 { &inst.color, ... } 会把刚建好的 5 张纹理**全部置空**（E1 实测：AFTER a=0x0 b=0x0），
-    //   随后 CreateUnorderedAccessView(nullptr) 返回 E_INVALIDARG 0x80070057 ⇒ create_pool 恒 false
-    //   ⇒ NGX 永远不出图，而日志只有一行 uav fail，极易误判为显卡不支持。
-    //   ★ 编译期零 warning，只能靠运行期抓。
-    ComPtr<ID3D11Texture2D> *dst[5] = {
-        std::addressof(inst.color),   std::addressof(inst.depth),
-        std::addressof(inst.motion),  std::addressof(inst.reactive),
-        std::addressof(inst.output)
-    };
-
-    int id = static_cast<int>(key & 0xFFFF);   // 仅用于失败日志定位是哪次建池
-    for (int k = 0; k < 5; ++k)
-    {
-        const bool render_size = (k == 0 || k == 1 || k == 2 || k == 3);
-        const UINT w = render_size ? rw : dw;
-        const UINT h = render_size ? rh : dh;
-        if (!make_pool_texture(dev, texs[k], w, h, *dst[k], id)) return fail();
-    }
-
-    // 池内视图：color_srv（SRV）+ depth_uav / motion_uav / reactive_uav（UAV）
-    // ★ output 不建 UAV（§3.12.1 规则③：NGX 自己按 typed 孪生建）
-    D3D11_SHADER_RESOURCE_VIEW_DESC sd {};
-    sd.Format        = srv_typed_format(color_fmt);
-    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    sd.Texture2D.MipLevels = 1;
-    HRESULT hr = dev->CreateShaderResourceView(inst.color.Get(), &sd, inst.color_srv.GetAddressOf());
-    // 非致命重复性错误（每次建池都可能重犯）⇒ 按槽独立限频。
-    if (FAILED(hr))
-    {
-        log_ngx_error_throttled<log_throttle_slot::Slot::ColorSrvFail>(
-            L"ngx_inst color_srv fail hr=0x%08X", static_cast<unsigned>(hr));
-        return fail();
-    }
-
-    // 三个 UAV：TYPELESS 资源必须显式给 typed 格式（D3D11 规定）
-    // ★★ 同上：std::addressof，不要 &inst.X（否则三个 UAV 源纹理被置空 ⇒ E_INVALIDARG）
-    ComPtr<ID3D11Texture2D> *uav_tex[3] = {
-        std::addressof(inst.depth), std::addressof(inst.motion), std::addressof(inst.reactive)
-    };
-    ComPtr<ID3D11UnorderedAccessView> *uav_out[3] = {
-        std::addressof(inst.depth_uav), std::addressof(inst.motion_uav), std::addressof(inst.reactive_uav)
-    };
-    const DXGI_FORMAT uav_fmt[3] = { DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R8_UNORM };
-    for (int k = 0; k < 3; ++k)
-    {
-        D3D11_UNORDERED_ACCESS_VIEW_DESC ud {};
-        ud.Format        = uav_fmt[k];
-        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-        ud.Texture2D.MipSlice = 0;
-        hr = dev->CreateUnorderedAccessView(uav_tex[k]->Get(), &ud, uav_out[k]->GetAddressOf());
-        if (FAILED(hr))
-        {
-            // 非致命重复性错误 ⇒ 按槽独立限频。
-            log_ngx_error_throttled<log_throttle_slot::Slot::UavFail>(
-                L"ngx_inst uav fail k=%d hr=0x%08X", k, static_cast<unsigned>(hr));
-            return fail();
-        }
-    }
-
-    // 16 B 常量缓冲（§3.6.5：b0 由 upload_cb 填）
-    D3D11_BUFFER_DESC bd {};
-    bd.ByteWidth      = 16;
-    bd.Usage          = D3D11_USAGE_DEFAULT;
-    bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
-    bd.CPUAccessFlags = 0;
-    hr = dev->CreateBuffer(&bd, nullptr, inst.cb.GetAddressOf());
-    // 非致命重复性错误 ⇒ 按槽独立限频。
-    if (FAILED(hr))
-    {
-        log_ngx_error_throttled<log_throttle_slot::Slot::CbFail>(
-            L"ngx_inst cb fail hr=0x%08X", static_cast<unsigned>(hr));
-        return fail();
-    }
-
-    return true;
-}
-
-// destroy_instance：幂等，未创建时调用安全。
-// ★ T-4 第 2 轮修复（MAJOR-1）：资源清理段抽到 release_pool_resources()，与 create_pool 共用。
-//   **对外行为完全不变**：仍 g_release(feature)、仍 feature_create_failed = false、
-//   仍 key_valid = false。create_pool 不能承担这三件事（见 release_pool_resources 上方注释）。
-static void destroy_instance()
-{
-    // ★ feature 是裸 handle，ComPtr 管不到，必须手工释放
-    if (g_inst.feature)
-    {
-        if (g_release) g_release(g_inst.feature);
-        g_inst.feature = nullptr;
-    }
-    g_inst.feature_create_failed = false;   // 对象销毁 ⇒ 锁存随对象消失（不是「清锁重试」）
-    // 2026-11-13（§5）：失败 key 与锁存同寿。**必须一起清** —— 否则换了设备/尺寸后
-    //   新实例会拿旧实例的 key 作比较，key_changed 可能恒假 ⇒ 白丢一次重试机会；
-    //   更糟的是 feature_fail_key_valid 残留时，间隔判据会以旧 tick 为起点。
-    g_inst.feature_fail_key       = CreateFeatureInputKey {};
-    g_inst.feature_fail_key_valid = false;
-    g_inst.feature_fail_rc        = 0;
-    g_inst.feature_fail_tick      = 0;
-    // T-8 M4-a：feature 句柄没了 ⇒ 那份「本次 CreateFlags 输入」快照也就不再描述任何活对象。
-    // ★ 必须一起清：否则 key 切换后（destroy + create_instance）旧快照会残留，
-    //   若此时位图恰好不同，第 5 步会判定 flags_changed 再白重建一次刚建好的资源池。
-    g_inst.feature_flags_bits  = 0;
-    g_inst.feature_flags_valid = false;
-    // 5 纹理 + cb + 3 UAV + 3 SRV 全是 ComPtr，置空即自动 Release
-    // （★ 含 cb_uploaded_* 复位与 depth_src_last / motion_src_last 归零）
-    release_pool_resources(g_inst);
-    g_inst.key_valid = false;
-}
-
-// create_instance：写 key/尺寸/格式 → 建池。失败时自己回滚。
-static bool create_instance(std::uint64_t key, ID3D11Device *dev,
-                            std::uint32_t rw, std::uint32_t rh,
-                            std::uint32_t dw, std::uint32_t dh,
-                            DXGI_FORMAT color_fmt, DXGI_FORMAT output_fmt)
-{
-    // 先把尺寸/格式写回 inst —— create_pool() 直接读 inst.color_fmt/output_fmt
-    g_inst.key        = key;
-    g_inst.rw = rw;  g_inst.rh = rh;
-    g_inst.dw = dw;  g_inst.dh = dh;
-    g_inst.color_fmt  = color_fmt;
-    g_inst.output_fmt = output_fmt;
-    g_inst.first      = true;
-    g_inst.eval_fail_streak = 0;
-
-    if (!create_pool(dev, g_inst, rw, rh, dw, dh, key))
-    {
-        destroy_instance();     // ★ 自己回滚：半成品资源不能留
-        return false;
-    }
-    g_inst.key_valid = true;
-    return true;
-}
-
-// ensure_instance：对外唯一入口。key 未变则直接返回；变了则 destroy + create。
-// **失败返回 false，调用方 return false；不置 g_release_all**（建池失败可能是瞬时的）。
-static bool ensure_instance(std::uint64_t key, ID3D11Device *dev,
-                            std::uint32_t rw, std::uint32_t rh,
-                            std::uint32_t dw, std::uint32_t dh,
-                            DXGI_FORMAT color_fmt, DXGI_FORMAT output_fmt)
-{
-    // 同 key 且已建好：直接复用。
-    // ★ key == 0 是合法值（§4.4 B-7），**不能**用 key != 0 判断「已建」。
-    if (g_inst.key_valid && g_inst.key == key)
-    {
-        g_inst.last_used_tick = GetTickCount64();
+        log_ngx_inst_reuse(inst.key, key);
+        inst.key = g_prev_key = key;
+        inst.first = true;
         return true;
     }
 
-    // ★★ 跨 key 复用（配置键 NgxCrossKeyReuse，默认开）：key 变了，但建池/建 feature 真正
-    //    依赖的「尺寸 + 格式」全等 ⇒ 现有池与 feature 描述的仍是同一个东西，销毁再建纯属浪费。
-    //    实机 E2 证据：6 次 ngx_inst switch 的 sw_fmt/color_fmt/depth_inv/flags 完全相同，
-    //    却每次都花 ~502ms 在 destroy_instance() 的 g_release(feature) 上；
-    //    无 feature 可释放的那次只用 520us。E1 日志：switch 1 次 / reuse 13 次 / rebuild_us=0。
-    //    ★ 只放行「尺寸与格式全等」：任一项不同都落到下面的 destroy + create，行为不变。
-    //    ★ 必须把 key 写回 g_inst.key：否则上面那条同 key 分支永远不命中，
-    //      每帧都会重新进本分支（虽然不崩，但会每帧刷一条日志）。
-    //
-    // ★★ 配置门控：cross_key_reuse() 关掉时，本 if 的第一个子表达式即假 ⇒ 整条分支不可达，
-    //    控制流**直接落到下面的 destroy_instance() + create_instance()**，与引入本键之前的
-    //    路径逐字节一致（唯一的差别是本条 if 求值了一次 atomic relaxed load）。
-    //    这是刻意把门控放在**条件最前面**而不是包一层 if：包一层会多一层缩进、
-    //    且将来改判定逻辑时更容易只改到其中一层。
-    if (cross_key_reuse() &&
-        g_inst.key_valid &&
-        g_inst.rw == rw && g_inst.rh == rh && g_inst.dw == dw && g_inst.dh == dh &&
-        g_inst.color_fmt == color_fmt && g_inst.output_fmt == output_fmt)
+    const std::uint64_t start = same_key ? 0 : qpc_us();
+    // F6 的退休入口仍可以看到旧 feature 的设备与资源；先释句柄，再交出旧池。
+    if (!retire_feature(inst)) return false;
+    if (auto built = inst.pool.rebuild(device, shape); FAILED(built.hr))
     {
-        // ★★ 安全校验（宁可慢也不出错）：尺寸/格式全等**只说明 key 背后的语义等价**，
-        //    并不证明现有资源仍然可用。以下两类东西可能在别处被释放/半成品化：
-        //      · feature 句柄（裸 handle，不归 ComPtr 管）；
-        //      · 池内 5 张纹理（ComPtr，理论上 key_valid 为真时非空，但 key_valid 只是一个
-        //        bool，任何一处漏置位都会让它与真实状态脱钩）。
-        //    复用一份半成品资源去 EvaluateFeature，后果是**画面错误或驱动崩溃**，
-        //    且远比起一次重建难排查 ⇒ 任一不满足就**放弃复用**，落到 destroy + create。
-        //    ★ 注意这不是"静默降级"：下面的 warn 行会说明是哪一项不满足，
-        //      而且这条路径与 cross_key_reuse=0 时的路径**完全相同**（都会重建），
-        //      所以最坏情况就是退回到引入本键之前的性能，不会更差，也不会每帧重复降级。
-        const bool feature_ok = (g_inst.feature != nullptr);
-        const bool pool_ok    = (g_inst.color && g_inst.depth && g_inst.motion &&
-                                 g_inst.reactive && g_inst.output);
-        if (!feature_ok || !pool_ok)
-        {
-            // 用限频槽打：这条在"资源真出问题"时会**每次 key 变化都命中**，与 reuse 行同族，
-            //   必须限频；同样保证首现可见（前 8 条全打）。
-            // ★ 必须用**独立槽** InstReuseSkip：与上面的 InstReuse 共用槽号会让两个调用点
-            //   共享同一个计数器 ⇒ 后出现者的首现被吞（见 LOG_SLOT_LIST 上方"残余 ①"）。
-            log_ngx_error_throttled<log_throttle_slot::Slot::InstReuseSkip>(
-                L"ngx_inst reuse skip reason=resources_invalid feature=%d pool=%d "
-                L"from=0x%llX to=0x%llX",
-                feature_ok ? 1 : 0, pool_ok ? 1 : 0,
-                static_cast<unsigned long long>(g_inst.key),
-                static_cast<unsigned long long>(key));
-        }
-        else
-        {
-            log_ngx_inst_reuse(g_inst.key, key);
-            g_inst.key            = key;
-            // ★ 2026-11-10（独立审核 MINOR-1）：复用**必须**补一次 Reset。
-            //   改动前 key 变化走 destroy+create，create_instance 置 first=true ⇒ 下一帧 Reset=1
-            //   ⇒ NGX 时域历史归零。复用路径不重建 feature，若不置 first，就会让新 key
-            //   继承旧 key 的历史（两个不同视图的时域累积互相污染）。
-            //   成本可忽略：只多一次 Reset 标志，不重建 feature。
-            g_inst.first          = true;
-            g_inst.last_used_tick = GetTickCount64();
-            g_prev_key            = key;
-            return true;
-        }
+        log_ngx_error_throttled<log_throttle_slot::Slot::PoolTexFail>(
+            L"ngx_inst pool fail inst=0x%llX stage=%hs hr=0x%08X",
+            static_cast<unsigned long long>(key), built.step, static_cast<unsigned>(built.hr));
+        inst.clear_pool();
+        return false;
     }
-
-    // ---- 切换：先释放，再重建 ----
-    const std::uint64_t t0 = qpc_us();
-    destroy_instance();                  // ReleaseFeature + ComPtr 自动放纹理/UAV/SRV/cb
-    if (!create_instance(key, dev, rw, rh, dw, dh, color_fmt, output_fmt))
+    if (same_key)
     {
-        return false;                    // 建池失败：本帧放弃（create_instance 已回滚）
+        ++inst.pool_rebuilds;
     }
-    const std::uint64_t dt = qpc_us() - t0;
-    log_ngx_inst_switch(g_prev_key, key, dt);
-    g_prev_key = key;
+    else
+    {
+        inst.clear_create_failure();
+        inst.eval_fail_streak = 0;
+        log_ngx_inst_switch(g_prev_key, key, qpc_us() - start);
+    }
+    inst.key = g_prev_key = key;
     return true;
 }
 
@@ -3389,194 +2654,6 @@ static bool ensure_shaders()
 
 // 每帧两段 CS 之前调用一次；值与上次相同则跳过上传。
 // ★ 缓存初值是 quiet_NaN()（不是 0.0f）⇒ 保证首帧必上传一次（§3.6.5）。
-static void upload_cb(ID3D11DeviceContext *ctx, NgxInstance &inst,
-                      float depth_scale, float flip)
-{
-    if (inst.cb_uploaded_depth == depth_scale && inst.cb_uploaded_flip == flip)
-        return;
-    const float vals[4] = { depth_scale, flip, 0.0f, 0.0f };   // 16 B，正好 b0
-    ctx->UpdateSubresource(inst.cb.Get(), 0, nullptr, vals, 0, 0);
-    inst.cb_uploaded_depth = depth_scale;
-    inst.cb_uploaded_flip  = flip;
-}
-
-// 深度 CS 的 t0：格式三分支 + 身份缓存。
-// ★ 必须走 GetDesc(&td) 出参形式 —— ID3D11Texture2D 没有无参 GetDesc() 重载，
-//   写 GetDesc().Format 会 C2660。
-static bool ensure_depth_src_srv(const ffx12::FrameInput &in, NgxInstance &inst)
-{
-    // ★★ T-4 第 2 轮修复（MAJOR-2）：入口判空。旧代码直接 in.depth->GetDesc(&dtd)，
-    //   **E0 推断**（空指针解引用；未做崩溃复现归档故不标 E1，见 SDS §0 的 S-109）：注入型 DLL 里是游戏进程崩溃而非 fail-open。
-    //   契约与函数尾部一致：false ⇒ 本帧放弃（fail-open，调用方走原生放行）。
-    //   ★ 必须在 GetDesc 之前 —— 挪到后面等于没修。
-    if (in.depth == nullptr)
-        return false;
-
-    DXGI_FORMAT srv_fmt = DXGI_FORMAT_R32_FLOAT;
-    D3D11_TEXTURE2D_DESC dtd {};
-    in.depth->GetDesc(&dtd);
-    switch (dtd.Format)
-    {
-        case DXGI_FORMAT_R24G8_TYPELESS:
-        case DXGI_FORMAT_D24_UNORM_S8_UINT:
-        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
-            srv_fmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-            break;
-        case DXGI_FORMAT_R32G8X24_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
-            // 官方约定：D32S8/R32G8X24 深度需用 R32_FLOAT_X8X24 视图读深度分量
-            // （普通 R32_FLOAT 视图读不到）
-            srv_fmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-            break;
-        default:
-            srv_fmt = DXGI_FORMAT_R32_FLOAT;
-            break;
-    }
-
-    if (!inst.depth_src_srv || inst.depth_src_last != in.depth)
-    {
-        inst.depth_src_srv.Reset();
-        D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
-        srv.Format = srv_fmt;
-        srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srv.Texture2D.MipLevels = 1;
-        if (FAILED(g_device->CreateShaderResourceView(in.depth, &srv, inst.depth_src_srv.GetAddressOf())))
-            inst.depth_src_srv.Reset();
-        inst.depth_src_last = inst.depth_src_srv ? in.depth : nullptr;
-    }
-    return inst.depth_src_srv != nullptr;
-}
-
-// motion CS 的 t0：格式固定 R10G10B10A2_UNORM（没有三分支）。
-// ★ 不能照 in.motion 的实际格式：游戏 motion 是 R10G10B10A2_TYPELESS(23)，
-//   TYPELESS 不能直接建 SRV（E_INVALIDARG），且解码公式假定 rg 是 UNORM [0,1]。
-static bool ensure_motion_src_srv(const ffx12::FrameInput &in, NgxInstance &inst)
-{
-    // ★★ T-4 第 2 轮修复（MAJOR-2）：与 ensure_depth_src_srv 对齐的显式判空。
-    //   本函数当前不会崩（不调 GetDesc），但不判空时 CreateShaderResourceView(nullptr)
-    //   只是碰巧失败并被下面的 FAILED 分支吃掉 —— 依赖"碰巧"是缺陷，显式判空。
-    //   同族函数行为必须对称（审核 MAJOR-2 的原始意见）。
-    if (in.motion == nullptr)
-        return false;
-
-    if (!inst.motion_src_srv || inst.motion_src_last != in.motion)
-    {
-        inst.motion_src_srv.Reset();
-        D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
-        srv.Format        = DXGI_FORMAT_R10G10B10A2_UNORM;   // 固定
-        srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srv.Texture2D.MipLevels = 1;
-        if (FAILED(g_device->CreateShaderResourceView(in.motion, &srv, inst.motion_src_srv.GetAddressOf())))
-            inst.motion_src_srv.Reset();
-        inst.motion_src_last = inst.motion_src_srv ? in.motion : nullptr;
-    }
-    return inst.motion_src_srv != nullptr;
-}
-
-// ============================================================================
-// 2026-11-09（PR #12 审查次要项 9）：为什么两个 CS **用完置空**而不是「还原原值」
-// ============================================================================
-// 审查意见：用完置空（null）而非还原游戏原本绑定的 SRV，多组件共存（桥 + OptiScaler +
-//   ReShade）时可能互相干扰。
-// 结论：**保留置空**，理由与量化依据如下（不是"看起来更省事"）。
-//
-// ① 还原需要多少个 Get*（本文件实测点数，非估计）：
-//    本文件两个 CS 各绑定 4 类槽位 —— CS shader / SRV0 / CB0 / UAV0..N。
-//    ⇒ 还原必须成对调用 4 个 Get*：CSGetShader、CSGetShaderResources(0,1)、
-//       CSGetConstantBuffers(0,1)、CSGetUnorderedAccessViews(0,N)。
-//    两个 CS 每帧各跑一次 ⇒ **每帧 8 次 Get* + 8 次 Release**（每个 Get 返回的接口都
-//    AddRef 一次，必须逐个 Release，漏一个就是永久泄漏，见 AGENTS.md §三 #12）。
-//    而当前实现的解绑侧是 **8 次 Set***，一次 Get 都没有。
-//    ⇒ 还原方案的代价是「+8 Get* +8 Release / 帧」，不是任务书设想的 2-3 个 Get*。
-//
-// ② 为什么不能改读桥自己的影子状态（g_state.cs_srvs / cs_uavs / cs_shader / cs_cbs）：
-//    那四个影子数组只由 hooked_cs_set_* 维护，而 **CS 系列钩子在 Release 构建里根本不装**
-//    （Dx11FsrBridge.cpp 的 patches 表：k_idx_cs_set_* 整组在
-//    #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME) 内）。生产构建读到的会是**从不更新**的
-//    旧值 ⇒ 还原成任意别的资源，比置空更危险。故唯一可行路径就是上面那 8 个 Get*。
-//
-// ③ 为什么 8 个 Get* 在本项目算"代价明显"而不是"可以接受"：
-//    · CSGetUnorderedAccessViews / CSGetShaderResources 在 D3D11 立即上下文上是
-//      **回读型**调用：运行时为了让返回值准确，必须把延迟提交的状态落定。它们位于
-//      ngx::dispatch 的第 8/9 步 —— 该函数由 ffx12::dispatch 在**每个 FSR2 派发点**上调用
-//      （实机约每帧一次，与 NgxBackend 的 g_ngx_frame_count 同频），属于
-//      AGENTS.md §二.5 点名的"每帧/每 draw 路径"。
-//    · 附带 8 次 AddRef/Release 的原子引用计数操作，同样是每帧固定开销。
-//    ★ 诚实标注：本条的 ③ 是 **E0（读 API 语义与代码结构推断）**，
-//      **没有**做过「关/开还原」的帧数 A/B 实测（AGENTS.md §二.5 明确要求先验证探针
-//      本身无扰动再谈收益，本轮不具备该条件）。因此本决策的依据是 ①（可数的事实：
-//      8 Get* + 8 Release vs 0）与 ②（Release 构建没有影子状态可用），不是性能实测。
-//
-// ④ 置空方向为什么是**安全侧**：绑定 null 是「什么都不绑」，游戏在下一次自己的 CS 派发前
-//    会重新绑定它需要的全部槽位（D3D11 立即上下文没有状态继承）。而"还原成猜的资源"
-//    一旦猜错，就是**把别人的纹理绑进游戏的 CS**，形态是静默画面错误而非缺图。
-//
-// ④-b **还原在 API 层面就是不完整的**（这条是决定性的，已核 Windows SDK）：
-//    `CSGetUnorderedAccessViews` 的签名是
-//      void CSGetUnorderedAccessViews(UINT StartSlot, UINT NumUAVs,
-//                                     ID3D11UnorderedAccessView **ppUnorderedAccessViews);
-//    ——**没有 pUAVInitialCounts 输出参数**（d3d11.h:8523-8529，10.0.26100.0）。
-//    而绑定侧 `CSSetUnorderedAccessViews(..., const UINT *pUAVInitialCounts)` 是有的。
-//    ⇒ 一旦走「保存/还原」，游戏原本设的 UAV 初始计数会被**静默丢弃**（还原时只能传 nullptr
-//    或 -1 语义），而这正是 append/consume 型 UAV 的语义来源。
-//    也就是说：**"还原原值"做不到真的还原原值**，只能还原一半 —— 比置空更难解释的形态。
-//
-// ⑤ 已知风险（如实记录，未验证）：多组件共存时，若 OptiScaler / ReShade 依赖
-//    "桥退出后 CS 槽位仍是它们绑的那一份"，本实现会把它们看到的槽位清成 null。
-//    当前无证据表明存在这种依赖（三组件共存场景下未做过对照实测）；
-//    若现场出现"开桥后 ReShade 的某个 CS 后处理失效"，本条是**首要排查点**。
-// ============================================================================
-
-// §3.6.1 深度提取 CS（1 SRV / 1 CB / 1 UAV）
-static void dispatch_depth_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
-{
-    // ---- 绑定 ----
-    ctx->CSSetShader(g_depth_cs.Get(), nullptr, 0);      // ★ CS 为全局对象（§3.5），不在 inst 上
-    ID3D11ShaderResourceView *srvs[1] = { inst.depth_src_srv.Get() };
-    ctx->CSSetShaderResources(0, 1, srvs);
-    ID3D11Buffer *cbs[1] = { inst.cb.Get() };
-    ctx->CSSetConstantBuffers(0, 1, cbs);
-    ID3D11UnorderedAccessView *uavs[1] = { inst.depth_uav.Get() };
-    ctx->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
-
-    // ---- 派发 ----
-    ctx->Dispatch((inst.rw + 7u) / 8u, (inst.rh + 7u) / 8u, 1u);
-
-    // ---- 解绑（成对）----
-    ID3D11UnorderedAccessView *null_uavs[1] = { nullptr };
-    ctx->CSSetUnorderedAccessViews(0, 1, null_uavs, nullptr);
-    ID3D11ShaderResourceView *null_srvs[1] = { nullptr };
-    ctx->CSSetShaderResources(0, 1, null_srvs);
-    ID3D11Buffer *null_cbs[1] = { nullptr };
-    ctx->CSSetConstantBuffers(0, 1, null_cbs);
-    ctx->CSSetShader(nullptr, nullptr, 0);
-}
-
-// §3.6.2 motion 解码 CS（1 SRV / 1 CB / 2 UAV）
-static void dispatch_motion_cs(ID3D11DeviceContext *ctx, NgxInstance &inst)
-{
-    ctx->CSSetShader(g_motion_cs.Get(), nullptr, 0);
-    ID3D11ShaderResourceView *msrvs[1] = { inst.motion_src_srv.Get() };
-    ctx->CSSetShaderResources(0, 1, msrvs);
-    ID3D11Buffer *mcbs[1] = { inst.cb.Get() };
-    ctx->CSSetConstantBuffers(0, 1, mcbs);
-    // ★ 槽序不可换：u0 = 解码 motion（R16G16），u1 = reactive（R8，motion B 通道）
-    ID3D11UnorderedAccessView *muavs[2] = { inst.motion_uav.Get(), inst.reactive_uav.Get() };
-    ctx->CSSetUnorderedAccessViews(0, 2, muavs, nullptr);
-
-    ctx->Dispatch((inst.rw + 7u) / 8u, (inst.rh + 7u) / 8u, 1u);
-
-    ID3D11UnorderedAccessView *null_uavs2[2] = { nullptr, nullptr };
-    ctx->CSSetUnorderedAccessViews(0, 2, null_uavs2, nullptr);
-    // ★ 必须重新声明自己的解绑数组：上一段的 null_srvs / null_cbs 已出作用域
-    ID3D11ShaderResourceView *mn_srvs[1] = { nullptr };
-    ctx->CSSetShaderResources(0, 1, mn_srvs);
-    ID3D11Buffer *mn_cbs[1] = { nullptr };
-    ctx->CSSetConstantBuffers(0, 1, mn_cbs);
-    ctx->CSSetShader(nullptr, nullptr, 0);
-}
-
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
 // ============================================================================
 // §4.2 第 18/19/20 行的诊断抽检（**只在诊断构建里编译**；发布构建一个符号都不进产物）
@@ -3671,13 +2748,13 @@ static void diag_check_create_params(const NgxInstance &inst)
     unsigned int w = 0, h = 0, ow = 0, oh = 0;
     int pq = -1;
     if (g_params->Get(NVSDK_NGX_Parameter_Width, &w) != NVSDK_NGX_Result_Success ||
-        w != inst.rw)            { mismatch("Width");  return; }
+        w != inst.pool.shape.render_width)            { mismatch("Width");  return; }
     if (g_params->Get(NVSDK_NGX_Parameter_Height, &h) != NVSDK_NGX_Result_Success ||
-        h != inst.rh)            { mismatch("Height"); return; }
+        h != inst.pool.shape.render_height)            { mismatch("Height"); return; }
     if (g_params->Get(NVSDK_NGX_Parameter_OutWidth, &ow) != NVSDK_NGX_Result_Success ||
-        ow != inst.dw)           { mismatch("OutWidth");  return; }
+        ow != inst.pool.shape.output_width)           { mismatch("OutWidth");  return; }
     if (g_params->Get(NVSDK_NGX_Parameter_OutHeight, &oh) != NVSDK_NGX_Result_Success ||
-        oh != inst.dh)           { mismatch("OutHeight"); return; }
+        oh != inst.pool.shape.output_height)           { mismatch("OutHeight"); return; }
     // PerfQualityValue 是 CreateFeature 时写进去的，值来自 resolve_create_quality
     // （NGX 区间查询 → 回退 quality_from_ratio → 再经 perf_quality_for_create 兜底）。
     // ★★ 期望值必须**同样走这条链**，否则误报 set_mismatch（OPEN-ISSUES §4「注意」第二条）。
@@ -3688,7 +2765,7 @@ static void diag_check_create_params(const NgxInstance &inst)
     //   会出现两条 pq= 行，验收时无法判断哪条对应 CreateFeature。区间查询本身有缓存 ⇒ 这里
     //   不走查询、只取缓存。
     if (g_params->Get(NVSDK_NGX_Parameter_PerfQualityValue, &pq) != NVSDK_NGX_Result_Success ||
-        pq != resolve_create_quality(inst.rw, inst.rh, inst.dw, inst.dh, false))
+        pq != resolve_create_quality(inst.pool.shape.render_width, inst.pool.shape.render_height, inst.pool.shape.output_width, inst.pool.shape.output_height, false))
     {
         mismatch("PerfQualityValue");
         return;
@@ -3718,75 +2795,23 @@ static bool g_diag_first_eval_done = false;
 // ★ 不调 NVSDK_NGX_D3D11_Shutdown（§6-13 明确不做）；不调 DestroyParameters（§3.9.5：
 //   g_params 由 NGX 内部分配，v1 不释放，由进程回收）。
 // ============================================================================
-void shutdown_all()
+bool shutdown_all()
 {
-    // ---- 1. 释放 feature（裸 handle，ComPtr 管不到，必须手工 Release）----
-    // ★ 先判 g_release 非空：ensure_init 未跑过时它还是 nullptr。
-    if (g_release && g_inst.feature)
-        g_release(g_inst.feature);
-    g_inst.feature = nullptr;
-
-    // ---- 2. 清全部实例资源 + 两个随对象消失的锁存 ----
-    // ★ 资源清理只有一个实现点（release_pool_resources），不要在这里再手写一遍 Reset。
-    release_pool_resources(g_inst);
-    g_inst.key_valid = false;
-    // 对象销毁 ⇒ 锁存随对象消失（这不是"清锁重试"，§3.9.7 / S-81 只禁止尺寸变化时清它）
-    g_inst.feature_create_failed = false;
-    // 2026-11-13（§5）：与 destroy_instance() 同步清失败 key（两处都是"对象没了"的语义）。
-    g_inst.feature_fail_key       = CreateFeatureInputKey {};
-    g_inst.feature_fail_key_valid = false;
-    g_inst.feature_fail_rc        = 0;
-    g_inst.feature_fail_tick      = 0;
-    // T-8 M4-a：同上 —— 第 1 步已经把 feature 释放掉了，那份 CreateFlags 输入快照不再描述任何
-    // 活对象。★ 必须与 destroy_instance() 同步清（两处都是"对象没了"的语义）；
-    // 漏了它，换设备后第一次 dispatch 会拿旧快照比对，可能白重建一次刚建好的池。
-    g_inst.feature_flags_bits  = 0;
-    g_inst.feature_flags_valid = false;
-
-    // ---- 3. 清 shader 对象（设备级）----
-    // ★★ g_shader_compile_failed **必须保留**：D3DCompile 的输入（HLSL 字符串 + 编译器 +
-    //    宏表）是进程级常量，同一份输入重编必然同样失败（§3.5.4 / D9 触发条件 4）。
-    //    清了它 = 每帧重跑一次毫秒级的 D3DCompile ⇒ 卡顿，且无任何收益。
-    //    而 g_shader_object_failed 是**设备级**的（CreateComputeShader 失败），
-    //    新设备上值得重试一次 ⇒ 清。
+    if (!retire_feature(g_inst)) return false;
+    g_inst.clear_pool();
     g_depth_cs.Reset();
     g_motion_cs.Reset();
     g_shaders_ready = false;
     g_shader_object_failed = false;
 
-    // ---- 4. 清设备与参数 ----
-    // ★ 不调 DestroyParameters：g_params 是 NGX 内部分配的，v1 不释放（§3.9.5）。
-    //
-    // 2026-11-13（OPEN-ISSUES §4）：独立查询对象**要释放**，且必须在这里（设备级关停）释放。
-    //   为什么这里释放、而 g_params 不释放：两者来源相同（都是 GetCapabilityParameters），
-    //   但 g_params 的"不释放"是既有契约（§3.9.5，本次不改它）；查询对象是本次改动
-    //   **新多要来的一份**，按 SDK 文档（nvsdk_ngx.h:398-401）应由调用方 DestroyParameters。
-    //   漏了它就是每次设备重建泄漏一个参数表。
-    // ★★ 顺序：先释放查询对象、再清 g_query_params/g_params —— release_query_params 内部
-    //   只读自己的指针，不读 g_params，所以先清哪个都不影响；但必须在**同一段**里，
-    //   否则下一次 ensure_init 重建 g_params 后，缓存里还留着上一个设备的区间。
-    // ★ 区间缓存必须一起清：换设备 = 换驱动/换 DLSS 运行时，旧区间不再可信。
-    // ⚠️ 残余风险（诚实标注，未实机验证）：这里调 DestroyParameters 与 §3.9.5「v1 不释放
-    //   g_params、交给进程回收」的既有纪律**不一致** —— 理由是「这份是我们多要的、按 SDK
-    //   文档该由调用方释放」，但**没有实测过**外部 provider（OptiScaler）的
-    //   NVSDK_NGX_D3D11_DestroyParameters 在设备刚丢失的时刻是否安全。
-    //   若实机在 dev_removed 之后出现崩溃，第一嫌疑就是这一行：届时把它删掉即可
-    //   （代价只是每次设备重建泄漏一个参数表，设备重建在本项目里是低频事件）。
+    // 查询表由桥持有；主表和外部 provider 的全局设备仍按原契约管理。
+    // 不调用 Shutdown1 关闭 F6 可能与其他消费者共享的 provider。
     release_query_params();
-    g_pq_range_cache = OptimalRangeCache {};
+    g_pq_range_cache = {};
     g_device.Reset();
     g_params = nullptr;
-    // ★★ 陷阱 3（T-5 任务书）：**漏清 g_inited ⇒ 下次 dispatch 以为已初始化、直接拿空表 ⇒ 崩溃**。
-    //    与 g_device / g_params / 实例表必须一起清，一个都不能少。
-    g_inited    = false;
-    g_available = false;
-
-    // ---- 以下**故意不清**（每一条都有明文依据，改任何一条都是设计变更）----
-    //   g_release_all          —— 0→1 不可逆的全局放手信号（§4.3「转换：只能 0→1，不可逆」）
-    //   g_logged_config        —— 配置快照只打一次（§3.10.2）
-    //   g_init_retry_after_us  —— 失败退避窗口（§3.4.1）；shutdown_all 不是"初始化失败"，
-    //                             清它会让 init 失败后的 5 秒退避在换设备时被绕过。
-    //   十个函数指针           —— 指向已加载 DLL 的导出，DLL 从不卸载（§6-13）
+    g_inited = g_available = false;
+    return true;
 }
 
 } // namespace
@@ -3905,14 +2930,15 @@ void set_passthrough(bool on)
 // 与 NgxHdr 越界（不记位）刻意不同：Hdr 的 auto 本来就是它的默认语义，provider 的不是。
 void set_provider_mode(int mode)
 {
-    if (mode == kProviderNvidia || mode == kProviderExternal)
+    switch (mode)
     {
-        g_provider_mode = mode;
+    case 1: g_provider_mode = ProviderMode::nvidia; return;
+    case 2: g_provider_mode = ProviderMode::external; return;
+    default:
+        g_provider_mode = ProviderMode::automatic;
+        if (mode != 0) g_config_warn |= kWarnProviderInvalid;
         return;
     }
-    g_provider_mode = kProviderAuto;
-    if (mode != kProviderAuto)
-        g_config_warn |= kWarnProviderInvalid;
 }
 
 // NgxCrossKeyReuse（默认 true）。只存值，非法值不在此处纠正（int -> bool 已在读取点折叠）。
@@ -3957,7 +2983,7 @@ bool cross_key_reuse()
 //   ② 第 7-9 步（写资源**内容**）必须早于第 10 步（把资源**绑定**进参数袋）——
 //      顺序颠倒的形态是「静止正常、一动就糊」，零错误码（§3.7.1 约束 2 / 陷阱 1）。
 //   ③ 所有 return 路径都必须成对 Release dev（第 2b 步的 early return 尤其容易漏）。
-bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
+ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
               std::uint64_t instance_key)
 {
     // ---- 第 0 步（§3.7）：passthrough 时不建池、不编 CS、不 CopyResource，成本必须是 0 ----
@@ -3985,171 +3011,34 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         const std::uint64_t pt_count = ++g_ngx_passthrough_count;
         if (g_log_level < 3 || pt_count <= 8u || (pt_count % 256u) == 0u)
             log_ngx_core(blog::Level::Error, L"ngx_core passthrough=1 backend=ngx");
-        return false;
+        return ffx12::DispatchResult::failed;
     }
 
     // ---- 第 1 步：取设备（GetDevice 返回 void，失败时仍是 nullptr）----
-    if (ctx == nullptr)
-        return false;   // 防御：调用方保证非空；不改变正常路径行为
+    if (!ctx || !in.color || !in.output_target || !in.depth || !in.motion ||
+        ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        return ffx12::DispatchResult::failed;
 
-    // ★ 输入判空与尺寸判零前移到此处（而非第 4 步）：第 4 步一进来就 in.color->GetDesc()，
-    //   空指针解引用在注入型 DLL 里是**游戏进程崩溃**，不是 fail-open。
-    //   T-6 的分流点还会再判一遍（§3.3.2 复刻 native 的两道判空），这里判是自保，不是重复。
-    //   B-1：四个尺寸任一为 0 ⇒ CopyResource / CreateTexture2D 都不接受。
-    if (in.color == nullptr || in.output_target == nullptr)
-        return false;
-    if (in.render_w == 0 || in.render_h == 0 || in.display_w == 0 || in.display_h == 0)
-        return false;
-
-    ID3D11Device *dev = nullptr;
-    ctx->GetDevice(&dev);
-    if (dev == nullptr)
-        return false;
-
-    // 帧计数（§3.10.1 三条逐帧日志的闸门输入）。放在第 1 步之后：passthrough / 判空失败的
-    // 调用不构成"一帧"，不能挤占前 8 帧的全量日志额度。
-    const std::uint64_t frame_count = ++g_ngx_frame_count;
-
-    // ---- 第 2 步：设备变化 ⇒ 整体关停（多设备 / 设备重建，§3.9.7 / D14.0-b2）----
-    // ★ 必须在 ensure_init **之前**：设备换了，旧 NGX 绑定的是旧设备，不清就是 UB。
-    //   g_device / g_params / 实例表 / g_inited 必须一起清（shutdown_all 的契约）。
-    if (dev != g_device.Get())
-        shutdown_all();
-
-    // ---- 第 2b 步：全局放手 ⇒ 本帧什么都不做（S-84 / 计划 D14.4 第 1b 步）----
-    // ★★ 必须成对 Release：此时抢在第 3 步之前返回，漏了就**每帧泄漏一个 device 引用计数**。
-    // ★ 位置：第 2 步之后（设备更换仍需先清理）、ensure_init 与建实例之前（成本为 0）。
-    if (should_release_all())
-    {
-        dev->Release();
-        return false;
-    }
-
-    // ---- 第 3 步：ensure_init（幂等；首次成功才 AddRef）----
-    // ★ 只在**失败**路径 Release。成功路径的 Release 在第 4 步末尾（见 ①）。
-    if (!ensure_init(dev))
-    {
-        dev->Release();
-        return false;
-    }
-
-    // ---- 第 4 步：单实例取/建（形参显式传入，§3.12.2 骨架）----
-    // 先读出实际格式：create_pool 要用，且必须先于 ensure_instance（它是形参）。
     D3D11_TEXTURE2D_DESC cdesc {}, odesc {};
     in.color->GetDesc(&cdesc);
     in.output_target->GetDesc(&odesc);
-    const bool inst_ok = ensure_instance(instance_key, dev, in.render_w, in.render_h,
-                                         in.display_w, in.display_h,
-                                         cdesc.Format, odesc.Format);
-    // ★★ 成对释放：dev 已用完，且必须在所有使用点之后、所有 return 之前。
-    //    成功路径**只有这一处** Release —— 第 3 步不再释放（见 ①）。
-    dev->Release();
-    if (!inst_ok)
-        return false;
-    NgxInstance &inst = g_inst;   // 全局唯一实例：无 map、无 LRU、无驱逐（v8 / S-90）
+    const auto shape = neo::ngx::copy_shape(in, cdesc, odesc);
+    if (!shape) return ffx12::DispatchResult::failed;
 
-    // ---- 第 5 步：尺寸/格式六元组变化 **或 CreateFlags 输入变化** ⇒ 重建资源池 + feature（§3.12.3）----
-    // ★★ T-8 M4-a（T-8 审核 MAJOR）：判据里**必须**含 CreateFlags 的可变输入（见 flags_input_bits）。
-    //   缺陷原状：Create_Flags 只在 create_feature 时写进 g_params，EvaluateFeature 不重算；
-    //   而重建判据只有尺寸/格式六元组 ⇒ 若 SetColorSpace1 钩子在首个 CreateFeature 之后才被调用，
-    //   IsHDR 就**永久**是错的（直到尺寸/格式变化或换设备），且日志看不出来。
-    //
-    // ★ 为什么"值变化才重建"是安全的（不会每帧重建）：
-    //   feature_flags_bits 只在 create_feature 成功后写入，判据是"当前位图 != 已记录的位图"。
-    //   位图不变 ⇒ 条件恒假 ⇒ 零开销一次整数比较；位图变了 ⇒ 只重建**一次**，
-    //   重建后记录被更新成当前值，下一帧条件又变假。
-    //
-    // ★ 与 S-81 的取舍（明确写出，因为这是本步最容易踩雷的地方）：
-    //   S-81 的契约是"尺寸/格式变化**不清 feature_create_failed、不重试**"。本条**不破坏**它：
-    //     ① 本 if 块里**没有**任何对 feature_create_failed 的写；
-    //     ② CreateFlags 输入变化属于**新的输入变化**（HDR 状态本来就会在运行期改变，
-    //        例如玩家切 HDR / 游戏调 SetColorSpace1），与"同一份输入重试"不是同一件事；
-    //     ③ 且 flags_changed 自身就带 !feature_create_failed 门（见下方三前提），
-    //        锁存为真时 HDR 变化**不会**触发重建；尺寸/格式变化照旧走本 if 的其余项。
-    //   ⇒ HDR/DepthInverted 变化会且只会触发**一次**资源池 + feature 重建，不会形成重试风暴。
-    //
-    // ★ 一条已知的边界（记录，不在本轮修）：本 if 块同时承担"重建资源池"。
-    //   若 HDR 在**同一尺寸**下反复翻转，会连带重建 5 张纹理（约几十 MB 的分配）。
-    //   实际上 HDR 由注册表在启动时决定、运行期极少切换（见 hooked_set_color_space1 的注释），
-    //   因此按"简单优先"处理；若将来出现运行期频繁切换，应把池重建与 feature 重建拆成两个判据。
-    // ★★ 三条硬纪律（照 SDS §3.7 第 5 步 v17 修订版）：
-    //   ① **禁止**自己写 ComPtr::Reset()：create_pool 自持「先清后建」契约，从任意已建池
-    //      状态重入都安全。在这里再清一遍会让资源清理出现两个维护点，下次加字段必漏改一处。
-    //   ② 建池失败要 inst.key_valid = false 回滚 —— 六元组已被本步写回，下一帧判据相等
-    //      ⇒ 本步不会再进，池保持空 ⇒ 必须让下一帧经 ensure_instance 重建。
-    //   ③ **不写** inst.feature_create_failed = false（S-81：尺寸/格式变化不清锁、不重试）。
-    // ★ flags_changed：三个前提缺一不可。
-    //   ① !inst.feature_create_failed —— S-81 的锁存优先：已经判定"这份输入的 feature 建不起来"
-    //      就不再重建（否则 0xBAD0000B 会每帧重建一次池 + 每帧阻塞，正是 S-81 要防的）。
-    //   ② inst.feature_flags_valid —— 还没建过 feature 时没有可比对的基准；
-    //      若在这里恒为 true，则首帧就进重建分支，白建一次池。
-    //   ③ 位图不等 —— 值没变 ⇒ 一次整数比较就短路，零开销、不重建。
-    //   ★ 用 flags_input_bits()（纯计算、不打日志）而不是 build_create_flags()：
-    //     后者会打一条 Error 级日志，放在这里就是每帧一条（日志洪水 + 每帧格式化开销）。
-    const bool flags_changed = !inst.feature_create_failed &&
-                               inst.feature_flags_valid &&
-                               (flags_input_bits(cdesc.Format) != inst.feature_flags_bits);
-    if (in.render_w != inst.rw || in.render_h != inst.rh ||
-        in.display_w != inst.dw || in.display_h != inst.dh ||
-        cdesc.Format != inst.color_fmt || odesc.Format != inst.output_fmt ||
-        flags_changed)
-    {
-        if (g_release && inst.feature)
-            g_release(inst.feature);
-        inst.feature = nullptr;
+    ComPtr<ID3D11Device> dev;
+    ctx->GetDevice(dev.GetAddressOf());
+    if (!dev) return ffx12::DispatchResult::failed;
+    const std::uint64_t frame_count = ++g_ngx_frame_count;
+    if (g_device && dev.Get() != g_device.Get() && !shutdown_all()) return ffx12::DispatchResult::failed;
+    if (should_release_all() || !ensure_init(dev.Get()) || !ensure_instance(instance_key, *dev.Get(), *shape))
+        return ffx12::DispatchResult::failed;
 
-        // ★ 建池之前必须先把新尺寸与新格式写回 inst：create_pool 直接读 inst.color_fmt /
-        //   inst.output_fmt，漏写会拿 DXGI_FORMAT_UNKNOWN 去 CreateTexture2D ⇒
-        //   E_INVALIDARG ⇒ 每次建池都失败、NGX 永远不出图，而日志只有一行 pool tex fail。
-        inst.rw = in.render_w;  inst.rh = in.render_h;
-        inst.dw = in.display_w; inst.dh = in.display_h;
-        inst.color_fmt  = cdesc.Format;    // 游戏实际格式（本机实测 R10G10B10A2_TYPELESS = 23）
-        inst.output_fmt = odesc.Format;
+    auto &inst = g_inst;
+    if (!inst.pool.bind_guides(*dev.Get(), in)) return ffx12::DispatchResult::failed;
+    if (inst.feature && flags_input_bits(cdesc.Format) != inst.feature_flags_bits && !retire_feature(inst))
+        return ffx12::DispatchResult::failed;
 
-        if (!create_pool(g_device.Get(), inst, inst.rw, inst.rh, inst.dw, inst.dh, instance_key))
-        {
-            inst.key_valid = false;        // 见 ②：让下一帧经 ensure_instance 重建
-            return false;                  // 建池失败：本帧放弃（create_pool 已自行清干净）
-        }
-        ++inst.pool_rebuilds;              // §3.12.2：本字段的唯一写入点
-        inst.first = true;                 // 尺寸变化 ⇒ 历史失效 ⇒ 下一帧 Reset
-    }
-
-    // ---- 第 5 步之后：feature 的建与不建 ----
-    // 永久不重试（§3.9.7 / S-81）：CreateFeature 失败的根因（PathListInfo 配错）不会自愈，
-    // 相同输入重试只会每帧阻塞 + 每帧重复日志。锁存只在对象销毁时随对象消失。
-    //
-    // ⚠️ 2026-11-13（§5）起不再"永久"：**输入 key 变化允许重试一次**。S-81 的原始理由
-    //   仍然成立，所以放宽被限制成三重窄门（任何一条不满足都回到"不重试"）：
-    //     ① 失败必须是**白名单 rc**（0xBAD00010）—— 由 create_feature 决定是否记录 key，
-    //        并在此用 feature_fail_key_valid 体现；其余 rc 早已置 g_release_all、
-    //        在更早的 gate 就返回了，根本到不了这里；
-    //     ② 当前 key 必须与失败时记录的 key **不同**（逐字段整数比较，10 个字段，见
-    //        same_feature_input_key）；相同 ⇒ 原样 return false，行为与改前一致；
-    //     ③ 距离上次失败必须 >= kFeatureCreateRetryMinMs。
-    //   ★★ 2026-11-13（独立审查第 4 条）：③ 的**理由已订正**（原文方向写反，保留在下方）。
-    //     已推翻的旧说法：「②保证输入变了才重试，但输入可以每帧都变（例如尺寸在
-    //       1920x1080 / 1919x1080 间抖动、或 HDR 探测反复翻转）」—— **不成立**：
-    //       构成 key 的 10 个字段全是低频、事件驱动的量（尺寸随玩家改设置、格式随后缓冲
-    //       切换、flags/HDR 由 ini 与 swapchain 探测决定），没有一个随帧变化。
-    //       "尺寸逐帧抖动"在本 key 上压根不会发生 ⇒ 无间隔保护也不会退化成每帧重试。
-    //     真实理由：**DLSS CreateFeature 在失败时会阻塞**（:1891 附近"每帧阻塞"的记录，
-    //       也正是 S-81 当初定"永久不重试"的直接动因）。参数性失败虽可自愈，但自愈之前
-    //       每一次尝试都要付这笔阻塞代价 ⇒ 需要给"连续失败"一个频率上限。
-    //       ③ 的职责就是那个上限：最坏情况下每 2 秒最多阻塞一次。
-    //     ★ 2000 是**保守猜测值，未实机标定**（诚实标注）：它只保证自愈不会被拖慢到
-    //       玩家可感知（用户改设置的间隔必然 >> 2 秒，见事故日志 00:18:02 -> 00:18:30），
-    //       以及"最坏阻塞频率 <= 1 次/2 秒"。实机若测得阻塞很轻可下调、很重应上调；
-    //       两种调整都不影响"用户改回安全精度后能自愈"这一验收判据。
-    //     ★ 是否保留 2000 的结论：**保留** —— 只要失败会阻塞，就需要频率上限，
-    //       而这正是本常量唯一的职责（与"输入会不会抖动"无关）。
-    //
-    // ★ 热路径开销（AGENTS.md §二.5）：这些比较**只在 feature_create_failed 为真时**才做
-    //   ——此时本次 dispatch 本来就要 return false，计算成本被吞掉；成功路径上是**一次
-    //   bool 判断**，与改前完全相同（改前那一行也是 if (inst.feature_create_failed)）。
-    // ★ 重试簿记：只在下面的 feature_create_failed 分支里置 is_retry=true。
-    //   放在 if 之外是因为"重试结果"要在**建完之后**才打（成功行与失败行共用 prev_rc）。
-    bool         is_retry     = false;
+    bool is_retry = false;
     unsigned int retry_prev_rc = 0;
     if (inst.feature_create_failed)
     {
@@ -4170,7 +3059,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         const bool interval_ok = inst.feature_fail_key_valid &&
                                  (GetTickCount64() - inst.feature_fail_tick) >= kFeatureCreateRetryMinMs;
         if (!key_changed || !interval_ok)
-            return false;
+            return ffx12::DispatchResult::failed;
         // ---- 到这里：白名单 rc 失败 + 输入 key 变化 + 间隔足够 ⇒ 清锁重试一次 ----
         // ★ 为什么三个字段要一起清：任何一项残留都会让下一帧重新进入本分支
         //   （key_valid 残留 ⇒ key_changed 恒假 ⇒ 永远不重试；tick 残留 ⇒ 间隔判据错）。
@@ -4184,11 +3073,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
                       inst.feature_fail_rc);
         is_retry      = true;
         retry_prev_rc = inst.feature_fail_rc;
-        inst.feature_create_failed = false;
-        inst.feature_fail_key_valid = false;
-        inst.feature_fail_key       = CreateFeatureInputKey {};
-        inst.feature_fail_rc        = 0;
-        inst.feature_fail_tick      = 0;
+        inst.clear_create_failure();
         // ★ 清锁后**不 return**：直接落进下面的 if (!inst.feature) 建 feature，
         //   复用同一条创建路径（含诊断回读）。重试成功后必须继续走第 6-11 步，
         //   在这里 return 会让本帧白丢一次派发 —— 那是把修复写成"自愈了但仍不出图"。
@@ -4216,12 +3101,12 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
                               retry_prev_rc, new_rc,
                               (rc_known && new_rc == retry_prev_rc) ? 1 : 0, rc_known ? 1 : 0);
             }
-            return false;                  // 内部已置位 feature_create_failed 与 g_release_all
+            return ffx12::DispatchResult::failed;                  // 内部已置位 feature_create_failed 与 g_release_all
         }
         if (is_retry)
         {
             log_ngx_error(L"ngx_core create_feature key_retry_result ok=1 prev_rc=0x%X rw=%u rh=%u dw=%u dh=%u",
-                          retry_prev_rc, inst.rw, inst.rh, inst.dw, inst.dh);
+                          retry_prev_rc, inst.pool.shape.render_width, inst.pool.shape.render_height, inst.pool.shape.output_width, inst.pool.shape.output_height);
         }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         // §4.2 第 19 行：Set() 返回 void，只能 Get 回读抽检。不等 ⇒ set_mismatch + 置位。
@@ -4244,34 +3129,11 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
                           L"shader_failure",
                           static_cast<unsigned long long>(instance_key),
                           static_cast<int>(inst.eval_fail_streak));
-        return false;
+        return ffx12::DispatchResult::failed;
     }
 
-    // ---- 第 7 步：color 用游戏原格式 TYPELESS 原样拷（§4.2 第 17 行）----
-    // ★ CopyResource 返回 void，**无法检测失败**；正确性靠建池时的同 desc 构造性约束。
-    // ★ 必须在第 8/9 步之前：两个 CS 的 t0 是**游戏的** in.depth / in.motion，
-    //   但它们的 t1/颜色通道读的是 inst.color —— 见 §3.7.1 约束 1 的澄清。
-    ctx->CopyResource(inst.color.Get(), in.color);
-
-    // ---- 第 8 步：深度提取 CS（§3.6.1）----
-    if (!ensure_depth_src_srv(in, inst))
-        return false;
-    upload_cb(ctx, inst, 1.0f, 1.0f);      // ★ depth_scale / flip 恒 1.0（§3.6.5），两段 CS 共用一个 cb
-    dispatch_depth_cs(ctx, inst);
-
-    // ---- 第 9 步：motion 解码 CS（§3.6.2）----
-    if (!ensure_motion_src_srv(in, inst))
-        return false;
-    dispatch_motion_cs(ctx, inst);
-
-    // ---- 第 10 步：写 §3.9.1 的十四行逐帧参数（协议 A：**不重写创建期七项**，§3.9.1a）----
-    // ★★ 顺序硬约束（§3.7.1 约束 2）：本步绑的是 inst.* 的**资源**，第 7-9 步写入的是这些
-    //    资源的**内容**。颠倒不报错，但 NGX 读到上一帧/未初始化内容 ⇒「静止正常、一动就糊」。
-    // ★★ 第 1-4 项一律走 set_tex（§3.9.6）：Set() 没有 SRV/UAV 重载，传视图会隐式转
-    //    void* ⇒ 编译通过、无警告、运行时静默错误。
-    // ★ 第 14 项 ExposureTexture **明确不设**（桥从不提供曝光纹理，F-21）。
-    if (g_params == nullptr)
-        return false;   // 防御：ensure_init 成功即非空，但不拿空指针去解引用（同陷阱 2 的纪律）
+    // 两个 guide 已绑定同次 Draw 的纹理；pool 录制后，Evaluate 才读这些资源。
+    inst.pool.record_inputs(*ctx, in, g_depth_cs.Get(), g_motion_cs.Get());
 
     // A 阶段（2026-11-10）：判定搬进纯函数（零行为变更）。
     // ★ 重构前原文：const int reset_val = (in.reset || inst.first) ? 1 : 0;
@@ -4300,10 +3162,11 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     }
 
     // 1-4：四个纹理（资源本体，**不是视图**）
-    set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.color.Get());
-    set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.depth.Get());
-    set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.motion.Get());
-    set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.output.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.pool.color.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.pool.depth.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.pool.motion.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.pool.output.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_ExposureTexture, nullptr);
     // 5：jitter —— **像素单位，直接透传**（不乘 render_w、不加 0.5，D4）
     g_params->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, in.jitter_x);
     g_params->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, in.jitter_y);
@@ -4313,37 +3176,52 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     // 7：Reset —— in.reset 或本实例首帧（F-32）。int 重载。
     g_params->Set(NVSDK_NGX_Parameter_Reset, reset_val);
     // 8：Width / Height —— **每帧也要设**（不只 CreateFeature），取当前实例的重建尺寸
-    g_params->Set(NVSDK_NGX_Parameter_Width,  inst.rw);
-    g_params->Set(NVSDK_NGX_Parameter_Height, inst.rh);
+    g_params->Set(NVSDK_NGX_Parameter_Width,  inst.pool.shape.render_width);
+    g_params->Set(NVSDK_NGX_Parameter_Height, inst.pool.shape.render_height);
     // 9：Render.Subrect 维度 —— 无动态分辨率时等于全屏子矩形
-    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,  inst.rw);
-    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, inst.rh);
+    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,  inst.pool.shape.render_width);
+    g_params->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, inst.pool.shape.render_height);
     // 10：Exposure_Scale **恒 1.0f**；与第 11 项是两个不同参数，都要设
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Exposure_Scale, 1.0f);
-    // 11：Pre_Exposure = in.pre_exposure（当前恒 1.0）。**不设 Flags_AutoExposure**（D8）
+    // Pre_Exposure 是游戏颜色缩放，不是独立的曝光纹理，也不替代 Create 的 AutoExposure。
     g_params->Set(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, in.pre_exposure);
     // 12：FrameTimeDeltaInMsec —— **仅当 NgxSetFrameTimeDelta=1**。桥侧已 clamp [1,100]，
     //     此处**不重复 clamp**（B-4：过滤会掩盖上游 bug）。
     if (g_dt_enabled)
         g_params->Set(NVSDK_NGX_Parameter_FrameTimeDeltaInMsec, in.frame_time_delta_ms);
     // 13：reactive mask —— **仅当 NgxUseReactiveMask=1**，且必须先过尺寸守卫（§3.9.2）。
-    //     守卫恒真（inst.reactive 就是按 inst.rw x inst.rh 建的），保留它是为了与 FFX 侧口径一致。
+    //     守卫恒真（inst.pool.reactive 就是按 inst.pool.shape.render_width x inst.pool.shape.render_height 建的），保留它是为了与 FFX 侧口径一致。
     // A 阶段（2026-11-10）：尺寸比较搬进纯函数；g_use_reactive 这一位留在原地
     // （它是配置开关，不是尺寸计算）。
-    // ★ 重构前原文：if (g_use_reactive && inst.rw >= in.render_w && inst.rh >= in.render_h)
+    // ★ 重构前原文：if (g_use_reactive && inst.pool.shape.render_width >= in.render_w && inst.pool.shape.render_height >= in.render_h)
     //   短路顺序保持：先看配置开关，再算尺寸比较。
-    if (g_use_reactive && ngx_param_map::reactive_size_ok(inst.rw, inst.rh, in.render_w, in.render_h))
-        set_tex(g_params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask, inst.reactive.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask,
+        g_use_reactive && ngx_param_map::reactive_size_ok(shape->render_width, shape->render_height,
+            in.render_w, in.render_h) ? inst.pool.reactive.Get() : nullptr);
 
-    // ---- 第 11 步：EvaluateFeature（含 eval_us 计时，§3.10.1）----
-    // ★★ 陷阱 2：g_eval 是**函数指针**，nullptr 时直接调用 = 空指针崩溃
-    //    （注入型 DLL 里是整个游戏进程崩，不是 fail-open）。
-    if (g_eval == nullptr)
-        return false;
-
-    const std::uint64_t eval_t0 = qpc_us();
-    const NVSDK_NGX_Result rr = g_eval(ctx, inst.feature, g_params, nullptr);
-    const std::uint64_t eval_us = qpc_us() - eval_t0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    const bool sampled = log_gate_win8_every1024(frame_count);
+    const std::uint64_t eval_t0 = sampled ? qpc_us() : 0;
+#endif
+    using neo::ngx::F6OutputStatus;
+    F6OutputStatus f6_output = F6OutputStatus::unproven;
+    NVSDK_NGX_Result rr;
+    if (g_provider.evaluate_f6)
+    {
+        const auto request = ++g_f6_request;
+        neo::ngx::F6EvalReceiptV1 receipt {};
+        rr = g_provider.evaluate_f6(ctx, inst.feature.get(), g_params, nullptr, request, &receipt);
+        f6_output = neo::ngx::f6_output_status(receipt, request, inst.feature.get(), ctx, inst.pool.output.Get());
+    }
+    else
+    {
+        rr = g_provider.evaluate(ctx, inst.feature.get(), g_params, nullptr);
+    }
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    if (sampled)
+        log_ngx_core(blog::Level::Debug, L"ngx_timing frame=%llu eval_us=%.1f rc=0x%X",
+            static_cast<unsigned long long>(frame_count), static_cast<double>(qpc_us() - eval_t0), rr);
+#endif
 
     if (rr != NVSDK_NGX_Result_Success)
     {
@@ -4363,11 +3241,10 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         {
             log_ngx_core(blog::Level::Error,
                          L"ngx_core eval ok=%d rc=0x%X eval_fail_total=%llu "
-                         L"eval_fail_streak=%u eval_us=%.1f",
+                         L"eval_fail_streak=%u",
                          0, static_cast<unsigned>(rr),
                          static_cast<unsigned long long>(inst.eval_fail_total),
-                         static_cast<unsigned>(inst.eval_fail_streak),
-                         static_cast<double>(eval_us));
+                         static_cast<unsigned>(inst.eval_fail_streak));
         }
 
         if (device_removed)
@@ -4397,7 +3274,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
                           static_cast<unsigned>(drr),
                           static_cast<unsigned long long>(instance_key));
             shutdown_all();
-            return false;
+            return ffx12::DispatchResult::failed;
         }
 
         // 连续 3 次才放手（§4.2 第 11 行）：过滤偶发单帧抖动。
@@ -4410,23 +3287,31 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
                               static_cast<unsigned long long>(instance_key),
                               static_cast<int>(inst.eval_fail_streak));
         }
-        return false;
+        return ffx12::DispatchResult::failed;
     }
 
-    // ---- 成功：清零 streak、清 first、回写游戏 ----
-    inst.eval_fail_streak = 0;   // 成功后只清 streak，**不清 total**（§3.12.2 计数器表）
+    inst.eval_fail_streak = 0;
+    if (g_provider.evaluate_f6 && f6_output != F6OutputStatus::current_output_ordered)
+    {
+        // F6 的公共 Success 也可能只是 skip/recreate。不能用池中的旧内容填本帧，更不能消费 Reset。
+        inst.first = true;
+        if (log_gate_win8_every1024(frame_count))
+            log_ngx_core(blog::Level::Info, L"ngx_out not_delivered receipt=%s request=%llu",
+                f6_output == F6OutputStatus::no_output ? L"no_output" : L"unproven",
+                static_cast<unsigned long long>(g_f6_request));
+        return ffx12::DispatchResult::failed;
+    }
     inst.first = false;
 
-    const std::uint64_t copy_t0 = qpc_us();
-    ctx->CopyResource(in.output_target, inst.output.Get());
-    const std::uint64_t copy_us = qpc_us() - copy_t0;
+    // 此 copy 只保证立即上下文的顺序；不以 CPU 等待或日志代替 GPU 输出证明。
+    ctx->CopyResource(in.output_target, inst.pool.output.Get());
 
     // ngx_out 行（§3.10.1 输出侧；逐帧 = **debug**；失败才用 error）
     if (log_gate_win8_every1024(frame_count))
     {
-        log_ngx_core(blog::Level::Debug, L"ngx_out copy out=%dx%d fmt=%d copy_us=%.1f",
-                     static_cast<int>(inst.dw), static_cast<int>(inst.dh),
-                     static_cast<int>(odesc.Format), static_cast<double>(copy_us));
+        log_ngx_core(blog::Level::Debug, L"ngx_out copy out=%ux%u fmt=%d evidence=%s",
+                     shape->output_width, shape->output_height, static_cast<int>(odesc.Format),
+                     g_provider.evaluate_f6 ? L"f6_receipt_v1" : L"ngx_status_only");
     }
 
     // ngx_core eval 成功行（**info**；每 1024 帧一次）
@@ -4434,11 +3319,10 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     {
         log_ngx_core(blog::Level::Info,
                      L"ngx_core eval ok=%d rc=0x%X eval_fail_total=%llu "
-                     L"eval_fail_streak=%u eval_us=%.1f",
+                     L"eval_fail_streak=%u",
                      1, static_cast<unsigned>(rr),
                      static_cast<unsigned long long>(inst.eval_fail_total),
-                     static_cast<unsigned>(inst.eval_fail_streak),
-                     static_cast<double>(eval_us));
+                     static_cast<unsigned>(inst.eval_fail_streak));
     }
 
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -4448,8 +3332,8 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     if ((frame_count % 600u) == 0u)
     {
         bool tl_zero = false, br_zero = false;
-        const bool tl_ok = sample_1x1_zero(ctx, inst.output.Get(), 0, 0, tl_zero);
-        const bool br_ok = sample_1x1_zero(ctx, inst.output.Get(), inst.dw - 1u, inst.dh - 1u, br_zero);
+        const bool tl_ok = sample_1x1_zero(ctx, inst.pool.output.Get(), 0, 0, tl_zero);
+        const bool br_ok = sample_1x1_zero(ctx, inst.pool.output.Get(), inst.pool.shape.output_width - 1u, inst.pool.shape.output_height - 1u, br_zero);
         if (tl_ok && br_ok && tl_zero && br_zero)
         {
             // ★ 已知偏离：本行同样**不置 g_release_all**、且**可重复**
@@ -4459,7 +3343,7 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
             //   与画面异常同步出现 —— 再叠一层计数闸门只会让因果对齐变难。
             log_ngx_error(L"ngx_out copy fail suspect inst=0x%llX out=%ux%u fmt=%d frame=%llu",
                           static_cast<unsigned long long>(instance_key),
-                          inst.dw, inst.dh, static_cast<int>(odesc.Format),
+                          inst.pool.shape.output_width, inst.pool.shape.output_height, static_cast<int>(odesc.Format),
                           static_cast<unsigned long long>(frame_count));
         }
     }
@@ -4470,12 +3354,12 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
     if (!g_diag_first_eval_done)
     {
         g_diag_first_eval_done = true;   // 无论采样成败都只做一次，避免采样失败后每帧重试
-        const UINT cx = inst.dw / 2u, cy = inst.dh / 2u;
+        const UINT cx = inst.pool.shape.output_width / 2u, cy = inst.pool.shape.output_height / 2u;
         bool o1 = false, o2 = false, o3 = false;
         bool i1 = false, i2 = false, i3 = false;
-        const bool out_ok = sample_1x1_zero(ctx, inst.output.Get(), 0, 0, o1)
-                         && sample_1x1_zero(ctx, inst.output.Get(), cx, cy, o2)
-                         && sample_1x1_zero(ctx, inst.output.Get(), inst.dw - 1u, inst.dh - 1u, o3);
+        const bool out_ok = sample_1x1_zero(ctx, inst.pool.output.Get(), 0, 0, o1)
+                         && sample_1x1_zero(ctx, inst.pool.output.Get(), cx, cy, o2)
+                         && sample_1x1_zero(ctx, inst.pool.output.Get(), inst.pool.shape.output_width - 1u, inst.pool.shape.output_height - 1u, o3);
         const bool in_ok  = sample_1x1_zero(ctx, in.color, 0, 0, i1)
                          && sample_1x1_zero(ctx, in.color, in.render_w / 2u, in.render_h / 2u, i2)
                          && sample_1x1_zero(ctx, in.color, in.render_w - 1u, in.render_h - 1u, i3);
@@ -4483,13 +3367,13 @@ bool dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext *ctx,
         {
             log_ngx_error(L"ngx_out all_black inst=0x%llX out=%ux%u in=%ux%u",
                           static_cast<unsigned long long>(instance_key),
-                          inst.dw, inst.dh, in.render_w, in.render_h);
+                          inst.pool.shape.output_width, inst.pool.shape.output_height, in.render_w, in.render_h);
             g_release_all.store(true, std::memory_order_relaxed);
         }
     }
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS
 
-    return true;
+    return g_provider.evaluate_f6 ? ffx12::DispatchResult::f6_ordered : ffx12::DispatchResult::ngx_legacy_copy;
 }
 
 // ============================================================================

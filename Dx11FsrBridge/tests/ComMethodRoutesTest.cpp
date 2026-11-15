@@ -56,11 +56,13 @@ void expect(bool condition, const char *what)
 }
 
 void **racing_table = nullptr;
-void *bind_patch(void *replacement, void *original)
+template <std::uintptr_t Replacement>
+void *bind_patch(void *original)
 {
-    if (racing_table && replacement == reinterpret_cast<void *>(22))
-        racing_table[1] = reinterpret_cast<void *>(99);
-    return original ? replacement : nullptr;
+    if constexpr (Replacement == 22)
+        if (racing_table)
+            racing_table[1] = reinterpret_cast<void *>(99);
+    return original ? reinterpret_cast<void *>(Replacement) : nullptr;
 }
 
 void test_vtable_slots()
@@ -72,24 +74,24 @@ void test_vtable_slots()
     Context instance { table };
     DWORD old = 0;
     VirtualProtect(table, 4096, PAGE_READONLY, &old);
-    expect(com_vtable::patch(&instance, 69, {{0, reinterpret_cast<void *>(11)}}, bind_patch),
+    expect(com_vtable::patch(&instance, 69, {{0, &bind_patch<11>}}),
         "read-only shared vtable accepts a public method patch");
     expect(instance.table == table && table[69] == reinterpret_cast<void *>(70),
         "original vptr and runtime private dispatch remain intact");
-    expect(com_vtable::patch(&instance, 69, {{1, reinterpret_cast<void *>(22)}}, bind_patch) &&
+    expect(com_vtable::patch(&instance, 69, {{1, &bind_patch<22>}}) &&
         table[0] == reinterpret_cast<void *>(11) && table[1] == reinterpret_cast<void *>(22),
         "later patches merge rather than hitting a stale object cache");
     MEMORY_BASIC_INFORMATION info {};
     VirtualQuery(table, &info, sizeof(info));
     expect(info.Protect == PAGE_READONLY, "read-only page protection restored");
-    expect(!com_vtable::patch(&instance, 69, {{69, reinterpret_cast<void *>(71)}}, bind_patch) &&
+    expect(!com_vtable::patch(&instance, 69, {{69, &bind_patch<71>}}) &&
         table[69] == reinterpret_cast<void *>(70), "public bounds never patch a private slot");
     VirtualProtect(table, 4096, PAGE_READWRITE, &old);
     table[0] = reinterpret_cast<void *>(1);
     table[1] = reinterpret_cast<void *>(2);
     racing_table = table;
     expect(!com_vtable::patch(&instance, 2,
-        {{0, reinterpret_cast<void *>(11)}, {1, reinterpret_cast<void *>(22)}}, bind_patch),
+        {{0, &bind_patch<11>}, {1, &bind_patch<22>}}),
         "another injector changing a prepared slot rejects publication");
     racing_table = nullptr;
     expect(table[0] == reinterpret_cast<void *>(1) && table[1] == reinterpret_cast<void *>(99),

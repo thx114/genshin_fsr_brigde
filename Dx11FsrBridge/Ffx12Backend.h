@@ -167,22 +167,26 @@ struct ChainSampleData
 };
 void get_chain_samples(ChainSampleData &out);
 
-// 每帧派发：拷贝输入 → D3D12 ffxDispatch(FSR2 2.3.4) → 拷贝输出。
-// 内部懒创建共享纹理池与 FSR2 上下文（尺寸变化时重建）。
-// instance_key：区分游戏多个 FFX_FSR2 实例（主渲染/UI 次渲染），每实例独立 context 防历史串流。
-// 线程安全（内部互斥）。返回 false 表示本帧失败（调用方回退）。
-bool dispatch(const FrameInput &input, ID3D11DeviceContext *game_context, std::uint64_t instance_key = 0);
+// 三种接管结果都已排入 D3D11 写回；只有前两种有本帧回程证明，不表示 CPU 已读到像素。
+// ngx_legacy_copy 为旧 ABI 保留兼容，不得作为「Evaluate 确认写出本帧」的取证。
+enum class DispatchResult { failed, native_ordered, f6_ordered, ngx_legacy_copy };
 
-// 异步交叠（async upscale）：dispatch 只提交 FFX（不等待），游戏继续渲染；
-// Present 前调用 finish_pending 等待 FFX 完成并拷贝输出——FFX 与游戏后续
-// GPU 工作并行，消除渲染线程每帧硬停（GPU 负载不满来源）。
-//  - set_async_upscale(true)：dispatch 提交后立即返回（默认开启）
-//  - set_async_upscale(false)：dispatch 内提交+等待+拷贝（旧同步行为，可回退）
+constexpr const char *output_evidence(DispatchResult result) noexcept
+{
+    switch (result)
+    {
+    case DispatchResult::native_ordered: return "native_fence";
+    case DispatchResult::f6_ordered: return "f6_receipt_v1";
+    case DispatchResult::ngx_legacy_copy: return "ngx_status_only";
+    default: return "none";
+    }
+}
+DispatchResult dispatch(const FrameInput &input, ID3D11DeviceContext *game_context,
+                        std::uint64_t instance_key = 0);
+
+// true 允许 D3D11 正常批提交；false 在排入写回后显式 Flush（仍无每帧 CPU fence 等待）。
 void set_async_upscale(bool enable);
 bool async_upscale_enabled();
-// 完成挂起的异步 FFX（等 fence + 拷贝输出到 output_target）。无挂起时立即返回 true。
-// 由桥在 Present 前调用；dispatch 入口也会先 finish 上一帧（防异常路径堆积）。
-bool finish_pending();
 
 // P2 诊断（**默认关**）：打开后把两类低频事件写进 SDK 消息（note 数量有上限，
 // 避免把消息缓冲刷满）：

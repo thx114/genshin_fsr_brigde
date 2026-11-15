@@ -105,6 +105,25 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 
 也可以让构建脚本先自动更新上游组件再打包（`-FetchUpstream`）。芙芙启动器插件包仅写入本地 `dist\FSR-Bridge-Plugin.v*.zip`，不会进入 GitHub Actions 或 GitHub Release。
 
+## Neo 重写分支
+
+`fsr/neo-rewrite` 保留 `Dx11FsrBridge.dll`、INI 和安装入口，不代表上面的上游发布已包含 Neo。
+桥内部把图形接入、帧归属与时域状态、游戏版本定位和两个超分后端分开：已识别的当前帧才交由后端，
+写回在当前 D3D11 命令流中排序。FFX12 使用双向 GPU fence，`Ffx12AsyncUpscale=1` 保留正常批提交，
+`0` 在安排写回后显式 Flush；不依赖下一次 Present 交付这一帧。
+
+- **游戏更新**：优先用可执行段内的相对方法布局定位 Render/Update/Camera，菜单按独立签名确认。
+  歧义或验证失败不采用该候选；只有通过范围及序言检查的配置地址可以兜底。只读检查用
+  `FsrVersionCheck.exe <游戏 exe>`（打开 `DX11FSRBRIDGE_BUILD_TESTS` 后构建），不会启动游戏。
+- **F6**：显式选择 `Ffx12Backend=ngx`、`NgxProvider=external` 时走外部 NGX；回执扩展由同一 DLL 提供。
+  回执缺失或不匹配时不写回、不推进历史，按原配置放行；不带扩展的旧 DLL 保持状态码兼容，日志会标为
+  `evidence=ngx_status_only`，它不证明该帧有新输出。
+- **开发验证**：用 `ctest --test-dir <构建目录> --output-on-failure` 运行 WARP/设备接入、归属、版本和 F6 回执夹具。
+  `tools/Test-NeoProviders.ps1` 与 `tools/Test-NeoF6Interop.ps1` 额外使用指定的 FFX/F6 DLL 和测试配置来跑隔离宿主，
+  不部署到游戏。带 `-Cases` 的调用请在 PowerShell 中直接执行脚本，以保留数组参数。
+
+实际游戏、ReShade/NR/FG 组合、HDR 和帧时间不是宿主测试的结论；尚待验收的项目见 [待办](docs/OPEN-ISSUES.md)。
+
 ## 功能
 
 Bridge 只拦截一次游戏原生 FSR2 调用，然后在它后面接上两条后端 —— AMD FFX12 SDK 与 NVIDIA NGX（DLSS）：
