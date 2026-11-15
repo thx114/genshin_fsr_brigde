@@ -18,6 +18,8 @@
   <img src="assets/readme/hero.svg" alt="原神原生 FSR2 调用经 Dx11FsrBridge 分叉到 AMD FFX12 SDK（FSR4/FSR3/FSR2）与 NVIDIA NGX（DLSS）两条后端" width="100%">
 </div>
 
+> 此分支由 GPT 6.2 Sol和GPT 6.2 Astra 重写
+
 面向原神 Windows DX11 客户端的图形插件。它独立 hook 游戏原生 FSR2 调用，并转接到 AMD FFX12 官方 SDK 实现超分：在支持的显卡上直接提供 FSR4/FSR3/FSR2，不依赖 OptiScaler 等外部插件；NVIDIA 显卡上还可以切到内置 NGX 后端直接输出 DLSS（同样不需要 OptiScaler），接入 OptiScaler 后可以进一步扩展 XeSS/FSR4 INT8 等超分类型。
 
 本仓库同时包含 `AntiPlayerMosaic/` 与 `TextureLoader/` 两个子项目：前者是独立构建的原神马赛克修复与 UID 隐藏插件；后者是 3DMigoto 兼容的纹理替换 / Mod 加载器（支持 DDS 与 DirectStorage GPU 解压的 GDDS）。用法分别见对应目录的 README 与 NOTICE。
