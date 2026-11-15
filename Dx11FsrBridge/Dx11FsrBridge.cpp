@@ -7228,6 +7228,7 @@ struct UpscalerPathCacheEntry
     std::uint32_t output_fmt = 0;
     std::uint64_t last_hit_tick = 0;
 };
+constexpr std::size_t k_path_cache_capacity = 8;
 std::mutex g_upscaler_path_cache_mutex;
 std::unordered_map<std::uint64_t, UpscalerPathCacheEntry> g_upscaler_path_cache;
 
@@ -7256,45 +7257,51 @@ std::uint64_t upscaler_path_fingerprint(
     return h;
 }
 
-// 快速路径：正缓存命中（output 特征匹配 + 按缓存布局读 3 SRV 指纹验证）→ 直接构造 info。
-//
-// ⚠️ 2026-09-27（B106）：新增出参 `out0_info`。理由与等价性：
-//   本函数**本来就必须**先读一次 RTV[0]（output 特征匹配的前提），而调用方在"快路径未命中"
-//   之后**还要**再读**同一个** RTV[0] 作为 `outputs[0]`。同一个视图对象在同一次调用内
-//   读取两次，字段逐位相同（`read_resource_info` 是纯读：视图→资源在创建后不可变，
-//   `kind` 形参本身未被使用；读失败时两次都得到空 info）⇒ 把第一次的结果交回调用方复用，
-//   **不改变任何判定**，只是少付一次 `GetResource+GetType+QI+GetDesc+QI+GetDesc`。
-std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
-    ID3D11RenderTargetView *const *render_targets,
-    ID3D11ShaderResourceView *const *shader_resources,
-    ResourceInfo &out0_info)
+// 快路径和完整识别复用相同绑定的资源描述，不跨 draw 缓存设备指针。
+// 2026-11-16：绑定视图由当前 FrameBindings 持有；同一 draw 中缓存失败也只读一次。
+template <typename View, std::size_t N>
+struct SlotMetadata
 {
-    ResourceInfo out0 {};
-    // ⚠️ B106：用 `safe_read_resource_info_counted`（只多记一次工作量计数）——
-    // 本函数在内省路径上，读的视图数正是"优化到底少做了多少工作"要对比的量。
-    safe_read_resource_info_counted(render_targets[0], L"fsr2_path_out", out0);
-    out0_info = out0; // 交回调用方（见上：等价性论证）
-    if (out0.resource_key == 0)
-        return std::nullopt;
+    std::span<View *const> views;
+    std::array<ResourceInfo, N> values {};
+    std::array<bool, N> sampled {};
 
-    std::lock_guard lock(g_upscaler_path_cache_mutex);
-    for (auto &[fingerprint, entry] : g_upscaler_path_cache)
+    const ResourceInfo &get(std::size_t slot)
     {
-        (void)fingerprint;
-        if (entry.output_w != out0.width || entry.output_h != out0.height ||
-            entry.output_fmt != static_cast<std::uint32_t>(out0.format))
-            continue; // output 段不匹配：跳过（避免按旧布局读 SRV）
+        if (!sampled[slot])
+        {
+            safe_read_resource_info_counted(views[slot], L"fsr2_binding", values[slot]);
+            sampled[slot] = true;
+        }
+        return values[slot];
+    }
+};
 
-        ResourceInfo color {}, motion {}, depth {};
-        safe_read_resource_info_counted(shader_resources[entry.color_slot], L"fsr2_path_color", color);
-        safe_read_resource_info_counted(shader_resources[entry.motion_slot], L"fsr2_path_motion", motion);
-        safe_read_resource_info_counted(shader_resources[entry.depth_slot], L"fsr2_path_depth", depth);
+std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
+    SlotMetadata<ID3D11RenderTargetView, 2> &targets, SlotMetadata<ID3D11ShaderResourceView, 7> &inputs)
+{
+    const auto &out0 = targets.get(0);
+    if (!out0.resource_key) return std::nullopt;
+    std::array<std::pair<std::uint64_t, UpscalerPathCacheEntry>, k_path_cache_capacity> candidates;
+    std::size_t count = 0;
+    {
+        std::lock_guard lock(g_upscaler_path_cache_mutex);
+        for (const auto &[key, entry] : g_upscaler_path_cache)
+            if (entry.output_w == out0.width && entry.output_h == out0.height &&
+                entry.output_fmt == static_cast<std::uint32_t>(out0.format))
+                candidates[count++] = { key, entry };
+    }
+    for (const auto &[fingerprint, entry] : std::span(candidates).first(count))
+    {
+        const auto &color = inputs.get(entry.color_slot);
+        const auto &motion = inputs.get(entry.motion_slot);
+        const auto &depth = inputs.get(entry.depth_slot);
         if (color.resource_key == 0 || motion.resource_key == 0 || depth.resource_key == 0)
             continue;
 
         ResourceInfo out1 {};
         if (entry.output_rtv_slot < 2)
-            safe_read_resource_info_counted(render_targets[entry.output_rtv_slot], L"fsr2_path_out1", out1);
+            out1 = targets.get(entry.output_rtv_slot);
 
         std::uint64_t h = 14695981039346656037ull;
         const auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ull; };
@@ -7328,7 +7335,14 @@ std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
         info.output_rtv_slot = entry.output_rtv_slot;
         info.color_resource_key = color.resource_key;
         info.motion_resource_key = motion.resource_key;
-        entry.last_hit_tick = GetTickCount64();
+        // 匹配期间可能被淘汰或覆盖（transparency 槽不在指纹内），提交时只采信仍在表里的布局。
+        std::lock_guard lock(g_upscaler_path_cache_mutex);
+        const auto hit = g_upscaler_path_cache.find(fingerprint);
+        if (hit == g_upscaler_path_cache.end() || hit->second.color_slot != entry.color_slot ||
+            hit->second.motion_slot != entry.motion_slot || hit->second.depth_slot != entry.depth_slot ||
+            hit->second.output_rtv_slot != entry.output_rtv_slot) continue;
+        info.transparency_srv_slot = hit->second.transparency_slot;
+        hit->second.last_hit_tick = GetTickCount64();
         return info;
     }
     return std::nullopt;
@@ -7629,10 +7643,10 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     // `try_upscaler_path_cache_fast` 的判据里**完全不含 cb0，也不看视口**
     // （只看 RTV[0] 的 output 尺寸/格式 + 缓存布局上的 3 个 SRV + out1 指纹）。
     // 若把它挪到便宜判据之后，原本能命中快路径的 draw 会走不到 ⇒ **缩小识别集合** ✗。
-    // `output_metadata_info` 是它已经读过的那份 RTV[0]（见该函数的出参说明）。
-    ResourceInfo output_metadata_info {};
-    if (const auto fast_info = try_upscaler_path_cache_fast(
-            render_targets.data(), shader_resources.data(), output_metadata_info))
+    // 两条识别路径共享此次 draw 的绑定元数据。
+    SlotMetadata<ID3D11RenderTargetView, 2> target_meta { render_targets };
+    SlotMetadata<ID3D11ShaderResourceView, 7> input_meta { shader_resources };
+    if (const auto fast_info = try_upscaler_path_cache_fast(target_meta, input_meta))
     {
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_funnel.mark(perf_probe::FunnelStage::fast_hit);
@@ -7695,9 +7709,8 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     UINT viewport_count = 1;
     context->RSGetViewports(&viewport_count, &viewport);
 
-    std::array<ResourceInfo, 2> outputs {};
-    outputs[0] = output_metadata_info; // 复用快路径已读的 RTV[0]（同一次调用内同值，见该函数出参）
-    safe_read_resource_info_counted(render_targets[1], L"fsr2_on_demand_rtv", outputs[1]);
+    target_meta.get(1);
+    const auto &outputs = target_meta.values;
 
     const bool viewport_usable = viewport_count != 0 && viewport.Width != 0 && viewport.Height != 0;
     if (!viewport_usable)
@@ -7723,9 +7736,9 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     perf_funnel.mark(perf_probe::FunnelStage::after_output);
 #endif
 
-    std::array<ResourceInfo, 7> inputs {};
     for (std::size_t index = 0; index < shader_resources.size(); ++index)
-        safe_read_resource_info_counted(shader_resources[index], L"fsr2_on_demand_srv", inputs[index]);
+        input_meta.get(index);
+    const auto &inputs = input_meta.values;
 
     const std::uint64_t constant_buffer_key =
         reinterpret_cast<std::uint64_t>(constant_buffer);
@@ -7827,7 +7840,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         entry.output_fmt = static_cast<std::uint32_t>(outputs[0].format);
         entry.last_hit_tick = GetTickCount64();
         const std::uint64_t fingerprint = upscaler_path_fingerprint(inputs, outputs, *identified);
-        if (g_upscaler_path_cache.size() >= 8)
+        if (g_upscaler_path_cache.size() >= k_path_cache_capacity)
         {
             auto oldest = g_upscaler_path_cache.begin();
             for (auto it = g_upscaler_path_cache.begin(); it != g_upscaler_path_cache.end(); ++it)
