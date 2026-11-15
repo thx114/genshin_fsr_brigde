@@ -18,6 +18,7 @@
 #include "runtime/GraphicsIngress.h"
 #include "runtime/DrawSequence.h"
 #include "runtime/FrameBindings.h"
+#include "runtime/JitterReadback.h"
 #include "runtime/OutputHistory.h"
 #include "runtime/CandidateSignature.h"
 #include "runtime/FrameAttribution.h"
@@ -9684,6 +9685,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
             int jit_state = 0;        // 0=首帧探测, 1=已锁定
             bool jit_locked = false;
             int jit_slot = 0;
+            neo::graphics::JitterReadback jitter_readback;
             // P1 单实例裁决用的三个字段（只读语义，不参与本实例的 dispatch 行为）：
             std::uint64_t render_area = 0;       // 该实例的 render 面积（裁决主键）
             std::uint64_t first_seen_seq = 0;    // 首次出现次序（裁决次键，越小越早）
@@ -10828,129 +10830,96 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                 // 都不变 = 该视图无相机抖动 → 无 AA 可累积（游戏原生同此）。
                 if (!render_jitter_valid)
                 {
-                    ID3D11Buffer *bound_cb = nullptr;
-                    context->PSGetConstantBuffers(0, 1, &bound_cb);
-                    if (bound_cb != nullptr)
+                    st->jitter_readback.with_bound_cb(*context, [&](std::span<const float> values)
                     {
-                        D3D11_BUFFER_DESC bd {};
-                        bound_cb->GetDesc(&bd);
-                        if (bd.ByteWidth >= 464 && (bd.BindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0)
+                        // 候选槽（归一化 jitter ∈ (0,1)；0 视为未写入，≥1 视为脏数据）
+                        // 兜底模式（fallback=1）：样本槽优先（cb0[28].xy / [27].zw / [26].zw）
+                        // 纯特征模式（fallback=0）：扫描全 cb0（0..127 float 对）取前 3 个合理对
+                        float cb[3][2] {};
+                        bool ok[3] = {false, false, false};
+                        int idx[3][2] = {{112, 113}, {110, 111}, {106, 107}};
+                        if (!g_config.ffx12_feature_fallback)
                         {
-                            ID3D11Device *dev = nullptr;
-                            context->GetDevice(&dev);
-                            if (dev != nullptr)
+                            int found = 0;
+                            for (int i = 0; i < static_cast<int>(values.size() / 2) && found < 3; ++i)
                             {
-                                D3D11_BUFFER_DESC sd {};
-                                sd.ByteWidth = bd.ByteWidth;
-                                sd.Usage = D3D11_USAGE_STAGING;
-                                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                                ID3D11Buffer *staging_cb = nullptr;
-                                if (SUCCEEDED(dev->CreateBuffer(&sd, nullptr, &staging_cb)) &&
-                                    staging_cb != nullptr)
+                                const float a = values[i * 2], b = values[i * 2 + 1];
+                                if ((a != 0.0f || b != 0.0f) && a < 1.0f && b < 1.0f)
                                 {
-                                    context->CopyResource(staging_cb, bound_cb);
-                                    context->Flush();
-                                    D3D11_MAPPED_SUBRESOURCE m {};
-                                    if (SUCCEEDED(context->Map(staging_cb, 0, D3D11_MAP_READ, 0, &m)) &&
-                                        m.pData != nullptr)
-                                    {
-                                        const float *f = static_cast<const float *>(m.pData);
-                                        // 候选槽（归一化 jitter ∈ (0,1)；0 视为未写入，≥1 视为脏数据）
-                                        // 兜底模式（fallback=1）：样本槽优先（cb0[28].xy / [27].zw / [26].zw）
-                                        // 纯特征模式（fallback=0）：扫描全 cb0（0..127 float 对）取前 3 个合理对
-                                        float cb[3][2] {};
-                                        bool ok[3] = {false, false, false};
-                                        int idx[3][2] = {{112, 113}, {110, 111}, {106, 107}};
-                                        if (!g_config.ffx12_feature_fallback)
-                                        {
-                                            int found = 0;
-                                            for (int i = 0; i < 128 && found < 3; ++i)
-                                            {
-                                                const float a = f[i * 2], b = f[i * 2 + 1];
-                                                if ((a != 0.0f || b != 0.0f) && a < 1.0f && b < 1.0f)
-                                                {
-                                                    idx[found][0] = i * 2;
-                                                    idx[found][1] = i * 2 + 1;
-                                                    ++found;
-                                                }
-                                            }
-                                            // 无合理对：保留样本槽兜底（全冻结视图——锁定后无抖动累积，同原生）
-                                        }
-                                        for (int s = 0; s < 3; ++s)
-                                        {
-                                            const float a = f[idx[s][0]], b = f[idx[s][1]];
-                                            if ((a != 0.0f || b != 0.0f) && a < 1.0f && b < 1.0f)
-                                            {
-                                                cb[s][0] = a;
-                                                cb[s][1] = b;
-                                                ok[s] = true;
-                                            }
-                                        }
-                                        // 锁定式槽位选择：首帧记录探测值；次帧起选首个变化的槽并锁定
-                                        if (st->jit_state == 0)
-                                        {
-                                            for (int s = 0; s < 3; ++s)
-                                                if (ok[s])
-                                                {
-                                                    st->jit_probe[s][0] = cb[s][0];
-                                                    st->jit_probe[s][1] = cb[s][1];
-                                                }
-                                            st->jit_state = 1;
-                                        }
-                                        else if (!st->jit_locked)
-                                        {
-                                            for (int s = 0; s < 3; ++s)
-                                            {
-                                                if (ok[s] &&
-                                                    (cb[s][0] != st->jit_probe[s][0] || cb[s][1] != st->jit_probe[s][1]))
-                                                {
-                                                    st->jit_slot = s;
-                                                    break;
-                                                }
-                                            }
-                                            st->jit_locked = true; // 全冻结也锁定（默认槽 0 = 无抖动视图）
-                                            static std::atomic_uint64_t jit_slot_log_count { 0 };
-                                            const std::uint64_t jc = jit_slot_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
-                                            if (jc <= 16)
-                                            {
-                                                LOG_DEBUG(blog::cat::upscale, "ffx12_jit_slot inst=" + hex64(match_inst & 0xFFFFFFFFull) +
-                                                    " slot=" + std::to_string(st->jit_slot) +
-                                                    " v=(" + std::to_string(cb[st->jit_slot][0]) + "," +
-                                                    std::to_string(cb[st->jit_slot][1]) + ")");
-                                            }
-                                        }
-                                        const int pick = st->jit_locked ? st->jit_slot : 0;
-                                        if (ok[pick])
-                                        {
-                                            jit_src_x = cb[pick][0];
-                                            jit_src_y = cb[pick][1];
-                                            jit_src_name = pick == 0 ? "cb0_fallback" :
-                                                (pick == 1 ? "cb27_fallback" : "cb26_fallback");
-                                        }
-                                        else
-                                        {
-                                            // 锁定槽失效：本帧回退任一有效槽（锁定保持不变）
-                                            for (int s = 0; s < 3; ++s)
-                                            {
-                                                if (ok[s])
-                                                {
-                                                    jit_src_x = cb[s][0];
-                                                    jit_src_y = cb[s][1];
-                                                    jit_src_name = s == 0 ? "cb0_fallback" :
-                                                        (s == 1 ? "cb27_fallback" : "cb26_fallback");
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        context->Unmap(staging_cb, 0);
-                                    }
-                                    staging_cb->Release();
+                                    idx[found][0] = i * 2;
+                                    idx[found][1] = i * 2 + 1;
+                                    ++found;
                                 }
-                                dev->Release();
+                            }
+                            // 无合理对：保留样本槽兜底（全冻结视图——锁定后无抖动累积，同原生）
+                        }
+                        for (int s = 0; s < 3; ++s)
+                        {
+                            const float a = values[idx[s][0]], b = values[idx[s][1]];
+                            if ((a != 0.0f || b != 0.0f) && a < 1.0f && b < 1.0f)
+                            {
+                                cb[s][0] = a;
+                                cb[s][1] = b;
+                                ok[s] = true;
                             }
                         }
-                        bound_cb->Release();
-                    }
+                        // 锁定式槽位选择：首帧记录探测值；次帧起选首个变化的槽并锁定
+                        if (st->jit_state == 0)
+                        {
+                            for (int s = 0; s < 3; ++s)
+                                if (ok[s])
+                                {
+                                    st->jit_probe[s][0] = cb[s][0];
+                                    st->jit_probe[s][1] = cb[s][1];
+                                }
+                            st->jit_state = 1;
+                        }
+                        else if (!st->jit_locked)
+                        {
+                            for (int s = 0; s < 3; ++s)
+                            {
+                                if (ok[s] &&
+                                    (cb[s][0] != st->jit_probe[s][0] || cb[s][1] != st->jit_probe[s][1]))
+                                {
+                                    st->jit_slot = s;
+                                    break;
+                                }
+                            }
+                            st->jit_locked = true; // 全冻结也锁定（默认槽 0 = 无抖动视图）
+                            static std::atomic_uint64_t jit_slot_log_count { 0 };
+                            const std::uint64_t jc = jit_slot_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if (jc <= 16)
+                            {
+                                LOG_DEBUG(blog::cat::upscale, "ffx12_jit_slot inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+                                    " slot=" + std::to_string(st->jit_slot) +
+                                    " v=(" + std::to_string(cb[st->jit_slot][0]) + "," +
+                                    std::to_string(cb[st->jit_slot][1]) + ")");
+                            }
+                        }
+                        const int pick = st->jit_locked ? st->jit_slot : 0;
+                        if (ok[pick])
+                        {
+                            jit_src_x = cb[pick][0];
+                            jit_src_y = cb[pick][1];
+                            jit_src_name = pick == 0 ? "cb0_fallback" :
+                                (pick == 1 ? "cb27_fallback" : "cb26_fallback");
+                        }
+                        else
+                        {
+                            // 锁定槽失效：本帧回退任一有效槽（锁定保持不变）
+                            for (int s = 0; s < 3; ++s)
+                            {
+                                if (ok[s])
+                                {
+                                    jit_src_x = cb[s][0];
+                                    jit_src_y = cb[s][1];
+                                    jit_src_name = s == 0 ? "cb0_fallback" :
+                                        (s == 1 ? "cb27_fallback" : "cb26_fallback");
+                                    break;
+                                }
+                            }
+                        }
+                    });
                 }
                 // ---- A 阶段（2026-11-10）：模式换算搬进纯函数 NgxParamMap.cpp ----
                 // ★ 逐位等价：六种模式的公式与重构前 switch **逐字相同**（含 mode 2 的
