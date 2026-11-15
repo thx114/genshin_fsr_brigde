@@ -124,6 +124,12 @@ waits for the next Present to hand off the current frame.
   status-only ABI and log `evidence=ngx_status_only`; that is not proof of fresh pixels. A real F6 provider
   with `Dx11Upscaler=dlss_12` passed changing input, resizing, and first-frame skip in the isolated host.
   Run these checks with `ngx-v1`, `ngx-v1-resize`, and `ngx-v1-skip-control`.
+- **Native pre-upscale AO (experimental):** Set `NgxBeforeSrAo=1` under `[Dx11FsrBridge]`.
+  Neo applies depth-aware normal smoothing and spatial AO to the render-sized RGBA8 NGX color input.
+  This does not load ReShade, install a Present filter, or use optical flow. HDR/PQ and unsupported
+  inputs bypass the pass. Leave F6/ReShade BeforeSR AO off to avoid stacking effects. In the isolated host,
+  compare `ngx-nvidia-ao-on` / `ngx-nvidia-ao-off` for direct NVIDIA NGX or `ngx-v1-ao-on` /
+  `ngx-v1-ao-off` for F6 with HoYoShade disabled in the fixture.
 - **Development tests:** `ctest --test-dir <build directory> --output-on-failure` runs device and WARP tests,
   frame attribution, version discovery, and the F6 receipt fixture. `tools/Test-NeoProviders.ps1` and
   `tools/Test-NeoF6Interop.ps1` run isolated hardware hosts with pinned DLLs and test settings, not a game

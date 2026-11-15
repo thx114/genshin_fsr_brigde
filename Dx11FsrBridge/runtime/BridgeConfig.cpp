@@ -408,6 +408,7 @@ ConfigLoad read_config(const std::filesystem::path &module_dir)
     const int ngx_pt =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPassthrough", 0, config_path.c_str());
     ngx::set_passthrough(ngx_pt != 0);
+    ngx::set_before_sr_ao(GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxBeforeSrAo", 0, config_path.c_str()) == 1);
 
     // ---- 键 10：NgxProvider（2026-11-10 增，B154；默认 auto）----
     // 只接受**精确小写**的 auto / nvidia / external：与 Ffx12Backend 同风格（不 tolower、不 trim）。

@@ -50,6 +50,7 @@ void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDe
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
+void set_before_sr_ao(bool enable);                         // NgxBeforeSrAo，默认 false
 // NgxCrossKeyReuse，默认 true（ini 里 1）。语义：instance_key 变了，但建池/建 feature 真正
 //   依赖的「render/display 尺寸 + color/output 格式」全等时，**复用**现有资源池与 feature，
 //   不销毁重建。false（ini 里 0）⇒ 每次 key 变化都走原来的 destroy + create，与引入该键之前

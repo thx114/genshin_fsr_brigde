@@ -159,7 +159,21 @@ endif()
 # ⇒ `NgxBackend.cpp` 永不进编译单元 ⇒ ngx 的 13 个符号未定义 ⇒ **LNK2019**（本 target 无 GLOB）。
 if(DX11FSRBRIDGE_ENABLE_NGX)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/nvsdk_ngx_defs.h")
-        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp ngx/BeforeSr.cpp
+        # 2026-11-15：离线编译原生 BeforeSR 的 DXBC，避免首次打开效果时在渲染线程编译 HLSL。
+        get_filename_component(FSRBRIDGE_SDK_TOOLS "${CMAKE_RC_COMPILER}" DIRECTORY)
+        find_program(FSRBRIDGE_FXC NAMES fxc.exe fxc HINTS "${FSRBRIDGE_SDK_TOOLS}"
+            "$ENV{WindowsSdkVerBinPath}/x64"
+            "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+            REQUIRED)
+        set(FSRBRIDGE_AO_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ngx/BeforeSrAo.hlsl")
+        set(FSRBRIDGE_AO_BYTECODE "${CMAKE_CURRENT_BINARY_DIR}/BeforeSrAoBytecode.h")
+        add_custom_command(OUTPUT "${FSRBRIDGE_AO_BYTECODE}"
+            COMMAND "${FSRBRIDGE_FXC}" /nologo /O3 /WX /Ges /T cs_5_0 /E main
+                /Fh "${FSRBRIDGE_AO_BYTECODE}" /Vn k_neo_before_sr_ao "${FSRBRIDGE_AO_SOURCE}"
+            DEPENDS "${FSRBRIDGE_AO_SOURCE}" VERBATIM)
+        add_custom_target(BeforeSrAoBytecode DEPENDS "${FSRBRIDGE_AO_BYTECODE}")
+        add_dependencies(Dx11FsrBridge BeforeSrAoBytecode)
+        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp ngx/BeforeSr.cpp ngx/BeforeSrAo.cpp
             ngx/FrameResources.cpp ngx/ProviderDiscovery.cpp)
         target_include_directories(Dx11FsrBridge PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx")
@@ -416,6 +430,12 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         fsrbridge_configure_test(BeforeSrInputTest)
         target_link_libraries(BeforeSrInputTest PRIVATE d3d11)
         add_test(NAME BeforeSrInputTest COMMAND BeforeSrInputTest)
+        add_executable(BeforeSrAoTest tests/BeforeSrAoTest.cpp ngx/BeforeSrAo.cpp)
+        fsrbridge_configure_test(BeforeSrAoTest)
+        add_dependencies(BeforeSrAoTest BeforeSrAoBytecode)
+        target_include_directories(BeforeSrAoTest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_link_libraries(BeforeSrAoTest PRIVATE d3d11)
+        add_test(NAME BeforeSrAoTest COMMAND BeforeSrAoTest)
     endif()
     add_executable(CandidateSignatureTest tests/CandidateSignatureTest.cpp runtime/CandidateSignature.cpp)
     fsrbridge_configure_test(CandidateSignatureTest)
@@ -465,6 +485,14 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
         add_test(NAME NgxInputMapDelayedIntegration COMMAND ProviderFrameHost ngx-input-map-delayed
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        add_test(NAME BeforeSrAoIntegration COMMAND ProviderFrameHost ngx-ao
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+        add_test(NAME BeforeSrAoOffIntegration COMMAND ProviderFrameHost ngx-ao-off
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+        add_test(NAME BeforeSrAoReceiptIntegration COMMAND ProviderFrameHost ngx-ao-v1
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        set_tests_properties(BeforeSrAoIntegration BeforeSrAoOffIntegration BeforeSrAoReceiptIntegration
+            PROPERTIES TIMEOUT 45)
         set_tests_properties(F6EvalReceiptIntegration BeforeSrIntegration NgxInputMapCurrentIntegration NgxInputMapDelayedIntegration PROPERTIES TIMEOUT 45)
     endif()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)

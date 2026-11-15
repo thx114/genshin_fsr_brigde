@@ -64,6 +64,8 @@
 #include "ngx/ProviderDiscovery.h"
 #include "ngx/FrameResources.h"
 #include "ngx/BeforeSr.h"
+#include "ngx/BeforeSrAo.h"
+#include "ComMethodRoutes.h"
 // A 阶段重构（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
 // 本 TU 只负责"取输入 → 调纯函数 → 写输出"；公式全部在 NgxParamMap.cpp，
 // 由 NgxParamMapTest.cpp 做离线位级回归（NGX=OFF 也能构建）。
@@ -218,6 +220,7 @@ struct NgxInstance
 {
     std::uint64_t key = 0; // 0 也是合法 key；池是否已发布由资源本身表示。
     neo::ngx::FrameResources pool;
+    neo::ngx::BeforeSrAo ao;
     neo::ngx::FeatureHandle feature;
     int feature_preset = 0;
     unsigned feature_flags_bits = 0;
@@ -243,6 +246,7 @@ struct NgxInstance
 
     void clear_pool()
     {
+        ao = {};
         pool = {};
         key = 0;
         clear_create_failure();
@@ -274,6 +278,7 @@ using neo::ngx::ProviderMode;
 ProviderMode g_provider_mode = ProviderMode::automatic;
 neo::ngx::ProviderApi g_provider;
 std::uint64_t g_f6_request = 0; // dispatch 在后端锁内串行。
+bool g_before_sr_ao = false;
 
 // ---- 自写 CS（全局，形状与尺寸无关；只编一次，§3.5）----
 // T-2 只声明；ensure_shaders 是 T-4 的交付物。
@@ -2553,6 +2558,7 @@ static bool ensure_instance(std::uint64_t key, ID3D11Device &device, const neo::
         inst.clear_pool();
         return false;
     }
+    inst.ao = {};
     if (same_key)
     {
         ++inst.pool_rebuilds;
@@ -2926,6 +2932,11 @@ void set_passthrough(bool on)
     g_passthrough = on;
 }
 
+void set_before_sr_ao(bool enable)
+{
+    g_before_sr_ao = enable;
+}
+
 // 2026-11-10（B154）：NgxProvider 三态。越界（含 load_config 送来的 -1）静默回 auto，
 // 但**记位** —— provider 拼错（ngx / NVIDIA / 外部 / 空值）会让人以为"已经切到外部实现"，
 // 与 NgxHdr 越界（不记位）刻意不同：Hdr 的 auto 本来就是它的默认语义，provider 的不是。
@@ -3163,9 +3174,10 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     }
 
     // 2026-11-15：复用刚录入的 Color/Depth/Motion，不让消费者重做捕获或靠下一帧的输入找深度。
-    const auto before_sr_input = [&]() noexcept -> neo::ngx::BeforeSrInput
+    const auto before_sr_input = [&](bool ao_applied = false) noexcept -> neo::ngx::BeforeSrInput
     {
         using namespace neo::interop;
+        // AO 不是直接复制；不把游戏原始 SRV 当成它的来源视图公布。
         return { {
             .frame = frame_count, .instance = instance_key, .context = ctx,
             .color = inst.pool.color.Get(), .depth = inst.pool.depth.Get(), .motion = inst.pool.motion.Get(),
@@ -3177,12 +3189,20 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
                 (reset_val ? k_before_sr_reset : 0u),
             .jitter_x = in.jitter_x, .jitter_y = in.jitter_y,
             .motion_scale_x = in.motion_scale_x, .motion_scale_y = in.motion_scale_y,
-        }, in.color, in.color_source_view };
+        }, ao_applied ? nullptr : in.color, ao_applied ? nullptr : in.color_source_view };
     };
     ComPtr<ID3D11Texture2D> filtered_color;
-    // F6 自己拥有 BeforeSR，不能同时再调用直连 NGX 的外部记录者。
+    bool ao_applied = false;
+    // 2026-11-15：原生 AO 是显式选择；原有直连记录者优先，不在同次派发中串叠这两条路径。
     if (!g_provider.evaluate_f6 && neo::ngx::has_before_sr_callback())
         filtered_color = neo::ngx::record_before_sr(before_sr_input(), *dev.Get());
+    else if (g_before_sr_ao && !(inst.feature_flags_bits & kFlagsInputIsHdr) && !ffx12::pq_chain())
+    {
+        const neo::ngx::AoProjection projection { in.camera_near, in.camera_far, in.camera_fov_vertical,
+            (inst.feature_flags_bits & kFlagsInputDepthInvert) != 0 };
+        const ContextPolicyBypass bypass(ctx);
+        ao_applied = inst.ao.record(*dev.Get(), *ctx, *inst.pool.color.Get(), *inst.pool.depth.Get(), projection);
+    }
 
     // 1-4：四个纹理（资源本体，**不是视图**）
     set_tex(g_params, NVSDK_NGX_Parameter_Color, filtered_color ? filtered_color.Get() : inst.pool.color.Get());
@@ -3234,7 +3254,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
         const auto request = ++g_f6_request;
         neo::ngx::F6EvalReceiptV1 receipt {};
         {
-            const auto input = before_sr_input();
+            const auto input = before_sr_input(ao_applied);
             const neo::ngx::BeforeSrQueryScope scope(input);
             rr = g_provider.evaluate_f6(ctx, inst.feature.get(), g_params, nullptr, request, &receipt);
         }
@@ -3243,9 +3263,9 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     else
     {
         rr = g_provider.evaluate(ctx, inst.feature.get(), g_params, nullptr);
-        // 参数袋跨帧复用，不能让它保留本次临时替代资源的裸指针。
-        if (filtered_color) set_tex(g_params, NVSDK_NGX_Parameter_Color, inst.pool.color.Get());
     }
+    // 参数袋跨帧复用，不能在临时替代资源或下一次重建池时留下裸指针。
+    if (filtered_color) set_tex(g_params, NVSDK_NGX_Parameter_Color, inst.pool.color.Get());
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (sampled)
         log_ngx_core(blog::Level::Debug, L"ngx_timing frame=%llu eval_us=%.1f rc=0x%X",

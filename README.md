@@ -121,6 +121,11 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
   本次交付才写回；无法证明时不推进历史，按原配置回退。不带扩展的旧 DLL 维持状态码兼容，标记为
   `evidence=ngx_status_only`，它不证明该帧有新输出。已用真实 `Dx11Upscaler=dlss_12`
   验证正常改色、尺寸切换和首帧跳过；测试 case 为 `ngx-v1`、`ngx-v1-resize`、`ngx-v1-skip-control`。
+- **原生超分前 AO（实验性）**：在 `[Dx11FsrBridge]` 下显式设 `NgxBeforeSrAo=1`。仅处理 NGX 的 SDR RGBA8 颜色，
+  使用同帧深度平滑法线并做空间遮蔽；不加载 ReShade，不使用光流或时域历史。开启时可关闭 ReShade 与 F6 的
+  ReShade BeforeSR 效果；两者不要作为同一个 AO 预设叠用。默认 `0`；输入不兼容时保留原图。
+  隔离对照：NVIDIA 直连用 `ngx-nvidia-ao-on` / `ngx-nvidia-ao-off`；真 F6 用 `ngx-v1-ao-on` /
+  `ngx-v1-ao-off`，测试用的 F6 配置需关闭 HoYoShade。
 - **开发验证**：用 `ctest --test-dir <构建目录> --output-on-failure` 运行 WARP/设备接入、归属、版本和 F6 回执夹具。
   `tools/Test-NeoProviders.ps1` 与 `tools/Test-NeoF6Interop.ps1` 额外使用指定的 FFX/F6 DLL 和测试配置来跑隔离宿主，
   不部署到游戏。带 `-Cases` 的调用请在 PowerShell 中直接执行脚本，以保留数组参数。
