@@ -121,6 +121,10 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
   本次交付才写回；无法证明时不推进历史，按原配置回退。不带扩展的旧 DLL 维持状态码兼容，标记为
   `evidence=ngx_status_only`，它不证明该帧有新输出。已用真实 `Dx11Upscaler=dlss_12`
   验证正常改色、尺寸切换和首帧跳过；测试 case 为 `ngx-v1`、`ngx-v1-resize`、`ngx-v1-skip-control`。
+- **同尺寸输入**：通过完整 FSR 签名的原尺寸输入可交给 NGX 的 DLAA 路径。
+  `RenderScaleMenu=0` 使用游戏原生精度列表；原生精度 `1.1` 不代表桥菜单里的 `0.6`。
+  隔离宿主的 `ngx-v1-dlaa` / `ngx-nvidia-dlaa` 已验证真实 F6 和 NVIDIA 直连的两帧输出；
+  这不代表游戏内画质或性能已经验收。
 - **原生超分前 AO（实验性）**：在 `[Dx11FsrBridge]` 下显式设 `NgxBeforeSrAo=1`。仅处理 NGX 的 SDR RGBA8 颜色，
   使用同帧深度平滑法线并做空间遮蔽；不加载 ReShade，不使用光流或时域历史。开启时可关闭 ReShade 与 F6 的
   ReShade BeforeSR 效果；两者不要作为同一个 AO 预设叠用。默认 `0`；输入不兼容时保留原图。

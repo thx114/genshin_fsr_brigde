@@ -124,6 +124,10 @@ waits for the next Present to hand off the current frame.
   status-only ABI and log `evidence=ngx_status_only`; that is not proof of fresh pixels. A real F6 provider
   with `Dx11Upscaler=dlss_12` passed changing input, resizing, and first-frame skip in the isolated host.
   Run these checks with `ngx-v1`, `ngx-v1-resize`, and `ngx-v1-skip-control`.
+- **Native-sized input:** Inputs that pass the full FSR signature can reach NGX's DLAA path.
+  `RenderScaleMenu=0` uses the game's native scale list; native `1.1` is different from the bridge's `0.6`.
+  The isolated `ngx-v1-dlaa` / `ngx-nvidia-dlaa` cases passed two output frames with real F6 and NVIDIA NGX.
+  In-game image quality and performance remain unverified.
 - **Native pre-upscale AO (experimental):** Set `NgxBeforeSrAo=1` under `[Dx11FsrBridge]`.
   Neo applies depth-aware normal smoothing and spatial AO to the render-sized RGBA8 NGX color input.
   This does not load ReShade, install a Present filter, or use optical flow. HDR/PQ and unsupported

@@ -9632,8 +9632,10 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
     const std::optional<TargetUpscalerDrawInfo> &draw_info = inspected_draw_info;
     if (!draw_info)
         return false;
-    if (draw_info->render_width >= draw_info->output_width &&
-        draw_info->render_height >= draw_info->output_height)
+    // 2026-11-16（同尺寸入口）：旧 DLL 的 1:1 提供方对照只有原生像素，没有 NGX 派发。
+    // 完整签名仍须通过；同尺寸应交给后端原尺寸路径，游戏恢复尚待用户实测。
+    if (draw_info->render_width > draw_info->output_width ||
+        draw_info->render_height > draw_info->output_height)
     {
         return false;
     }
@@ -9645,7 +9647,9 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
         LOG_INFO(blog::cat::upscale, "fsr2_translation_candidate render=" +
             std::to_string(draw_info->render_width) + "x" + std::to_string(draw_info->render_height) +
             " output=" + std::to_string(draw_info->output_width) + "x" + std::to_string(draw_info->output_height) +
-            " mode=" + std::to_string(translation_mode));
+            " mode=" + std::to_string(translation_mode) + " native_size=" +
+            ((draw_info->render_width == draw_info->output_width &&
+                draw_info->render_height == draw_info->output_height) ? "1" : "0"));
     }
 
     // ---- Phase 2: 调用点驱动的 FSR2 2.3.4 后端（不经 OptiScaler、不经 cb0 jitter） ----
