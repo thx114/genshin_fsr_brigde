@@ -16,6 +16,7 @@ constexpr std::uint32_t k_data_rva = 0x20000;
 constexpr std::uint32_t k_image_size = k_data_rva + 0x1000;
 constexpr auto k_nt = sizeof(IMAGE_DOS_HEADER);
 constexpr auto k_sections = k_nt + sizeof(IMAGE_NT_HEADERS64);
+using MethodRvas = std::array<std::uint32_t, k_fsr2_layout.gaps.size() + 1>;
 
 struct Image
 {
@@ -57,10 +58,16 @@ struct Image
         std::memcpy(bytes.data() + offset, &value, sizeof(value));
     }
 
-    std::array<std::uint32_t, k_fsr2_layout.gaps.size() + 1> family(std::uint32_t start, int edit_index = -1,
-        unsigned delta = 0)
+    void put_anchors(const MethodRvas &methods)
     {
-        std::array<std::uint32_t, k_fsr2_layout.gaps.size() + 1> methods {};
+        put(methods[k_fsr2_layout.render_index], neo::game::k_render_head);
+        put(methods[k_fsr2_layout.update_index], neo::game::k_ucb_head);
+        put(methods[k_fsr2_layout.camera_index], neo::game::k_camera_head);
+    }
+
+    MethodRvas family(std::uint32_t start, int edit_index = -1, unsigned delta = 0)
+    {
+        MethodRvas methods {};
         methods[0] = start;
         for (std::size_t i = 0; i < k_fsr2_layout.gaps.size(); ++i)
             methods[i + 1] = methods[i] + k_fsr2_layout.gaps[i] + (static_cast<int>(i) == edit_index ? delta : 0u);
@@ -92,17 +99,17 @@ void expect(bool ok, const char *test)
 int main()
 {
     Image first;
-    auto source = first.family(k_code_rva + 0x100);
-    const auto version = neo::game::discover_version(first.bytes);
-    expect(!version.render_compatible && !version.camera_compatible,
+    const auto source = first.family(k_code_rva + 0x100);
+    const auto layout_only = neo::game::discover_version(first.bytes);
+    expect(layout_only.status == DiscoveryStatus::incompatible_anchors && !layout_only.render_compatible &&
+        !layout_only.camera_compatible && layout_only.render == 0 && layout_only.update == 0 && layout_only.camera == 0,
         "matching relative offsets alone do not authorize hook installation");
-    first.put(source[k_fsr2_layout.render_index], neo::game::k_render_head);
-    first.put(source[k_fsr2_layout.update_index], neo::game::k_ucb_head);
-    first.put(source[k_fsr2_layout.camera_index], neo::game::k_camera_head);
-    auto hooks = neo::game::discover_version(first.bytes);
-    expect(hooks.render_compatible && hooks.camera_compatible, "complete executable prologues validated independently");
+    first.put_anchors(source);
+    const auto version = neo::game::discover_version(first.bytes);
+    expect(version.render_compatible && version.camera_compatible,
+        "complete executable prologues validated independently");
     first.put(source[k_fsr2_layout.update_index], std::uint8_t { 0xcc });
-    hooks = neo::game::discover_version(first.bytes);
+    const auto hooks = neo::game::discover_version(first.bytes);
     expect(hooks.matched() && !hooks.render_compatible && hooks.camera_compatible,
         "bad update prologue rejects Render but not the independent camera anchor");
     first.put(source[k_fsr2_layout.update_index], neo::game::k_ucb_head);
@@ -160,20 +167,43 @@ int main()
         version.camera == source[k_fsr2_layout.camera_index], "matches a family at the final possible sorted index");
 
     Image updated;
-    source = updated.family(k_code_rva + 0x1000, 15, 0x10);
+    const auto moved = updated.family(k_code_rva + 0x1000, 15, 0x10);
+    updated.put_anchors(moved);
     const auto relocated = neo::game::discover_version(updated.bytes);
-    expect(relocated.matched() && relocated.exact_gaps + 1 == version.exact_gaps &&
-        relocated.render == source[k_fsr2_layout.render_index] && relocated.render != version.render,
+    expect(relocated.matched() && relocated.render_compatible && relocated.exact_gaps + 1 == version.exact_gaps &&
+        relocated.render == moved[k_fsr2_layout.render_index] && relocated.render != version.render,
         "relocated image and one changed method gap do not need an RVA update");
 
-    first.family(k_second_family);
-    const auto ambiguous = neo::game::discover_version(first.bytes);
-    expect(ambiguous.status == DiscoveryStatus::ambiguous && ambiguous.render == 0 && ambiguous.camera == 0,
-        "tied candidates are not eligible for auto installation");
-
-    auto best = updated.family(k_second_family);
+    // 2026-11-15：验证映像更新时，缺入口证据的高分窗口不能挡住可执行的布局变体。
+    const auto best = updated.family(k_second_family);
+    const auto with_layout_decoy = neo::game::discover_version(updated.bytes);
+    expect(with_layout_decoy.render == relocated.render && with_layout_decoy.render_compatible &&
+        with_layout_decoy.exact_gaps == relocated.exact_gaps,
+        "layout-only decoy cannot hide a lower scoring executable family");
+    updated.put_anchors(best);
     expect(neo::game::discover_version(updated.bytes).render == best[k_fsr2_layout.render_index],
-        "a strictly better layout wins instead of first match");
+        "a strictly better executable layout wins instead of first match");
+    updated.put(best[k_fsr2_layout.update_index], std::uint8_t { 0xcc });
+    updated.put(moved[k_fsr2_layout.camera_index], std::uint8_t { 0xcc });
+    const auto render_only = neo::game::discover_version(updated.bytes);
+    expect(render_only.render == relocated.render && render_only.render_compatible &&
+        !render_only.camera_compatible && render_only.camera == 0,
+        "verified Render pair beats camera-only candidate without taking its camera");
+    updated.put(moved[k_fsr2_layout.render_index], std::uint8_t { 0xcc });
+    const auto camera_only = neo::game::discover_version(updated.bytes);
+    expect(camera_only.matched() && camera_only.camera_compatible &&
+        camera_only.camera == best[k_fsr2_layout.camera_index] && !camera_only.render_compatible &&
+        camera_only.render == 0 && camera_only.update == 0,
+        "verified camera remains available when neither Render pair is compatible");
+
+    const auto peer = first.family(k_second_family);
+    const auto with_tied_decoy = neo::game::discover_version(first.bytes);
+    expect(with_tied_decoy.render_compatible && with_tied_decoy.render == version.render,
+        "unverified equal-score layout cannot make a verified family ambiguous");
+    first.put_anchors(peer);
+    const auto ambiguous = neo::game::discover_version(first.bytes);
+    expect(ambiguous.status == DiscoveryStatus::ambiguous && ambiguous.render == 0 &&
+        ambiguous.update == 0 && ambiguous.camera == 0, "tied verified candidates are not eligible for auto installation");
 
     Image no_match;
     no_match.family(k_code_rva + 0x100, static_cast<int>(k_fsr2_layout.update_index), 0x1000);

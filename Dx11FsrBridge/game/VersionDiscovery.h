@@ -29,6 +29,7 @@ enum class DiscoveryStatus
     invalid_image,
     unavailable_layout,
     no_match,
+    incompatible_anchors,
     ambiguous,
     matched,
 };
@@ -44,6 +45,7 @@ struct VersionDiscovery
     bool render_compatible = false;
     bool camera_compatible = false;
 
+    // matched 至少有一组入口通过验证；Camera 可独立匹配，不代表 Render 可用。
     bool matched() const { return status == DiscoveryStatus::matched; }
 };
 

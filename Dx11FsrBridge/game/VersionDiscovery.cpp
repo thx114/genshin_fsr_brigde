@@ -281,16 +281,17 @@ constexpr bool gap_matches(std::int64_t drift, std::uint16_t expected)
     return drift >= -tolerance(expected) && drift <= tolerance(expected);
 }
 
-void select_layout(std::vector<std::uint32_t> &methods, VersionDiscovery &out)
+VersionDiscovery select_layout(const Image &image, std::vector<std::uint32_t> &methods)
 {
     std::sort(methods.begin(), methods.end());
     methods.erase(std::unique(methods.begin(), methods.end()), methods.end());
     const auto &layout = k_fsr2_layout;
     const auto count = layout.gaps.size() + 1;
+    VersionDiscovery best { DiscoveryStatus::no_match, image.image_size };
     if (methods.size() < count)
-        return;
+        return best;
 
-    std::size_t best = 0;
+    bool saw_layout = false;
     bool tie = false;
     for (std::size_t i = 0; i <= methods.size() - count; ++i)
     {
@@ -312,26 +313,34 @@ void select_layout(std::vector<std::uint32_t> &methods, VersionDiscovery &out)
         }
         if (j != layout.gaps.size() || total_drift < -0x1000 || total_drift > 0x1000 || exact < 20)
             continue;
-        if (exact > out.exact_gaps)
+
+        // 2026-11-15：合成 PE 回归证明，间距高分或同分的窗口若没有匹配入口，
+        // 不应抢走可接管的家族。保持原序言约束，不用其它家族的 Camera 拼接 Render。
+        saw_layout = true;
+        const auto render = methods[i + layout.render_index];
+        const auto update = methods[i + layout.update_index];
+        const auto camera = methods[i + layout.camera_index];
+        const bool render_ok = matches_code(image, render, k_render_head) && matches_code(image, update, k_ucb_head);
+        const bool camera_ok = matches_code(image, camera, k_camera_head);
+        if (!render_ok && !camera_ok)
+            continue;
+
+        // 能接管 Render 的候选优先；同级仍按原来的精确间距数排名，平局不猜。
+        const bool same_priority = render_ok == best.render_compatible;
+        if (same_priority ? exact > best.exact_gaps : render_ok)
         {
-            best = i;
-            out.exact_gaps = exact;
+            best = { DiscoveryStatus::matched, image.image_size, render_ok ? render : 0, render_ok ? update : 0,
+                camera_ok ? camera : 0, exact, render_ok, camera_ok };
             tie = false;
         }
-        else if (exact == out.exact_gaps)
+        else if (same_priority && exact == best.exact_gaps)
             tie = true;
     }
-    if (out.exact_gaps == 0)
-        return;
     if (tie)
-    {
-        out.status = DiscoveryStatus::ambiguous;
-        return;
-    }
-    out.status = DiscoveryStatus::matched;
-    out.render = methods[best + layout.render_index];
-    out.update = methods[best + layout.update_index];
-    out.camera = methods[best + layout.camera_index];
+        return { .status = DiscoveryStatus::ambiguous, .image_size = image.image_size, .exact_gaps = best.exact_gaps };
+    if (!best.matched() && saw_layout)
+        best.status = DiscoveryStatus::incompatible_anchors;
+    return best;
 }
 
 bool find_pairs_in_section(Bytes code, std::uint32_t rva, Bytes render, Bytes update, std::uint32_t distance,
@@ -384,15 +393,7 @@ VersionDiscovery discover(const Image &image)
             static_cast<std::uint64_t>(code->VirtualAddress) + code->Misc.VirtualSize, methods))
             return { DiscoveryStatus::invalid_image, out.image_size };
     }
-    if (data_seen)
-    {
-        out.status = DiscoveryStatus::no_match;
-        select_layout(methods, out);
-        out.render_compatible = out.matched() && matches_code(image, out.render, k_render_head) &&
-            matches_code(image, out.update, k_ucb_head);
-        out.camera_compatible = out.matched() && matches_code(image, out.camera, k_camera_head);
-    }
-    return out;
+    return data_seen ? select_layout(image, methods) : out;
 }
 }
 
@@ -447,6 +448,7 @@ const char *discovery_status(DiscoveryStatus status)
     case DiscoveryStatus::invalid_image: return "invalid_image";
     case DiscoveryStatus::unavailable_layout: return "unavailable_layout";
     case DiscoveryStatus::no_match: return "no_match";
+    case DiscoveryStatus::incompatible_anchors: return "incompatible_anchors";
     case DiscoveryStatus::ambiguous: return "ambiguous";
     case DiscoveryStatus::matched: return "matched";
     }
