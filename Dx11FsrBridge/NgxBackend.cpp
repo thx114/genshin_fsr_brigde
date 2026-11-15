@@ -63,6 +63,7 @@
 #include "ngx/FeatureHandle.h"
 #include "ngx/ProviderDiscovery.h"
 #include "ngx/FrameResources.h"
+#include "ngx/BeforeSr.h"
 // A 阶段重构（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
 // 本 TU 只负责"取输入 → 调纯函数 → 写输出"；公式全部在 NgxParamMap.cpp，
 // 由 NgxParamMapTest.cpp 做离线位级回归（NGX=OFF 也能构建）。
@@ -3161,8 +3162,30 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
                      static_cast<int>(mdesc.Format));
     }
 
+    // 2026-11-15：复用刚录入的 Color/Depth/Motion，不让消费者重做捕获或靠下一帧的输入找深度。
+    const auto before_sr_input = [&]() noexcept -> neo::ngx::BeforeSrInput
+    {
+        using namespace neo::interop;
+        return { {
+            .frame = frame_count, .instance = instance_key, .context = ctx,
+            .color = inst.pool.color.Get(), .depth = inst.pool.depth.Get(), .motion = inst.pool.motion.Get(),
+            .render_width = shape->render_width, .render_height = shape->render_height,
+            .display_width = shape->output_width, .display_height = shape->output_height,
+            .color_storage_format = shape->color_format,
+            .flags = ((inst.feature_flags_bits & kFlagsInputDepthInvert) ? k_before_sr_depth_inverted : 0u) |
+                ((inst.feature_flags_bits & kFlagsInputMvJittered) ? k_before_sr_motion_jittered : 0u) |
+                (reset_val ? k_before_sr_reset : 0u),
+            .jitter_x = in.jitter_x, .jitter_y = in.jitter_y,
+            .motion_scale_x = in.motion_scale_x, .motion_scale_y = in.motion_scale_y,
+        }, in.color_source_view };
+    };
+    ComPtr<ID3D11Texture2D> filtered_color;
+    // F6 自己拥有 BeforeSR，不能同时再调用直连 NGX 的外部记录者。
+    if (!g_provider.evaluate_f6 && neo::ngx::has_before_sr_callback())
+        filtered_color = neo::ngx::record_before_sr(before_sr_input(), *dev.Get());
+
     // 1-4：四个纹理（资源本体，**不是视图**）
-    set_tex(g_params, NVSDK_NGX_Parameter_Color,         inst.pool.color.Get());
+    set_tex(g_params, NVSDK_NGX_Parameter_Color, filtered_color ? filtered_color.Get() : inst.pool.color.Get());
     set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.pool.depth.Get());
     set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.pool.motion.Get());
     set_tex(g_params, NVSDK_NGX_Parameter_Output,        inst.pool.output.Get());
@@ -3210,12 +3233,18 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     {
         const auto request = ++g_f6_request;
         neo::ngx::F6EvalReceiptV1 receipt {};
-        rr = g_provider.evaluate_f6(ctx, inst.feature.get(), g_params, nullptr, request, &receipt);
+        {
+            const auto input = before_sr_input();
+            const neo::ngx::BeforeSrQueryScope scope(input);
+            rr = g_provider.evaluate_f6(ctx, inst.feature.get(), g_params, nullptr, request, &receipt);
+        }
         f6_output = neo::ngx::f6_output_status(receipt, request, inst.feature.get(), ctx, inst.pool.output.Get());
     }
     else
     {
         rr = g_provider.evaluate(ctx, inst.feature.get(), g_params, nullptr);
+        // 参数袋跨帧复用，不能让它保留本次临时替代资源的裸指针。
+        if (filtered_color) set_tex(g_params, NVSDK_NGX_Parameter_Color, inst.pool.color.Get());
     }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (sampled)

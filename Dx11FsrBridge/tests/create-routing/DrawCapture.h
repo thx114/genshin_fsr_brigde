@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <optional>
 #include <vector>
 #include "../../runtime/CandidateSignature.h"
 
@@ -22,7 +24,12 @@ struct CaptureFrame
     void (*publish_render)(UINT render, UINT display) = nullptr;
     bool expect_provider = false;
     UINT color_r10 = 32, color_g10 = 96, color_b10 = 900;
+    DXGI_FORMAT color_source_view = DXGI_FORMAT_UNKNOWN;
+    std::optional<std::uint32_t> exact_provider_pixel;
 };
+
+inline constexpr std::uint32_t k_before_sr_scene_color = 0xFF286AA4u;
+inline constexpr std::uint32_t k_before_sr_filtered_color = 0xFFC9512Bu;
 
 inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     CaptureEntry entry = CaptureEntry::draw, const CaptureFrame &frame = {},
@@ -74,13 +81,16 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         desc.Format = n == 2 ? DXGI_FORMAT_R32_FLOAT : n == 3 ?
             (frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16_FLOAT) :
             (n == 0 && frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM);
+        const bool alternate_color = n == 0 && frame.color_source_view != DXGI_FORMAT_UNKNOWN;
+        if (alternate_color) desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
         desc.BindFlags = n < 7 ? D3D11_BIND_SHADER_RESOURCE :
             (compute ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_RENDER_TARGET);
         D3D11_SUBRESOURCE_DATA init {};
         if (frame.publish_render)
         {
             // 0.5/0.5 是 Genshin packed MV 的零运动，颜色让 RT 结果区别于原生像素。
-            const auto value = n == 0 ? (0xC0000000u | (frame.color_b10 << 20) | (frame.color_g10 << 10) | frame.color_r10) :
+            const auto packed_scene = 0xC0000000u | (frame.color_b10 << 20) | (frame.color_g10 << 10) | frame.color_r10;
+            const auto value = n == 0 ? (alternate_color ? k_before_sr_scene_color : packed_scene) :
                 n == 2 ? 0x3f000000u : n == 3 ? (512u << 10) | 512u : 0u;
             std::fill(pixels.begin(), pixels.begin() + static_cast<std::size_t>(desc.Width) * desc.Height, value);
             init.pSysMem = pixels.data();
@@ -89,7 +99,12 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         if (FAILED(device->CreateTexture2D(&desc, init.pSysMem ? &init : nullptr, &textures[n]))) return false;
         if (n < 7)
         {
-            if (FAILED(device->CreateShaderResourceView(textures[n].Get(), nullptr, &views[n]))) return false;
+            D3D11_SHADER_RESOURCE_VIEW_DESC view {};
+            view.Format = frame.color_source_view;
+            view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            view.Texture2D.MipLevels = 1;
+            if (FAILED(device->CreateShaderResourceView(textures[n].Get(), alternate_color ? &view : nullptr,
+                &views[n]))) return false;
             inputs[n] = views[n].Get();
         }
         else if (compute)
@@ -203,7 +218,10 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             const int delta = static_cast<int>(value) - expected;
             return delta >= -26 && delta <= 26;
         };
+        std::uint32_t raw {};
+        std::memcpy(&raw, pixel, sizeof(raw));
         const bool provider_pixel = n == 0 ? pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 :
+            frame.exact_provider_pixel ? raw == *frame.exact_provider_pixel :
             close_to_input(pixel[0], frame.color_r10) && close_to_input(pixel[1], frame.color_g10) &&
             close_to_input(pixel[2], frame.color_b10);
         const bool correct = frame.expect_provider ? provider_pixel : native_pixel;

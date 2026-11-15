@@ -12,6 +12,7 @@
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11ShaderResourceView;
 struct ID3D11Texture2D;
 
 namespace ffx12
@@ -38,6 +39,7 @@ struct FrameInput
     bool use_reactive_mask = false;
     bool use_transparency_mask = false;
     float sharpness = 0.0f;
+    ID3D11ShaderResourceView *color_source_view = nullptr; // 借用同次 Draw 中 color 的源视图。
 };
 
 // 初始化：解析游戏 D3D11 设备的适配器 → 建 D3D12 设备 → 加载 ffx-api runtime。

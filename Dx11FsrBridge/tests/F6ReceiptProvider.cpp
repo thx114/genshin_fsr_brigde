@@ -1,10 +1,12 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 #include "../ngx/F6EvalReceiptV1.h"
+#include "../interop/BeforeSrV1.h"
 #include "../third_party/ngx/nvsdk_ngx_params.h"
 
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <variant>
 
@@ -47,7 +49,10 @@ private:
 
 Parameters g_main, g_query;
 NVSDK_NGX_Handle g_feature { 17 };
-unsigned g_params_issued = 0, g_eval = 0;
+unsigned g_params_issued = 0;
+#if !defined(BEFORE_SR_LEGACY_FIXTURE)
+unsigned g_eval = 0;
+#endif
 bool g_active = false;
 }
 
@@ -95,6 +100,29 @@ EXPORT NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle *handle)
     g_active = false;
     return NVSDK_NGX_Result_Success;
 }
+#if defined(BEFORE_SR_LEGACY_FIXTURE)
+EXPORT NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext *context, const NVSDK_NGX_Handle *handle,
+    const NVSDK_NGX_Parameter *p, PFN_NVSDK_NGX_ProgressCallback)
+{
+    ID3D11Resource *color = nullptr, *output = nullptr;
+    unsigned render = 0, height = 0;
+    if (!context || !p || handle != &g_feature || !g_active ||
+        p->Get(NVSDK_NGX_Parameter_Color, &color) != NVSDK_NGX_Result_Success || !color ||
+        p->Get(NVSDK_NGX_Parameter_Output, &output) != NVSDK_NGX_Result_Success || !output ||
+        p->Get(NVSDK_NGX_Parameter_Width, &render) != NVSDK_NGX_Result_Success || !render ||
+        p->Get(NVSDK_NGX_Parameter_Height, &height) != NVSDK_NGX_Result_Success || !height)
+        return NVSDK_NGX_Result_Fail;
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D11Texture2D> target;
+    if (FAILED(output->QueryInterface(IID_PPV_ARGS(target.GetAddressOf())))) return NVSDK_NGX_Result_Fail;
+    D3D11_TEXTURE2D_DESC desc {};
+    target->GetDesc(&desc);
+    // 从实际绑定给 Evaluate 的颜色取一个精确像素，不用固定输出掩盖接错或调用顺序错误。
+    const D3D11_BOX center { render / 2, height / 2, 0, render / 2 + 1, height / 2 + 1, 1 };
+    context->CopySubresourceRegion(output, 0, desc.Width / 2, desc.Height / 2, 0, color, 0, &center);
+    return NVSDK_NGX_Result_Success;
+}
+#else
 EXPORT NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext *, const NVSDK_NGX_Handle *,
     const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback)
 {
@@ -113,7 +141,45 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
     if (p->Get(NVSDK_NGX_Parameter_Output, &output) != NVSDK_NGX_Result_Success || !output ||
         p->Get(NVSDK_NGX_Parameter_Reset, &reset) != NVSDK_NGX_Result_Success)
         return NVSDK_NGX_Result_Fail;
+    using namespace neo::interop;
+    ID3D11Resource *color = nullptr, *depth = nullptr, *motion = nullptr;
+    if (p->Get(NVSDK_NGX_Parameter_Color, &color) != NVSDK_NGX_Result_Success || !color ||
+        p->Get(NVSDK_NGX_Parameter_Depth, &depth) != NVSDK_NGX_Result_Success || !depth ||
+        p->Get(NVSDK_NGX_Parameter_MotionVectors, &motion) != NVSDK_NGX_Result_Success || !motion)
+        return NVSDK_NGX_Result_Fail;
+    const auto query = reinterpret_cast<QueryBeforeSrFrameV1>(GetProcAddress(
+        GetModuleHandleW(L"Dx11FsrBridge.dll"), k_query_before_sr_frame_v1));
+    BeforeSrFrameV1 input, mismatch, wrong_version;
+    mismatch.frame = UINT64_MAX;
+    wrong_version.version = 0;
+    const auto expected_view = (g_eval % 2 == 0) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (!query || query(context, color, depth, &input) != S_OK || input.context != context ||
+        input.color != color || input.depth != depth || input.motion != motion || input.frame != g_eval + 1 ||
+        input.render_width != 512 || input.render_height != 512 || input.display_width != 1024 ||
+        input.display_height != 1024 || input.color_storage_format != DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+        input.color_view_format != expected_view || input.color_transfer != ColorTransfer::unknown ||
+        query(context, output, depth, &mismatch) != S_FALSE || query(context, color, output, &mismatch) != S_FALSE ||
+        mismatch.frame != UINT64_MAX || query(context, color, depth, &wrong_version) != E_INVALIDARG)
+    {
+        std::puts("receipt fixture: BeforeSR input does not match current NGX parameters and source view");
+        return NVSDK_NGX_Result_Fail;
+    }
+    if (g_eval == 0)
+    {
+        bool isolated = false;
+        // 夹具把完全相同的参数交给另一线程，防止进程全局缓存恰好通过资源身份检查。
+        std::thread other([&]
+        {
+            BeforeSrFrameV1 result;
+            isolated = query(context, color, depth, &result) == S_FALSE && result.frame == 0;
+        });
+        other.join();
+        if (!isolated) return NVSDK_NGX_Result_Fail;
+    }
     ++g_eval;
+    std::printf("BeforeSR query: frame=%llu storage=%u view=%u transfer=%u\n",
+        static_cast<unsigned long long>(input.frame), input.color_storage_format, input.color_view_format,
+        static_cast<unsigned>(input.color_transfer));
     // 未交付的每一帧都必须保留 Reset；最后一次成功后的正常帧应清掉它。
     if (reset != (g_eval <= 7 ? 1 : 0)) return NVSDK_NGX_Result_Fail;
     receipt->request_id = request;
@@ -148,3 +214,15 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
         static_cast<unsigned>(f6_output_status(*receipt, request, handle, context, output)));
     return rc;
 }
+
+extern "C" __declspec(dllexport) BOOL WINAPI BeforeSrFixtureScopeClosed(ID3D11DeviceContext *context,
+    neo::interop::QueryBeforeSrFrameV1 query) noexcept
+{
+    ID3D11Resource *color = nullptr, *depth = nullptr;
+    neo::interop::BeforeSrFrameV1 result;
+    // 用刚才实际 Evaluate 的参数，不用无效参数制造一个碰巧失败的断言。
+    return g_main.Get(NVSDK_NGX_Parameter_Color, &color) == NVSDK_NGX_Result_Success && color &&
+        g_main.Get(NVSDK_NGX_Parameter_Depth, &depth) == NVSDK_NGX_Result_Success && depth &&
+        query(context, color, depth, &result) == S_FALSE && result.frame == 0;
+}
+#endif

@@ -10803,6 +10803,12 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                 }
                 ffx12::FrameInput sdk_in {};
                 sdk_in.color = color_tex;
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+                // 2026-11-15：沿匹配 color 的同一次 PS 绑定传递视图，不再查 context 或猜测纹理的读法。
+                const auto color_inputs = frame.inputs();
+                if (draw_info->color_srv_slot < color_inputs.size())
+                    sdk_in.color_source_view = color_inputs[draw_info->color_srv_slot];
+#endif
                 sdk_in.depth = depth_tex;
                 sdk_in.motion = motion_tex;
                 sdk_in.transparency = transparency_tex;
