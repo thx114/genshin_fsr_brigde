@@ -118,12 +118,22 @@ int wmain(int argc, wchar_t **argv)
         mode == L"wrapping-boundary-retry";
     const bool nested = mode == L"nested" || mode == L"nested-success" || creation_boundary;
     const bool success = mode == L"success" || mode == L"nested-success" || swapchain_mode || creation_boundary;
+    const bool cached_factory = mode.find(L"cached-factory") != std::wstring::npos;
+    const bool free_bridge = mode.find(L"free-library") != std::wstring::npos;
     const HMODULE first = LoadLibraryW(argv[2]);
     const HMODULE second = LoadLibraryW(argv[3]);
     const HMODULE imports1 = LoadLibraryW(argv[4]);
     const HMODULE imports2 = LoadLibraryW(argv[5]);
     if (!first || !second || !imports1 || !imports2 || first == second)
         return 3;
+    wchar_t cached_system[MAX_PATH] {};
+    GetSystemDirectoryW(cached_system, MAX_PATH);
+    const HMODULE cached_runtime = cached_factory ?
+        LoadLibraryW((std::filesystem::path(cached_system) / L"d3d11.dll").c_str()) : nullptr;
+    const auto cached_device = cached_factory ? reinterpret_cast<decltype(&D3D11CreateDevice)>(
+        GetProcAddress(cached_runtime, "D3D11CreateDevice")) : nullptr;
+    const auto cached_combined = cached_factory ? reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(
+        GetProcAddress(cached_runtime, "D3D11CreateDeviceAndSwapChain")) : nullptr;
     const auto original_get_proc = &GetProcAddress;
     const char *names[] = { "D3D11CreateDevice", "D3D11CreateDeviceAndSwapChain" };
     for (const char *name : names)
@@ -175,6 +185,14 @@ int wmain(int argc, wchar_t **argv)
         if (!capture_receipt || !set_import(bridge, "OutputDebugStringA",
             reinterpret_cast<FARPROC>(&capture_debug_line), nullptr))
             return 12;
+    }
+    if (free_bridge)
+    {
+        // 2026-11-15：已公开 IAT/vtable 回调的桥必须存活至进程退出。
+        // 释放宿主 LoadLibrary 引用后继续真实绘制，覆盖仅检查模块句柄的盲区。
+        expect(FreeLibrary(bridge) != FALSE, "host releases its bridge module reference");
+        expect(GetModuleHandleW(bridge_path.c_str()) == bridge,
+            "bridge callbacks remain mapped after host FreeLibrary");
     }
 
     // 反向查询第二提供者，不能让查询顺序或 IAT 首次绑定决定 original。
@@ -278,8 +296,9 @@ int wmain(int argc, wchar_t **argv)
         wchar_t system[MAX_PATH] {};
         GetSystemDirectoryW(system, MAX_PATH);
         const HMODULE runtime = LoadLibraryW((std::filesystem::path(system) / L"d3d11.dll").c_str());
-        const auto create = reinterpret_cast<decltype(&D3D11CreateDevice)>(GetProcAddress(runtime, names[0]));
-        expect(belongs_to(bridge, reinterpret_cast<void *>(create)), "system WARP create actually enters bridge");
+        const auto create = cached_factory ? cached_device :
+            reinterpret_cast<decltype(&D3D11CreateDevice)>(GetProcAddress(runtime, names[0]));
+        expect(cached_factory || belongs_to(bridge, reinterpret_cast<void *>(create)), "system WARP create route is callable");
         for (unsigned round = 0; round < 2; ++round)
         {
             ID3D11Device *device = nullptr;
@@ -299,8 +318,9 @@ int wmain(int argc, wchar_t **argv)
                 desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
                 desc.OutputWindow = window;
                 desc.Windowed = TRUE;
-                const auto combined = reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(GetProcAddress(runtime, names[1]));
-                expect(belongs_to(bridge, reinterpret_cast<void *>(combined)),
+                const auto combined = cached_factory ? cached_combined :
+                    reinterpret_cast<decltype(&D3D11CreateDeviceAndSwapChain)>(GetProcAddress(runtime, names[1]));
+                expect(cached_factory || belongs_to(bridge, reinterpret_cast<void *>(combined)),
                     "system combined creation actually enters bridge");
                 created = combined(nullptr, driver, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
                     &desc, &chain, &device, nullptr, nullptr);

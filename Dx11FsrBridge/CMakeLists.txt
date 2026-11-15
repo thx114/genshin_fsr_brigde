@@ -392,9 +392,19 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     fsrbridge_configure_test(CreateRouteIntegrationTest)
     target_compile_definitions(CreateRouteIntegrationTest PRIVATE
         DX11FSRBRIDGE_TEST_NGX=$<BOOL:${DX11FSRBRIDGE_ENABLE_NGX}>)
+    add_executable(SystemD3D11FactoriesTest tests/SystemD3D11FactoriesTest.cpp)
+    target_include_directories(SystemD3D11FactoriesTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+    target_link_libraries(SystemD3D11FactoriesTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/detours/detours.lib")
+    fsrbridge_configure_test(SystemD3D11FactoriesTest)
+    add_test(NAME SystemD3D11FactoriesTest COMMAND SystemD3D11FactoriesTest)
+    set_tests_properties(SystemD3D11FactoriesTest PROPERTIES TIMEOUT 20)
     foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4
         resize-routing resize-routing-reversed warp hardware warp-device-only hardware-device-only
         warp-context-only hardware-context-only warp-combined-device-only hardware-combined-device-only
+        warp-cached-factory hardware-cached-factory warp-cached-factory-device-only hardware-cached-factory-device-only
+        warp-cached-factory-combined-device-only hardware-cached-factory-combined-device-only
+        warp-cached-factory-free-library hardware-cached-factory-free-library
         wrapping-boundary wrapping-boundary-combined wrapping-boundary-retry)
         add_test(NAME CreateRouteIntegration-${mode} COMMAND CreateRouteIntegrationTest
             "$<TARGET_FILE:Dx11FsrBridge>"

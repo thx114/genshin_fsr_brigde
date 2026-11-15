@@ -16,6 +16,7 @@
 #include "ComVtableMethods.h"
 #include "InterfaceVtableLayout.h"
 #include "D3D11CreationScope.h"
+#include "SystemD3D11Factories.h"
 #include "Fsr2FamilyTakeover.h"
 #include "Il2CppCallSiteHook.h"
 #include "TransparentJitterHook.h"
@@ -1232,6 +1233,12 @@ HRESULT WINAPI hooked_create_device(
 
 using DeviceCreateRoutes = CreateFunctionRoutes<create_device_fn, &hooked_create_device>;
 using CombinedCreateRoutes = CreateFunctionRoutes<create_device_and_swapchain_fn, &hooked_create_device_and_swapchain>;
+SystemD3D11Factories g_system_d3d11_factories;
+HRESULT WINAPI system_create_device(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
+    const D3D_FEATURE_LEVEL *, UINT, UINT, ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+HRESULT WINAPI system_create_combined(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT,
+    const D3D_FEATURE_LEVEL *, UINT, UINT, const DXGI_SWAP_CHAIN_DESC *, IDXGISwapChain **,
+    ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
 void log_create_route(const char *api, void *target, void *entry);
 
 void *resolve_create_device(void *target)
@@ -6162,6 +6169,36 @@ void install_hdr_output_desc_probe_from_adapter(IDXGIAdapter *adapter)
 
 void install_create_hooks_for_loaded_modules()
 {
+    wchar_t system[MAX_PATH] {};
+    if (GetSystemDirectoryW(system, MAX_PATH) != 0)
+    {
+        const auto path = std::filesystem::path(system) / L"d3d11.dll";
+        if (const HMODULE module = GetModuleHandleW(path.c_str()))
+        {
+            const auto get = g_original_get_proc_address ? g_original_get_proc_address : &GetProcAddress;
+            const auto device = DeviceCreateRoutes::target(
+                reinterpret_cast<create_device_fn>(get(module, "D3D11CreateDevice")));
+            const auto combined = CombinedCreateRoutes::target(
+                reinterpret_cast<create_device_and_swapchain_fn>(get(module, "D3D11CreateDeviceAndSwapChain")));
+            bool attempted = false;
+            const LONG result = g_system_d3d11_factories.install(device, combined,
+                &system_create_device, &system_create_combined, attempted);
+            if (attempted)
+            {
+                for (const auto &[api, receipt] : {
+                    std::pair { "D3D11CreateDevice", g_system_d3d11_factories.device_receipt },
+                    std::pair { "D3D11CreateDeviceAndSwapChain", g_system_d3d11_factories.combined_receipt } })
+                {
+                    LOG_INFO(blog::cat::hook, "d3d11_system_factory api=" + std::string(api) +
+                        " status=" + std::to_string(result) +
+                        " export=" + hex64(reinterpret_cast<std::uintptr_t>(receipt.entry)) +
+                        " target=" + hex64(reinterpret_cast<std::uintptr_t>(receipt.target)) +
+                        " target_module=" + module_path_from_address(receipt.target) +
+                        " trampoline=" + hex64(reinterpret_cast<std::uintptr_t>(receipt.trampoline)));
+                }
+            }
+        }
+    }
     std::size_t swapchain_hooks = 0;
     std::size_t device_hooks = 0;
 
@@ -15103,7 +15140,7 @@ void observe_created_device(ID3D11Device *device, ID3D11DeviceContext *context)
         owned_device->Release();
 }
 
-HRESULT WINAPI hooked_create_device_and_swapchain(
+HRESULT create_device_and_swapchain_with(create_device_and_swapchain_fn next,
     IDXGIAdapter *adapter,
     D3D_DRIVER_TYPE driver_type,
     HMODULE software,
@@ -15130,7 +15167,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
         LOG_INFO(blog::cat::hdr, "native_ldr_swapchain_format from=29/R8G8B8A8_UNORM_SRGB to=28/R8G8B8A8_UNORM api=CreateDeviceAndSwapChain");
     }
 
-    const HRESULT hr = CombinedCreateRoutes::original()(
+    const HRESULT hr = next(
         adapter,
         driver_type,
         software,
@@ -15160,7 +15197,7 @@ HRESULT WINAPI hooked_create_device_and_swapchain(
     return hr;
 }
 
-HRESULT WINAPI hooked_create_device(
+HRESULT create_device_with(create_device_fn next,
     IDXGIAdapter *adapter,
     D3D_DRIVER_TYPE driver_type,
     HMODULE software,
@@ -15174,7 +15211,7 @@ HRESULT WINAPI hooked_create_device(
 {
     // 旧 On12 引导移除（旧方案隔离）。
     D3D11CreationScope creation;
-    const HRESULT hr = DeviceCreateRoutes::original()(
+    const HRESULT hr = next(
         adapter,
         driver_type,
         software,
@@ -15192,6 +15229,40 @@ HRESULT WINAPI hooked_create_device(
         LOG_INFO(blog::cat::core, "hooked D3D11CreateDevice");
     }
     return hr;
+}
+
+HRESULT WINAPI hooked_create_device(IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type, HMODULE software,
+    UINT flags, const D3D_FEATURE_LEVEL *levels, UINT count, UINT sdk, ID3D11Device **device,
+    D3D_FEATURE_LEVEL *level, ID3D11DeviceContext **context)
+{
+    return create_device_with(DeviceCreateRoutes::original(), adapter, driver_type, software,
+        flags, levels, count, sdk, device, level, context);
+}
+
+HRESULT WINAPI system_create_device(IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type, HMODULE software,
+    UINT flags, const D3D_FEATURE_LEVEL *levels, UINT count, UINT sdk, ID3D11Device **device,
+    D3D_FEATURE_LEVEL *level, ID3D11DeviceContext **context)
+{
+    return create_device_with(g_system_d3d11_factories.device, adapter, driver_type, software,
+        flags, levels, count, sdk, device, level, context);
+}
+
+HRESULT WINAPI hooked_create_device_and_swapchain(IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type,
+    HMODULE software, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT count, UINT sdk,
+    const DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **swapchain, ID3D11Device **device,
+    D3D_FEATURE_LEVEL *level, ID3D11DeviceContext **context)
+{
+    return create_device_and_swapchain_with(CombinedCreateRoutes::original(), adapter, driver_type,
+        software, flags, levels, count, sdk, desc, swapchain, device, level, context);
+}
+
+HRESULT WINAPI system_create_combined(IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type,
+    HMODULE software, UINT flags, const D3D_FEATURE_LEVEL *levels, UINT count, UINT sdk,
+    const DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **swapchain, ID3D11Device **device,
+    D3D_FEATURE_LEVEL *level, ID3D11DeviceContext **context)
+{
+    return create_device_and_swapchain_with(g_system_d3d11_factories.combined, adapter, driver_type,
+        software, flags, levels, count, sdk, desc, swapchain, device, level, context);
 }
 
 HRESULT STDMETHODCALLTYPE hooked_factory_create_swap_chain(IDXGIFactory *factory, IUnknown *device, DXGI_SWAP_CHAIN_DESC *desc, IDXGISwapChain **swapchain)
