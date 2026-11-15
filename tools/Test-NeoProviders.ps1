@@ -69,7 +69,8 @@ foreach ($case in $Cases)
     $null = $process.Handle # 保留句柄，PS 5.1 才能在进程结束后读取 ExitCode。
     $complete = $process.WaitForExit($TimeoutSeconds * 1000)
     if (-not $complete) { $process.Kill(); $process.WaitForExit() }
-    $pixels = @(Select-Lines $stdout '^target=|^provider (host|export):|^receipt (host|fixture):')
+    $pixels = @(Select-Lines "$path\provider-receipt.txt" '^target=|^provider (host|export):|^receipt host:')
+    $mock = if ($case -eq 'ngx-receipt') { @(Select-Lines $stdout '^receipt fixture:') } else { @() }
     $bridge = @(Select-Lines "$path\Dx11FsrBridge.log" 'ffx12_result|ngx_core release_all|ngx_core create_feature|ngx_in jitter|sdk_selected|ffx12_version|FFX : FSR|ngx_out')
     $f6 = @(Select-Lines "$path\OptiScaler.log" 'NVSDK_NGX_D3D11_.*Feature|Hotfix.SkipFirstFrames:|F6 evaluate receipt v1')
     $writes = @($bridge -match 'rc=DISPATCH_OK copy_enqueued=1').Count
@@ -113,12 +114,12 @@ foreach ($case in $Cases)
                 @($f6 -match 'NVSDK_NGX_D3D11_EvaluateFeature Handle:').Count -eq 2
         }
         'ngx-receipt' {
-            $passed = $passed -and @($pixels -match '^receipt fixture:').Count -eq 8 -and
-                @($pixels -match '^receipt fixture: call=1 reset=1 rc=1 proof=1$').Count -eq 1 -and
-                @($pixels -match '^receipt fixture: call=[2-5] reset=1 rc=1 proof=0$').Count -eq 4 -and
-                @($pixels -match '^receipt fixture: call=6 reset=1 rc=BAD00000 proof=2$').Count -eq 1 -and
-                @($pixels -match '^receipt fixture: call=7 reset=1 rc=1 proof=2$').Count -eq 1 -and
-                @($pixels -match '^receipt fixture: call=8 reset=0 rc=1 proof=2$').Count -eq 1
+            $passed = $passed -and @($mock -match '^receipt fixture:').Count -eq 8 -and
+                @($mock -match '^receipt fixture: call=1 reset=1 rc=1 proof=1$').Count -eq 1 -and
+                @($mock -match '^receipt fixture: call=[2-5] reset=1 rc=1 proof=0$').Count -eq 4 -and
+                @($mock -match '^receipt fixture: call=6 reset=1 rc=BAD00000 proof=2$').Count -eq 1 -and
+                @($mock -match '^receipt fixture: call=7 reset=1 rc=1 proof=2$').Count -eq 1 -and
+                @($mock -match '^receipt fixture: call=8 reset=0 rc=1 proof=2$').Count -eq 1
         }
         'ngx-resize' {
             $passed = $passed -and @($bridge -match 'copy_enqueued=1 evidence=ngx_status_only').Count -ge 1 -and
@@ -134,7 +135,7 @@ foreach ($case in $Cases)
     }
     $row = [pscustomobject]@{
         Case = $case; Path = $path; PID = $process.Id; Exit = $process.ExitCode; Timeout = -not $complete; Pass = $passed
-        SelectedFsr = $selected; Pixels = $pixels; Bridge = $bridge; F6 = $f6
+        SelectedFsr = $selected; Pixels = $pixels; Mock = @($mock); Bridge = $bridge; F6 = $f6
         Identity = @(Get-ChildItem -LiteralPath $path -Recurse -File | Where-Object Extension -in '.dll','.exe','.ini' |
             ForEach-Object { [pscustomobject]@{ File = $_.FullName.Substring($path.Length + 1); SHA256 = (Get-FileHash -LiteralPath $_.FullName).Hash } })
     }

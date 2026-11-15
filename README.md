@@ -115,9 +115,10 @@ powershell -ExecutionPolicy Bypass -File .\Build-OnlineInstaller.ps1 -Configurat
 - **游戏更新**：优先用可执行段内的相对方法布局定位 Render/Update/Camera，菜单按独立签名确认。
   歧义或验证失败不采用该候选；只有通过范围及序言检查的配置地址可以兜底。只读检查用
   `FsrVersionCheck.exe <游戏 exe>`（打开 `DX11FSRBRIDGE_BUILD_TESTS` 后构建），不会启动游戏。
-- **F6**：显式选择 `Ffx12Backend=ngx`、`NgxProvider=external` 时走外部 NGX；回执扩展由同一 DLL 提供。
-  回执缺失或不匹配时不写回、不推进历史，按原配置放行；不带扩展的旧 DLL 保持状态码兼容，日志会标为
-  `evidence=ngx_status_only`，它不证明该帧有新输出。
+- **F6**：显式选择 `Ffx12Backend=ngx`、`NgxProvider=external` 时走外部 NGX。支持 V1 的 DLL 必须证明
+  本次交付才写回；无法证明时不推进历史，按原配置回退。不带扩展的旧 DLL 维持状态码兼容，标记为
+  `evidence=ngx_status_only`，它不证明该帧有新输出。已用真实 `Dx11Upscaler=dlss_12`
+  验证正常改色、尺寸切换和首帧跳过；测试 case 为 `ngx-v1`、`ngx-v1-resize`、`ngx-v1-skip-control`。
 - **开发验证**：用 `ctest --test-dir <构建目录> --output-on-failure` 运行 WARP/设备接入、归属、版本和 F6 回执夹具。
   `tools/Test-NeoProviders.ps1` 与 `tools/Test-NeoF6Interop.ps1` 额外使用指定的 FFX/F6 DLL 和测试配置来跑隔离宿主，
   不部署到游戏。带 `-Cases` 的调用请在 PowerShell 中直接执行脚本，以保留数组参数。

@@ -121,7 +121,9 @@ waits for the next Present to hand off the current frame.
   `FsrVersionCheck.exe <game executable>` to inspect a file without launching it.
 - **F6:** `Ffx12Backend=ngx` with `NgxProvider=external` selects external NGX. Providers that advertise
   the receipt extension must prove output for that call before copyback. Legacy providers still use the
-  status-only ABI and log `evidence=ngx_status_only`; that is not proof of fresh pixels.
+  status-only ABI and log `evidence=ngx_status_only`; that is not proof of fresh pixels. A real F6 provider
+  with `Dx11Upscaler=dlss_12` passed changing input, resizing, and first-frame skip in the isolated host.
+  Run these checks with `ngx-v1`, `ngx-v1-resize`, and `ngx-v1-skip-control`.
 - **Development tests:** `ctest --test-dir <build directory> --output-on-failure` runs device and WARP tests,
   frame attribution, version discovery, and the F6 receipt fixture. `tools/Test-NeoProviders.ps1` and
   `tools/Test-NeoF6Interop.ps1` run isolated hardware hosts with pinned DLLs and test settings, not a game

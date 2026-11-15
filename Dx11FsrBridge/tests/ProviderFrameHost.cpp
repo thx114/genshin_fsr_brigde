@@ -8,6 +8,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <share.h>
 #include <string_view>
 
 namespace
@@ -97,6 +99,11 @@ int wmain(int argc, wchar_t **argv)
     const auto provider = root / (receipt ? L"F6ReceiptProvider.dll" : ngx ? L"OptiScaler.dll" :
         reject ? L"FsrRejectProvider.dll" : L"amd_fidelityfx_upscaler_dx12.dll");
     if (!std::filesystem::is_regular_file(bridge) || (!missing && !std::filesystem::is_regular_file(provider))) return 2;
+    // SDK 日志可在多个线程写 stdout，不能与机器验收行共享输出流。
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> observations(
+        _wfsopen((root / L"provider-receipt.txt").c_str(), L"wb", _SH_DENYNO), &std::fclose);
+    if (!observations) return 2;
+    std::setvbuf(observations.get(), nullptr, _IONBF, 0);
     const auto module = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     const auto ucb = reinterpret_cast<std::uintptr_t>(k_methods.data()) - module;
     // 调用者提供独立目录；只写本夹具所需的配置，不使用或改写安装/发布配置。
@@ -124,7 +131,7 @@ int wmain(int argc, wchar_t **argv)
         if (!opti || !GetProcAddress(opti, "NVSDK_NGX_D3D11_Init_Ext")) return 3;
         const bool has_receipt = GetProcAddress(opti, neo::ngx::k_f6_evaluate_v1) != nullptr;
         const bool expect_receipt = receipt || real_receipt;
-        std::printf("provider export: v1=%d expected=%d\n", has_receipt, expect_receipt);
+        std::fprintf(observations.get(), "provider export: v1=%d expected=%d\n", has_receipt, expect_receipt);
         if (has_receipt != expect_receipt) return 3;
     }
     if (!LoadLibraryW(bridge.c_str())) return 3;
@@ -138,34 +145,38 @@ int wmain(int argc, wchar_t **argv)
         std::printf("hardware D3D11 device failed: %08lX\n", static_cast<unsigned long>(hr));
         return 3;
     }
+    const auto capture = [&](CaptureEntry entry, const CaptureFrame &frame)
+    {
+        return draw_capture(device.Get(), context.Get(), entry, frame, observations.get());
+    };
     // 真实 V1 skip 用例先要求原生像素，再要求不同颜色的提供方输出；不能靠旧输出通过。
     const CaptureFrame first { 512, 1024, publish_render, !fallback && !receipt && !receipt_skip };
     const CaptureFrame second { 512, 1024, publish_render, !fallback && !receipt, 704, 352, 128 };
-    const bool draw = draw_capture(device.Get(), context.Get(), CaptureEntry::draw, first);
-    const bool indexed = draw_capture(device.Get(), context.Get(), CaptureEntry::indexed, second);
+    const bool draw = capture(CaptureEntry::draw, first);
+    const bool indexed = capture(CaptureEntry::indexed, second);
     bool changed_size = true, restored_size = true;
     if (resize)
     {
         // 同一个 Render 实例在两个全尺寸池之间切换；不用原生像素或前一帧蓝色蒙混通过。
         const CaptureFrame smaller { 384, 768, publish_render, true, 192, 704, 352 };
-        changed_size = draw_capture(device.Get(), context.Get(), CaptureEntry::draw, smaller);
-        restored_size = draw_capture(device.Get(), context.Get(), CaptureEntry::indexed, first);
+        changed_size = capture(CaptureEntry::draw, smaller);
+        restored_size = capture(CaptureEntry::indexed, first);
     }
     if (receipt)
     {
-        const bool wrong_context = draw_capture(device.Get(), context.Get(), CaptureEntry::draw, first);
-        const bool wrong_output = draw_capture(device.Get(), context.Get(), CaptureEntry::indexed, second);
-        const bool unknown_status = draw_capture(device.Get(), context.Get(), CaptureEntry::draw, first);
-        const bool failed_ordered = draw_capture(device.Get(), context.Get(), CaptureEntry::indexed, second);
+        const bool wrong_context = capture(CaptureEntry::draw, first);
+        const bool wrong_output = capture(CaptureEntry::indexed, second);
+        const bool unknown_status = capture(CaptureEntry::draw, first);
+        const bool failed_ordered = capture(CaptureEntry::indexed, second);
         const CaptureFrame ordered { 512, 1024, publish_render, true, 192, 704, 352 };
-        const bool confirmed = draw_capture(device.Get(), context.Get(), CaptureEntry::draw, ordered);
-        const bool continued = draw_capture(device.Get(), context.Get(), CaptureEntry::indexed, ordered);
-        std::printf("receipt host: missing=%d stale=%d context=%d output=%d unknown=%d failed=%d ordered=%d continued=%d\n",
+        const bool confirmed = capture(CaptureEntry::draw, ordered);
+        const bool continued = capture(CaptureEntry::indexed, ordered);
+        std::fprintf(observations.get(), "receipt host: missing=%d stale=%d context=%d output=%d unknown=%d failed=%d ordered=%d continued=%d\n",
             draw, indexed, wrong_context, wrong_output, unknown_status, failed_ordered, confirmed, continued);
         return draw && indexed && wrong_context && wrong_output && unknown_status && failed_ordered &&
             confirmed && continued ? 0 : 1;
     }
-    std::printf("provider host: draw=%d indexed=%d resize_requested=%d resized=%d restored=%d\n",
+    std::fprintf(observations.get(), "provider host: draw=%d indexed=%d resize_requested=%d resized=%d restored=%d\n",
         draw, indexed, resize, changed_size, restored_size);
     return draw && indexed && changed_size && restored_size ? 0 : 1;
 }

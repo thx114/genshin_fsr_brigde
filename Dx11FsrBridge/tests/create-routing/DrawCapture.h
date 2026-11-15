@@ -25,7 +25,8 @@ struct CaptureFrame
 };
 
 inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
-    CaptureEntry entry = CaptureEntry::draw, const CaptureFrame &frame = {})
+    CaptureEntry entry = CaptureEntry::draw, const CaptureFrame &frame = {},
+    std::FILE *pixel_receipt = nullptr)
 {
     using Microsoft::WRL::ComPtr;
     const bool compute = entry == CaptureEntry::dispatch;
@@ -206,8 +207,8 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             close_to_input(pixel[0], frame.color_r10) && close_to_input(pixel[1], frame.color_g10) &&
             close_to_input(pixel[2], frame.color_b10);
         const bool correct = frame.expect_provider ? provider_pixel : native_pixel;
-        if (frame.publish_render)
-            std::printf("target=%u pixel=%u,%u,%u,%u expected=%s ok=%u\n", n,
+        if (pixel_receipt)
+            std::fprintf(pixel_receipt, "target=%u pixel=%u,%u,%u,%u expected=%s ok=%u\n", n,
                 pixel[0], pixel[1], pixel[2], pixel[3], frame.expect_provider ? "provider" : "native", correct);
         context->Unmap(readback.Get(), 0);
         pixels_match &= correct;
