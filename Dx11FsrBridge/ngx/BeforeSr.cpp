@@ -13,17 +13,29 @@ HRESULT WINAPI callback_in_progress(const BeforeSrFrameV1 *, ID3D11Texture2D **)
 std::atomic<RecordBeforeSrV1> g_callback { nullptr };
 thread_local const neo::ngx::BeforeSrInput *g_current_input = nullptr;
 
+DXGI_FORMAT copied_color_view_format(const neo::ngx::BeforeSrInput &input) noexcept
+{
+    if (!input.source_color || !input.source_view) return DXGI_FORMAT_UNKNOWN;
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc {};
+    input.source_view->GetDesc(&desc);
+    if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip != 0 ||
+        desc.Texture2D.MipLevels != 1)
+        return DXGI_FORMAT_UNKNOWN;
+
+    // 2026-11-15：同尺寸 typeless 副本也能创建相同的 typed SRV，唯有 CopyResource 的源能描述实际读法。
+    ComPtr<ID3D11Resource> viewed;
+    input.source_view->GetResource(viewed.GetAddressOf());
+    if (viewed.Get() == input.source_color) return desc.Format;
+    ComPtr<IUnknown> view_identity, source_identity;
+    return viewed && SUCCEEDED(viewed.As(&view_identity)) &&
+        SUCCEEDED(input.source_color->QueryInterface(IID_PPV_ARGS(source_identity.GetAddressOf()))) &&
+        view_identity.Get() == source_identity.Get() ? desc.Format : DXGI_FORMAT_UNKNOWN;
+}
+
 BeforeSrFrameV1 describe_input(const neo::ngx::BeforeSrInput &input) noexcept
 {
     BeforeSrFrameV1 frame = input.frame;
-    if (input.source_view)
-    {
-        D3D11_SHADER_RESOURCE_VIEW_DESC desc {};
-        input.source_view->GetDesc(&desc);
-        // 只有全纹理原字节副本与源视图读同一子资源时，才把源视图语义交给下游。
-        if (desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && desc.Texture2D.MostDetailedMip == 0)
-            frame.color_view_format = desc.Format;
-    }
+    frame.color_view_format = copied_color_view_format(input);
     return frame;
 }
 

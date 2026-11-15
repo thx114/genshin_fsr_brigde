@@ -227,6 +227,8 @@ struct FinalSceneSnapshotState
 struct ColorSourceWrite
 {
     std::uint64_t sequence = 0;
+    std::uint64_t context = 0;
+    ResourceInfo output {};
     std::string stage;
     std::uint64_t shader_hash = 0;
     std::size_t shader_size = 0;
@@ -1759,49 +1761,6 @@ void update_constant_buffer_array(std::array<BufferInfo, D3D11_COMMONSHADER_CONS
     }
 }
 
-std::vector<std::uint8_t> readback_buffer_bytes(ID3D11DeviceContext *context, std::uint64_t resource_key)
-{
-    if (context == nullptr || resource_key == 0)
-        return {};
-
-    auto *source = reinterpret_cast<ID3D11Buffer *>(resource_key);
-    D3D11_BUFFER_DESC source_desc {};
-    source->GetDesc(&source_desc);
-    if (source_desc.ByteWidth == 0)
-        return {};
-
-    D3D11_BUFFER_DESC staging_desc {};
-    staging_desc.ByteWidth = source_desc.ByteWidth;
-    staging_desc.Usage = D3D11_USAGE_STAGING;
-    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-    ID3D11Device *device = nullptr;
-    context->GetDevice(&device);
-    ID3D11Buffer *staging = nullptr;
-    const HRESULT create_result = device != nullptr
-        ? device->CreateBuffer(&staging_desc, nullptr, &staging)
-        : E_POINTER;
-    if (device != nullptr)
-        device->Release();
-    if (FAILED(create_result) || staging == nullptr)
-        return {};
-
-    context->CopyResource(staging, source);
-    D3D11_MAPPED_SUBRESOURCE mapped {};
-    const HRESULT map_result = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(map_result) || mapped.pData == nullptr)
-    {
-        staging->Release();
-        return {};
-    }
-
-    const auto *bytes = static_cast<const std::uint8_t *>(mapped.pData);
-    std::vector<std::uint8_t> result(bytes, bytes + source_desc.ByteWidth);
-    context->Unmap(staging, 0);
-    staging->Release();
-    return result;
-}
-
 void append_constant_buffer_list(std::ostringstream &out, const char *label, const std::array<BufferInfo, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> &buffers)
 {
     bool wrote_any = false;
@@ -2110,13 +2069,21 @@ bool is_color_source_trace_surface(
     return !is_depth_like_format(info.format);
 }
 
+bool color_source_trace_pending() noexcept
+{
+    return g_config.fsr2_trace_color_producers &&
+        (!g_fsr2_color_producers_dumped.load(std::memory_order_relaxed) ||
+         !g_fsr2_motion_producers_dumped.load(std::memory_order_relaxed));
+}
+
 void record_color_source_call(
+    ID3D11DeviceContext *context,
     const char *stage,
     std::uint32_t call_x,
     std::uint32_t call_y,
     std::uint32_t call_z)
 {
-    if (!g_config.fsr2_trace_color_producers || stage == nullptr)
+    if (!color_source_trace_pending() || stage == nullptr)
         return;
 
     DispatchState snapshot {};
@@ -2128,6 +2095,7 @@ void record_color_source_call(
     ColorSourceWrite write;
     write.sequence = g_color_source_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     write.stage = stage;
+    write.context = reinterpret_cast<std::uint64_t>(context);
     write.call_x = call_x;
     write.call_y = call_y;
     write.call_z = call_z;
@@ -2190,15 +2158,17 @@ void record_color_source_call(
     for (const ResourceInfo &output : outputs)
     {
         auto &history = g_color_source_writes[output.resource_key];
+        write.output = output;
         history.push_back(write);
         while (history.size() > 1024)
             history.pop_front();
     }
 }
 
-void record_color_source_copy(const ResourceInfo &destination, const ResourceInfo &source, const char *stage)
+void record_color_source_copy(ID3D11DeviceContext *context, const ResourceInfo &destination,
+    const ResourceInfo &source, const char *stage)
 {
-    if (!g_config.fsr2_trace_color_producers)
+    if (!color_source_trace_pending())
         return;
     std::uint32_t output_width = 0;
     std::uint32_t output_height = 0;
@@ -2214,6 +2184,8 @@ void record_color_source_copy(const ResourceInfo &destination, const ResourceInf
 
     ColorSourceWrite write;
     write.sequence = g_color_source_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    write.context = reinterpret_cast<std::uint64_t>(context);
+    write.output = destination;
     write.stage = stage != nullptr ? stage : "copy";
     if (source.resource_key != 0)
         write.inputs.push_back(source);
@@ -2228,6 +2200,10 @@ void record_color_source_copy(const ResourceInfo &destination, const ResourceInf
 void write_color_source_record_json(std::ofstream &out, const ColorSourceWrite &write)
 {
     out << "{\"sequence\":" << write.sequence
+        << ",\"context\":\"" << hex64(write.context) << "\""
+        << ",\"output_resource\":\"" << hex64(write.output.resource_key) << "\""
+        << ",\"output_format\":" << static_cast<std::uint32_t>(write.output.format)
+        << ",\"output_view_format\":" << static_cast<std::uint32_t>(write.output.view_format)
         << ",\"stage\":\"" << write.stage << "\""
         << ",\"shader\":\"" << hex64(write.shader_hash) << "\""
         << ",\"shader_size\":" << write.shader_size
@@ -2244,7 +2220,8 @@ void write_color_source_record_json(std::ofstream &out, const ColorSourceWrite &
         out << "{\"resource\":\"" << hex64(input.resource_key) << "\""
             << ",\"width\":" << input.width
             << ",\"height\":" << input.height
-            << ",\"format\":" << static_cast<std::uint32_t>(input.format) << "}";
+            << ",\"format\":" << static_cast<std::uint32_t>(input.format)
+            << ",\"view_format\":" << static_cast<std::uint32_t>(input.view_format) << "}";
     }
     out << "],\"constant_buffers\":[";
     for (std::size_t index = 0; index < write.constant_buffers.size(); ++index)
@@ -2271,17 +2248,11 @@ void write_color_source_record_json(std::ofstream &out, const ColorSourceWrite &
     out << "]}";
 }
 
-void maybe_dump_source_history(
-    ID3D11DeviceContext *context,
-    std::uint64_t target_resource_key,
-    const wchar_t *file_stem,
-    const char *log_label,
+void dump_source_history(ID3D11DeviceContext *context, const ResourceInfo &target,
+    std::uint64_t instance, std::uint64_t render_frame, const wchar_t *file_stem, const char *log_label,
     std::atomic_bool &dumped)
 {
-    if (!g_config.fsr2_trace_color_producers || target_resource_key == 0 || file_stem == nullptr ||
-        log_label == nullptr ||
-        (GetAsyncKeyState(VK_F6) & 0x8000) == 0 ||
-        dumped.exchange(true, std::memory_order_relaxed))
+    if (target.resource_key == 0 || dumped.exchange(true, std::memory_order_relaxed))
     {
         return;
     }
@@ -2290,7 +2261,7 @@ void maybe_dump_source_history(
     std::unordered_map<std::uint64_t, ColorSourceWrite> related_writes;
     {
         std::lock_guard lock(g_color_source_mutex);
-        const auto target_it = g_color_source_writes.find(target_resource_key);
+        const auto target_it = g_color_source_writes.find(target.resource_key);
         if (target_it != g_color_source_writes.end())
             target_writes = target_it->second;
         for (const ColorSourceWrite &write : target_writes)
@@ -2312,7 +2283,14 @@ void maybe_dump_source_history(
         return;
     }
 
-    out << "{\"target_resource\":\"" << hex64(target_resource_key) << "\",\"writes\":[";
+    out << "{\"observation\":\"sdk_input_write_candidates\",\"pid\":" << GetCurrentProcessId()
+        << ",\"context\":\"" << hex64(reinterpret_cast<std::uint64_t>(context)) << "\""
+        << ",\"instance\":\"" << hex64(instance) << "\",\"render_frame\":" << render_frame
+        << ",\"target_resource\":\"" << hex64(target.resource_key) << "\""
+        << ",\"target_width\":" << target.width << ",\"target_height\":" << target.height
+        << ",\"target_format\":" << static_cast<std::uint32_t>(target.format)
+        << ",\"target_view_format\":" << static_cast<std::uint32_t>(target.view_format)
+        << ",\"writes\":[";
     for (std::size_t index = 0; index < target_writes.size(); ++index)
     {
         if (index != 0)
@@ -2329,76 +2307,35 @@ void maybe_dump_source_history(
         write_color_source_record_json(out, write);
         out << "}";
     }
-    out << "],\"last_write_constant_buffers\":[";
-    if (!target_writes.empty())
-    {
-        const ColorSourceWrite &last_write = target_writes.back();
-        for (std::size_t index = 0; index < last_write.constant_buffers.size(); ++index)
-        {
-            if (index != 0)
-                out << ",";
-            const BufferInfo &buffer = last_write.constant_buffers[index];
-            std::vector<std::uint8_t> snapshot = readback_buffer_bytes(context, buffer.resource_key);
-            const char *source = "gpu_readback";
-            if (snapshot.empty())
-            {
-                snapshot = lookup_buffer_snapshot(buffer.resource_key);
-                source = "cpu_snapshot";
-            }
-            out << "{\"slot\":" << buffer.binding_slot
-                << ",\"resource\":\"" << hex64(buffer.resource_key) << "\""
-                << ",\"bytes\":" << buffer.byte_width
-                << ",\"source\":\"" << source << "\""
-                << ",\"data_hex\":\"" << bytes_to_hex(snapshot) << "\"}";
-        }
-    }
-    out << "],\"last_write_vertex_constant_buffers\":[";
-    if (!target_writes.empty())
-    {
-        const ColorSourceWrite &last_write = target_writes.back();
-        for (std::size_t index = 0; index < last_write.vertex_constant_buffers.size(); ++index)
-        {
-            if (index != 0)
-                out << ",";
-            const BufferInfo &buffer = last_write.vertex_constant_buffers[index];
-            std::vector<std::uint8_t> snapshot = readback_buffer_bytes(context, buffer.resource_key);
-            const char *source = "gpu_readback";
-            if (snapshot.empty())
-            {
-                snapshot = lookup_buffer_snapshot(buffer.resource_key);
-                source = "cpu_snapshot";
-            }
-            out << "{\"slot\":" << buffer.binding_slot
-                << ",\"resource\":\"" << hex64(buffer.resource_key) << "\""
-                << ",\"bytes\":" << buffer.byte_width
-                << ",\"source\":\"" << source << "\""
-                << ",\"data_hex\":\"" << bytes_to_hex(snapshot) << "\"}";
-        }
-    }
+    // 2026-11-15：旧实现按历史指针 Map/读 CB，既可能阻塞共享队列，也不是写入时的常量值。
+    // 本文件只给写入候选；验证 shader 分支/实际覆盖像素需用同帧捕获，不混用来路不明的 CB 值。
     out << "]}";
-    LOG_DEBUG(blog::cat::upscale, std::string("fsr2_") + log_label + "_dumped target=" + hex64(target_resource_key) +
-        " writes=" + std::to_string(target_writes.size()) +
-        " related=" + std::to_string(related_writes.size()));
+    LOG_DEBUG(blog::cat::upscale, std::string("fsr2_") + log_label + "_dumped target=" + hex64(target.resource_key) +
+        " render_frame=" + std::to_string(render_frame) + " retained_writes=" + std::to_string(target_writes.size()) +
+        " related_last_writes=" + std::to_string(related_writes.size()));
 }
 
-void maybe_dump_color_source_history(ID3D11DeviceContext *context, std::uint64_t target_resource_key)
-{
-    maybe_dump_source_history(
-        context,
-        target_resource_key,
-        L"Dx11FsrBridge.color_chain",
-        "color_chain",
-        g_fsr2_color_producers_dumped);
-}
+bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info);
+bool read_resource_info_from_resource(ID3D11Resource *resource, const wchar_t *kind, ResourceInfo &out_info);
 
-void maybe_dump_motion_source_history(ID3D11DeviceContext *context, std::uint64_t target_resource_key)
+void maybe_dump_sdk_input_chains(ID3D11DeviceContext *context, const ffx12::FrameInput &input,
+    std::uint64_t instance, std::uint64_t render_frame)
 {
-    maybe_dump_source_history(
-        context,
-        target_resource_key,
-        L"Dx11FsrBridge.motion_chain",
-        "motion_chain",
-        g_fsr2_motion_producers_dumped);
+    if (!color_source_trace_pending() || (GetAsyncKeyState(VK_F6) & 0x8000) == 0) return;
+
+    // 2026-11-15：只在 SDK 调用点取证；扫描命中的 draw 未必是实际派发选中的那一路视图。
+    ResourceInfo color {}, view {}, motion {};
+    if (read_resource_info_from_resource(input.color, L"sdk_color", color))
+    {
+        if (read_resource_info(input.color_source_view, L"sdk_color_view", view) &&
+            view.resource_key == color.resource_key)
+            color.view_format = view.view_format;
+        dump_source_history(context, color, instance, render_frame, L"Dx11FsrBridge.color_chain", "color_chain",
+            g_fsr2_color_producers_dumped);
+    }
+    if (read_resource_info_from_resource(input.motion, L"sdk_motion", motion))
+        dump_source_history(context, motion, instance, render_frame, L"Dx11FsrBridge.motion_chain", "motion_chain",
+            g_fsr2_motion_producers_dumped);
 }
 
 void note_2d_post_context(SimilarityStats &stats, const DispatchState &snapshot, UINT group_x, UINT group_y, UINT group_z)
@@ -4317,9 +4254,6 @@ void maybe_dump_color_candidate_inputs(ID3D11DeviceContext *context, UINT elemen
     g_fsr2_early_output_probe_frames_remaining.store(
         g_config.fsr2_early_output_probe ? g_config.fsr2_early_output_probe_frames : 0,
         std::memory_order_release);
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    maybe_dump_color_source_history(context, candidate_color.resource_key);
-#endif
     LOG_DEBUG(blog::cat::upscale, "fsr2_color_candidate_dumped shader=" +
         hex64(g_current_ps_hash.load(std::memory_order_relaxed)) +
         " output=" + hex64(target->resource_key));
@@ -7203,7 +7137,7 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
 #endif
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    record_color_source_call("dispatch", group_x, group_y, group_z);
+    record_color_source_call(context, "dispatch", group_x, group_y, group_z);
 #endif
 
     if (g_config.log_all_dispatch)
@@ -7940,20 +7874,6 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw(
     }
 #endif
     return inspect_target_upscaler_draw(element_count);
-}
-
-void maybe_dump_target_color_chain(ID3D11DeviceContext *context, UINT element_count)
-{
-    if (!g_config.fsr2_trace_color_producers)
-        return;
-    const auto draw_info = inspect_target_upscaler_draw(element_count);
-    if (draw_info)
-    {
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-        maybe_dump_color_source_history(context, draw_info->color_resource_key);
-        maybe_dump_motion_source_history(context, draw_info->motion_resource_key);
-#endif
-    }
 }
 
 std::wstring lower_wstring(std::wstring value)
@@ -11242,6 +11162,9 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     st->dbg_depth = d_ptr;
                 }
 
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+                maybe_dump_sdk_input_chains(context, sdk_in, call_params.instance, call_params.frame_index);
+#endif
                 const auto delivery = ffx12::dispatch(sdk_in, context, call_params.instance);
                 if (delivery != ffx12::DispatchResult::failed)
                 {
@@ -12156,10 +12079,6 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
     if (!hook_logged.load(std::memory_order_relaxed) &&
         !hook_logged.exchange(true, std::memory_order_relaxed))
         LOG_INFO(blog::cat::core, Indexed ? "draw_indexed_hook_active" : "draw_hook_active");
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    record_color_source_call(entry_name, element_count, 0, 0);
-    maybe_dump_target_color_chain(context, element_count);
-#endif
 #if defined(DX11FSRBRIDGE_FINAL_SCENE_PROBE)
     record_final_scene_probe_draw(element_count, Indexed);
 #endif
@@ -12218,6 +12137,7 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
     neo::graphics::execute_draw(draw, upscale, tone_map, spatial, [&]
     {
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+        record_color_source_call(context, entry_name, element_count, 0, 0);
         if (g_config.enable_similarity_probe || (g_config.trace_pixel_shader_draws &&
             g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
             record_similarity_draw(entry_name, element_count);
@@ -12401,7 +12321,7 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
         LOG_INFO(blog::cat::core, "copy_resource dst=" + hex64(dst_info.resource_key) + " src=" + hex64(src_info.resource_key));
     record_hdr_composite_copy(dst_info, src_info, "copy_resource");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    record_color_source_copy(dst_info, src_info, "copy_resource");
+    record_color_source_copy(context, dst_info, src_info, "copy_resource");
 #endif
     g_original_copy_resource(context, dst, src);
 }
@@ -12425,7 +12345,7 @@ void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *conte
             " dst_sub=" + std::to_string(dst_subresource) + " src_sub=" + std::to_string(src_subresource));
     record_hdr_composite_copy(dst_info, src_info, "copy_subresource");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    record_color_source_copy(dst_info, src_info, "copy_subresource");
+    record_color_source_copy(context, dst_info, src_info, "copy_subresource");
 #endif
     g_original_copy_subresource_region(context, dst, dst_subresource, dst_x, dst_y, dst_z, src, src_subresource, src_box);
 }
@@ -12469,7 +12389,7 @@ void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11Rend
                 " fmt=" + format_string(info.format) + " color=(" +
                 std::to_string(color[0]) + "," + std::to_string(color[1]) + "," + std::to_string(color[2]) + "," + std::to_string(color[3]) + ")");
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-        record_color_source_copy(info, {}, "clear_rtv");
+        record_color_source_copy(context, info, {}, "clear_rtv");
 #endif
     }
     g_original_clear_rtv(context, rtv, color);

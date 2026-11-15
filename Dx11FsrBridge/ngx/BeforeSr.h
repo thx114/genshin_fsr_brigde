@@ -8,7 +8,8 @@ namespace neo::ngx
 struct BeforeSrInput
 {
     interop::BeforeSrFrameV1 frame;
-    ID3D11ShaderResourceView *source_view; // 与 frame 的原始 Color 来自同一份 Draw 快照。
+    ID3D11Texture2D *source_color = nullptr; // CopyResource 的游戏源纹理，不是 NGX 的副本。
+    ID3D11ShaderResourceView *source_view = nullptr; // 借用同次 Draw 的实际 SRV。
 };
 
 class BeforeSrQueryScope

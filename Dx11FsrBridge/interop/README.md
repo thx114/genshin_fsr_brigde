@@ -19,6 +19,19 @@
 `S_OK` 才得到描述，`S_FALSE` 是无当次匹配且不改输出。查询不会改变资源，也不是 GPU 完成凭证；消费者仍拥有自己的提交、同步、共享资源和 ReShade 生命周期。
 
 `color_view_format` 是游戏累积 Draw 的实际 typed SRV 格式；`color_storage_format` 是 NGX 输入副本的存储格式，两者可不同。
+只有实际被复制的源纹理、mip 0 的单层 `Texture2D` SRV 才发布视图格式；空视图或同尺寸错资源留为 `DXGI_FORMAT_UNKNOWN`。
 目前 Color/Depth/Motion 对应同一次派发、完整 render-size 区域，mip 0、slice 0，原点 `(0,0)`。
 `color_transfer == unknown` 不能授权按 G22、sRGB、线性或 HDR 处理：视图解码方式不能证明内容的编码，
 也不能以内置 NGX IsHDR 或最终交换链代替。F6 若要在自己的共享纹理上处理，须另行验证复制及工作格式，不可仅凭查询放行颜色门。
+
+## 源颜色取证（仅诊断构建）
+
+在独立测试副本中，使用诊断开启、`DX11FSRBRIDGE_RELEASE_RUNTIME=OFF` 的桥。在 `[Dx11FsrBridge]`
+启用现有 `Fsr2TraceColorProducers=1`，在要查的场景按 F6 一次；桥模块目录输出 `Dx11FsrBridge.color_chain.json`
+和 `Dx11FsrBridge.motion_chain.json`。如需对照 writer shader，可同时启用现有 `DumpPixelShaders=1`。
+这不是性能测试配置，须保持其他诊断开关关闭。
+
+文件根记录 PID、SDK 调用输入 context、实例、游戏 Render 帧序号、实际复制源纹理和读端 SRV 格式。
+`writes` 列出观察到的资源写入候选及写端视图/着色器；`related_last_writes` 是各依赖资源的最后观察，**不是**完整 GPU 执行轨迹。
+上下文不匹配、未见写入、部分复制、录制/重放、常量选择或着色器被改写时，仍需同帧 GPU 捕获等独立证据。
+不从历史地址读回 GPU 常量或颜色；不以此文件、某个视图枚举或 SDK 调用尝试当作 transfer 或求值成功凭证。

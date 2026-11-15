@@ -3177,7 +3177,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
                 (reset_val ? k_before_sr_reset : 0u),
             .jitter_x = in.jitter_x, .jitter_y = in.jitter_y,
             .motion_scale_x = in.motion_scale_x, .motion_scale_y = in.motion_scale_y,
-        }, in.color_source_view };
+        }, in.color, in.color_source_view };
     };
     ComPtr<ID3D11Texture2D> filtered_color;
     // F6 自己拥有 BeforeSR，不能同时再调用直连 NGX 的外部记录者。
