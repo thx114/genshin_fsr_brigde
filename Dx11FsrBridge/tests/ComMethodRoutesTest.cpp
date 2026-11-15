@@ -97,6 +97,25 @@ void test_vtable_slots()
     expect(table[0] == reinterpret_cast<void *>(1) && table[1] == reinterpret_cast<void *>(99),
         "rollback restores only owned slots and preserves the other injector");
     VirtualFree(table, 0, MEM_RELEASE);
+
+    SYSTEM_INFO system {};
+    GetSystemInfo(&system);
+    const SIZE_T page = system.dwPageSize;
+    auto **pages = static_cast<void **>(VirtualAlloc(nullptr, page * 2, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!pages) { expect(false, "allocate two pages"); return; }
+    const SIZE_T next = page / sizeof(void *);
+    for (SIZE_T i = 0; i <= next; ++i) pages[i] = reinterpret_cast<void *>(1);
+    instance.table = pages;
+    VirtualProtect(pages, page, PAGE_READONLY, &old);
+    VirtualProtect(pages + next, page, PAGE_EXECUTE_READ, &old);
+    std::vector<com_vtable::MethodPatch> many { { next, &bind_patch<22> } };
+    for (SIZE_T i = 0; i < 40; ++i) many.push_back({ i, &bind_patch<11> });
+    expect(com_vtable::patch(&instance, next + 1, many), "overflow storage and separated pages");
+    VirtualQuery(pages, &info, sizeof(info));
+    expect(info.Protect == PAGE_READONLY && pages[39] == reinterpret_cast<void *>(11), "first page restored");
+    VirtualQuery(pages + next, &info, sizeof(info));
+    expect(info.Protect == PAGE_EXECUTE_READ && pages[next] == reinterpret_cast<void *>(22), "second page restored");
+    VirtualFree(pages, 0, MEM_RELEASE);
 }
 }
 
