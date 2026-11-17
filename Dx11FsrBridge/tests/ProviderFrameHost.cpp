@@ -613,6 +613,8 @@ int wmain(int argc, wchar_t **argv)
     const std::wstring_view mode = argc > 1 ? argv[1] : L"";
     const bool prewarm_retry = mode == L"ngx-prewarm-retry";
     const bool hudless = mode == L"ngx-hudless";
+    const unsigned provider_fault = mode == L"ngx-fault-init" ? 1 : mode == L"ngx-fault-create" ? 2 :
+        mode == L"ngx-fault-eval" ? 3 : mode == L"ngx-fault-release" ? 4 : 0;
     const bool prewarm = mode == L"ngx-prewarm" || prewarm_retry;
     const bool check_prewarm = prewarm || mode == L"ngx-prewarm-off";
     const bool receipt = check_prewarm || mode == L"ngx-receipt" || mode == L"ngx-receipt-dlaa";
@@ -652,11 +654,11 @@ int wmain(int argc, wchar_t **argv)
     const bool pixel_readback_legacy = mode == L"ngx-pixel-readback-legacy";
     const bool pixel_readback = pixel_readback_on || pixel_readback_legacy ||
         mode == L"ngx-pixel-readback-default" || mode == L"ngx-pixel-readback-off";
-    const bool fixture = hudless || receipt || before_sr || input_map || ao_fixture ||
+    const bool fixture = provider_fault || hudless || receipt || before_sr || input_map || ao_fixture ||
         scene_depth || multi_scene || failure_recovery || producer_capture || history || guide_views || candidate_admission ||
         pixel_readback;
     const wchar_t *fixture_name = multi_scene ? L"NgxMultiSceneProvider.dll" :
-        before_sr || producer_capture || history || scene_depth || failure_recovery || guide_views || candidate_admission ||
+        provider_fault || before_sr || producer_capture || history || scene_depth || failure_recovery || guide_views || candidate_admission ||
             pixel_readback ||
             (ao_fixture && !ao_v1) ? L"BeforeSrProvider.dll" :
         L"F6ReceiptProvider.dll";
@@ -738,6 +740,13 @@ int wmain(int argc, wchar_t **argv)
         const bool expect_receipt = hudless || receipt || input_map || real_receipt || ao_v1 || multi_scene;
         std::fprintf(observations.get(), "provider export: v1=%d expected=%d\n", has_receipt, expect_receipt);
         if (has_receipt != expect_receipt) return 3;
+        if (provider_fault && provider_fault != 4)
+        {
+            const auto configure = reinterpret_cast<void (*)(unsigned)>(
+                GetProcAddress(provider_module, "ConfigureProviderFault"));
+            if (!configure) return 3;
+            configure(provider_fault);
+        }
         if (receipt && same_size)
         {
             using ConfigureDisplay = void (*)(unsigned, unsigned) noexcept;
@@ -818,6 +827,35 @@ int wmain(int argc, wchar_t **argv)
     };
     if (scene_depth)
         return run_scene_depth(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+    if (provider_fault)
+    {
+        const auto configure = reinterpret_cast<void (*)(unsigned)>(
+            GetProcAddress(provider_module, "ConfigureProviderFault"));
+        const auto calls = reinterpret_cast<unsigned (*)()>(GetProcAddress(provider_module, "ProviderFaultCalls"));
+        if (!configure || !calls) return 3;
+        RenderFixture instance;
+        const auto run = [&](unsigned width, bool delivered)
+        {
+            const CaptureExtent extent {width, 256};
+            CaptureFrame frame {extent, extent, [&] { instance.publish(extent, extent, 0.f, 0.f); }, delivered};
+            // 2026-11-17（释放异常夹具）：先用源像素证明 Evaluate 成功，再在同实例换尺寸触发退休。
+            frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+            frame.exact_provider_pixel = frame.alternate_scene_pixel;
+            frame.typeless_depth = true;
+            return capture(CaptureEntry::draw, frame);
+        };
+        if (provider_fault == 4)
+        {
+            if (!run(512, true)) return 1;
+            configure(4);
+            if (!run(384, false)) return 1;
+        }
+        else if (!run(512, false)) return 1;
+        if (calls() != 1 || !run(512, false)) return 1;
+        if (calls() != (provider_fault == 3 ? 2u : 1u)) return 1;
+        std::printf("Actual bridge provider SEH: boundary=%u faults=%u native output preserved\n", provider_fault, calls());
+        return 0;
+    }
     if (multi_scene)
         return run_multi_scene(*device.Get(), *context.Get(), provider_module, observations.get(), multi_cold, multi_half,
             mode.ends_with(L"forward")) ? 0 : 1;

@@ -442,8 +442,8 @@ bool retire_feature(NgxInstance &inst)
     }
     // 拒绝退休时保留该实例整份所有权，进程剩余时间让原生路径接管。
     if (!g_release_all.exchange(true, std::memory_order_relaxed))
-        log_ngx_error(L"ngx_core release_all reason=retirement_refused inst=0x%llX rc=0x%X",
-            static_cast<unsigned long long>(inst.key), rc);
+        log_ngx_error(L"ngx_core release_all reason=retirement_refused inst=0x%llX rc=0x%X ex=0x%08lX",
+            static_cast<unsigned long long>(inst.key), rc, inst.feature.retire_exception());
     return false;
 }
 
@@ -1349,8 +1349,11 @@ static bool ensure_init(ID3D11Device *dev, bool prewarming = false)
     log_ngx_error(L"ngx_core appdata=%s", appdata.c_str());
 
     // ---- 第 6 步：Init_Ext(app_id, appdata, dev, NVSDK_NGX_Version_API, &fc) ← 第 5 参是 fc ----
-    const NVSDK_NGX_Result init_rc =
-        g_provider.init(g_app_id, appdata.c_str(), dev, NVSDK_NGX_Version_API, &fc);
+    unsigned long init_exception = 0;
+    const NVSDK_NGX_Result init_rc = neo::ngx::call_provider(init_exception,
+        g_provider.init, g_app_id, appdata.c_str(), dev, NVSDK_NGX_Version_API, &fc);
+    if (init_exception)
+        return fail_init(L"init_crash", init_exception);
     if (init_rc != NVSDK_NGX_Result_Success)
         return prewarming ? false : fail_init(L"init", static_cast<unsigned>(init_rc));
 
@@ -2376,8 +2379,11 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     apply_render_preset(g_render_preset);
 
     NVSDK_NGX_Handle *created = nullptr;
-    const NVSDK_NGX_Result rr =
-        g_provider.create(ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &created);
+    unsigned long create_exception = 0;
+    const NVSDK_NGX_Result rr = neo::ngx::call_provider(create_exception,
+        g_provider.create, ctx, NVSDK_NGX_Feature_SuperSampling, g_params, &created);
+    if (create_exception)
+        log_ngx_error(L"ngx_core create_feature reason=create_crash ex=0x%08lX", create_exception);
     const bool owned = inst.feature.adopt(rr, created, g_provider.release);
 
     // 2026-11-13（独立审查第二轮 · 建议 6）：**成功与失败都写出真实 rc**。
@@ -3349,6 +3355,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     using neo::ngx::F6OutputStatus;
     F6OutputStatus f6_output = F6OutputStatus::unproven;
     NVSDK_NGX_Result rr;
+    unsigned long eval_exception = 0;
     if (g_provider.evaluate_f6)
     {
         const auto request = ++g_f6_request;
@@ -3366,13 +3373,15 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
             };
             const neo::ngx::HudlessParameterScope hudless(*g_params,
                 neo::ngx::record_hudless(hudless_request, *dev.Get()));
-            rr = g_provider.evaluate_f6(ctx, inst.feature.get(), g_params, nullptr, request, &receipt);
+            rr = neo::ngx::call_provider(eval_exception,
+                g_provider.evaluate_f6, ctx, inst.feature.get(), g_params, nullptr, request, &receipt);
         }
         f6_output = neo::ngx::f6_output_status(receipt, request, inst.feature.get(), ctx, inst.pool.output.Get());
     }
     else
     {
-        rr = g_provider.evaluate(ctx, inst.feature.get(), g_params, nullptr);
+        rr = neo::ngx::call_provider(eval_exception,
+            g_provider.evaluate, ctx, inst.feature.get(), g_params, nullptr);
     }
     // 参数袋跨帧复用，不能在临时替代资源或下一次重建池时留下裸指针。
     if (filtered_color) set_tex(g_params, NVSDK_NGX_Parameter_Color, inst.pool.color.Get());
@@ -3400,10 +3409,10 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
         {
             log_ngx_core(blog::Level::Error,
                          L"ngx_core eval ok=%d rc=0x%X eval_fail_total=%llu "
-                         L"eval_fail_streak=%u",
+                         L"eval_fail_streak=%u ex=0x%08lX",
                          0, static_cast<unsigned>(rr),
                          static_cast<unsigned long long>(inst.eval_fail_total),
-                         static_cast<unsigned>(inst.eval_fail_streak));
+                         static_cast<unsigned>(inst.eval_fail_streak), eval_exception);
         }
 
         if (device_removed)

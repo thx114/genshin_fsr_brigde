@@ -72,6 +72,15 @@ struct FixtureFeature
 std::array<FixtureFeature, il2cpp_callsite::k_render_instance_capacity> g_features {};
 unsigned g_feature_id = 16;
 unsigned g_feature_releases = 0;
+unsigned g_fault = 0, g_fault_calls = 0;
+extern "C" __declspec(dllexport) void ConfigureProviderFault(unsigned fault) { g_fault = fault; }
+extern "C" __declspec(dllexport) unsigned ProviderFaultCalls() { return g_fault_calls; }
+void provider_fault(unsigned boundary)
+{
+    if (g_fault != boundary) return;
+    ++g_fault_calls;
+    RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+}
 extern "C" __declspec(dllexport) unsigned ReceiptFixtureCreates() { return g_feature_id - 16; }
 extern "C" __declspec(dllexport) unsigned ReceiptFixtureReleases() { return g_feature_releases; }
 bool active_feature(const NVSDK_NGX_Handle *handle)
@@ -129,6 +138,7 @@ EXPORT NVSDK_NGX_D3D11_Init_Ext(unsigned long long, const wchar_t *, ID3D11Devic
     NVSDK_NGX_Version, const NVSDK_NGX_FeatureCommonInfo *)
 {
     ++g_init_calls;
+    provider_fault(1);
     if (g_refuse_first_init.exchange(false)) return NVSDK_NGX_Result_Fail;
     return NVSDK_NGX_Result_Success;
 }
@@ -159,6 +169,7 @@ EXPORT NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext *, NVSDK_NGX_Feature ki
     [[maybe_unused]] NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
     if (!out || kind != NVSDK_NGX_Feature_SuperSampling) return NVSDK_NGX_Result_Fail;
+    provider_fault(2);
 #if !defined(BEFORE_SR_LEGACY_FIXTURE)
     if (g_input_map.enabled)
     {
@@ -179,6 +190,7 @@ EXPORT NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext *, NVSDK_NGX_Feature ki
 }
 EXPORT NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle *handle)
 {
+    provider_fault(4);
     for (auto &feature : g_features)
         if (feature.active && handle == &feature.handle)
         {
@@ -258,6 +270,7 @@ static NVSDK_NGX_Result copy_eval_color(ID3D11DeviceContext *context, const NVSD
 EXPORT NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext *context, const NVSDK_NGX_Handle *handle,
     const NVSDK_NGX_Parameter *p, PFN_NVSDK_NGX_ProgressCallback)
 {
+    provider_fault(3);
     return copy_eval_color(context, handle, p);
 }
 #else
@@ -437,6 +450,11 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
         return evaluate_input_map(*context, handle, *p, request, *receipt, input_map_ordinal);
     if (g_hudless_fixture)
     {
+        if (g_hudless_result == 3)
+        {
+            g_fault = 5;
+            provider_fault(5);
+        }
         ID3D11Resource *color = nullptr, *output = nullptr;
         unsigned flip = 9;
         if (p->Get("Opti.Hudless", &color) != NVSDK_NGX_Result_Success || color != g_hudless_expected ||

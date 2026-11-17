@@ -15,6 +15,7 @@ namespace
 
 unsigned release_count = 0;
 unsigned refuse_count = 0;
+unsigned crash_count = 0;
 NVSDK_NGX_Handle *released = nullptr;
 NVSDK_NGX_Result NVSDK_CONV release(NVSDK_NGX_Handle *handle)
 {
@@ -27,6 +28,13 @@ NVSDK_NGX_Result NVSDK_CONV refuse(NVSDK_NGX_Handle *)
 {
     ++refuse_count;
     return NVSDK_NGX_Result_Fail;
+}
+
+NVSDK_NGX_Result NVSDK_CONV crash(NVSDK_NGX_Handle *)
+{
+    ++crash_count;
+    RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    return NVSDK_NGX_Result_Success;
 }
 
 D3D11_TEXTURE2D_DESC desc(UINT width, UINT height, DXGI_FORMAT format)
@@ -67,6 +75,15 @@ int main()
         CHECK(!feature.adopt(NVSDK_NGX_Result_Success, &unrelated, release));
     }
     CHECK(refuse_count == 1);
+    {
+        FeatureHandle feature;
+        CHECK(feature.adopt(NVSDK_NGX_Result_Success, &owned, crash));
+        CHECK(feature.retire() == NVSDK_NGX_Result_Fail && feature.get() == &owned);
+        CHECK(feature.retire_exception() == EXCEPTION_ACCESS_VIOLATION);
+        CHECK(feature.retire() == NVSDK_NGX_Result_Fail && crash_count == 1);
+        CHECK(!feature.adopt(NVSDK_NGX_Result_Success, &unrelated, release));
+    }
+    CHECK(crash_count == 1);
 
     ffx12::FrameInput frame;
     frame.render_w = 64;

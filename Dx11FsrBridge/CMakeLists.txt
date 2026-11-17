@@ -508,6 +508,11 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         DX11FSRBRIDGE_TEST_DIAGNOSTICS=$<BOOL:${DX11FSRBRIDGE_DIAGNOSTICS_ON}>)
     target_link_libraries(ProviderFrameHost PRIVATE d3d11 d3dcompiler)
     if(DX11FSRBRIDGE_ENABLE_NGX)
+        foreach(boundary IN ITEMS init create eval release)
+            add_test(NAME NgxProviderFault-${boundary} COMMAND ProviderFrameHost "ngx-fault-${boundary}"
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+            set_tests_properties(NgxProviderFault-${boundary} PROPERTIES TIMEOUT 45)
+        endforeach()
         foreach(setting IN ITEMS default off on)
             add_test(NAME NgxDiagnosticPixelReadback-${setting} COMMAND ProviderFrameHost
                 ngx-pixel-readback-${setting} "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")

@@ -170,7 +170,7 @@ int run(HMODULE bridge, HMODULE provider, ID3D11DeviceContext &context, Capture 
         if (!verify(draw(mode <= 1), "admission and cleanup")) return 1;
     mode = 1;
     if (!verify(draw(true, 384), "resize")) return 1;
-    for (result = 1; result <= 2; ++result)
+    for (result = 1; result <= 3; ++result)
         if (!verify(draw(true), "failed or no-output Evaluate")) return 1;
     result = 0;
     const auto previous = calls;

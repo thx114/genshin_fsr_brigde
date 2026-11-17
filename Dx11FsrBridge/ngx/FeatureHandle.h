@@ -1,5 +1,6 @@
 #pragma once
 #include "../third_party/ngx/nvsdk_ngx_defs.h"
+#include "GuardedCall.h"
 
 namespace neo::ngx
 {
@@ -23,17 +24,19 @@ public:
     [[nodiscard]] NVSDK_NGX_Result retire() noexcept
     {
         if (!handle_ || retire_result_ != NVSDK_NGX_Result_Success) return retire_result_;
-        retire_result_ = release_(handle_);
+        retire_result_ = call_provider(retire_exception_, release_, handle_);
         // 拒绝退休不授权复用池，也不推定再次 Release 能安全重试。
         if (retire_result_ == NVSDK_NGX_Result_Success) handle_ = nullptr;
         return retire_result_;
     }
     NVSDK_NGX_Handle *get() const noexcept { return handle_; }
+    unsigned long retire_exception() const noexcept { return retire_exception_; }
     explicit operator bool() const noexcept { return handle_ != nullptr; }
 
 private:
     NVSDK_NGX_Handle *handle_ = nullptr;
     Release release_ = nullptr;
     NVSDK_NGX_Result retire_result_ = NVSDK_NGX_Result_Success;
+    unsigned long retire_exception_ = 0;
 };
 }
