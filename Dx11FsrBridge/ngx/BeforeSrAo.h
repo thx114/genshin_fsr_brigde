@@ -1,5 +1,6 @@
 #pragma once
 
+#include "BeforeSr.h"
 #include <d3d11_1.h>
 #include <wrl/client.h>
 
@@ -20,6 +21,10 @@ class BeforeSrAo
 public:
     bool record(ID3D11Device &device, ID3D11DeviceContext &context, ID3D11Texture2D &color,
         ID3D11Texture2D &depth, const AoProjection &projection) noexcept;
+
+    // 2026-11-16：record 成功后 result 已复制回 color；复用其实际 UNORM SRV，不新增视图/资源。
+    // AO 只在存储值上乘遮蔽，不能据此认证游戏原来的 transfer。
+    BeforeSrColorSource color_output() const noexcept { return { color_.Get(), srvs_[0].Get() }; }
 
 private:
     struct Constants

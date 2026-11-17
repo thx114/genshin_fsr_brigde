@@ -19,12 +19,13 @@ public:
 
 // 2026-11-14：生产 DLL 的成功设备回归证实，全局 original 会把 proxy this 传入
 // native 实现。正常回调只取匹配的 TLS 帧；内部跨对象调用才解析对象当前的方法槽。
-template <typename Function, Function Observe, std::size_t Method, bool SkipNested = false>
+template <typename Function, Function Observe, std::size_t Method, bool SkipNested = false,
+    auto AfterInvoke = nullptr>
 class ComMethodRoutes;
 
 template <typename Result, typename Object, typename... Args,
-    Result(STDMETHODCALLTYPE *Observe)(Object *, Args...), std::size_t Method, bool SkipNested>
-class ComMethodRoutes<Result(STDMETHODCALLTYPE *)(Object *, Args...), Observe, Method, SkipNested>
+    Result(STDMETHODCALLTYPE *Observe)(Object *, Args...), std::size_t Method, bool SkipNested, auto AfterInvoke>
+class ComMethodRoutes<Result(STDMETHODCALLTYPE *)(Object *, Args...), Observe, Method, SkipNested, AfterInvoke>
 {
     using Function = Result(STDMETHODCALLTYPE *)(Object *, Args...);
     struct Frame
@@ -36,9 +37,9 @@ class ComMethodRoutes<Result(STDMETHODCALLTYPE *)(Object *, Args...), Observe, M
     inline static thread_local Frame *active_ = nullptr;
     inline static std::atomic<bool> installed_ {};
 
-    static Result STDMETHODCALLTYPE invoke(Object *object, Args... args)
+    static Result invoke(Function original, Object *object, Args... args)
     {
-        Frame frame { active_, Routes::original(), object };
+        Frame frame { active_, original, object };
         active_ = &frame;
         struct Restore
         {
@@ -48,6 +49,17 @@ class ComMethodRoutes<Result(STDMETHODCALLTYPE *)(Object *, Args...), Observe, M
         // 共享 runtime 表会被后续新设备继承；包装器构造尚未结束时只转发。
         if (D3D11CreationScope::active())
             return frame.original(object, args...);
+        // 2026-11-16：真实 WARP 的 Flush/Draw 会改写内嵌方法表；返回策略也覆盖
+        // 透传和内部调用，但不能在尚未完成的包装器构造期间查询、重装对象。
+        struct Finish
+        {
+            Object *object;
+            ~Finish()
+            {
+                if constexpr (AfterInvoke != nullptr)
+                    AfterInvoke(object);
+            }
+        } finish { object };
         if constexpr (std::is_same_v<Object, ID3D11DeviceContext>)
             if (context_policy_bypass != 0)
                 return frame.original(object, args...);
@@ -58,7 +70,7 @@ class ComMethodRoutes<Result(STDMETHODCALLTYPE *)(Object *, Args...), Observe, M
         return Observe(object, args...);
     }
 
-    using Routes = CreateFunctionRoutes<Function, &invoke>;
+    using Routes = CreateFunctionRoutes<Function, nullptr, 16, &invoke>;
 
 public:
     static void *bind(void *target)
@@ -98,7 +110,7 @@ public:
         if (!table) return false;
         const auto entry = reinterpret_cast<Function>(std::atomic_ref<void *>(table[Method]).load(
             std::memory_order_acquire));
-        return entry && Routes::target(entry) != entry;
+        return entry && Routes::owns(entry);
     }
 
     bool operator==(std::nullptr_t) const { return !installed_.load(std::memory_order_acquire); }

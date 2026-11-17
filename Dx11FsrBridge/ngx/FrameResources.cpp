@@ -2,11 +2,51 @@
 #include "../Ffx12Backend.h"
 
 #include <utility>
+#include <array>
 
 namespace neo::ngx
 {
 namespace
 {
+class SceneDepthRead
+{
+public:
+    SceneDepthRead(ID3D11DeviceContext &context, bool needed) noexcept : context_(needed ? &context : nullptr)
+    {
+        // 2026-11-16（四路 guide 实测）：仍绑定为 DSV 的深度被 CS 读成 0，必须先解除写绑定。
+        // 只在调用方确实选择了当前 DSV 时读取 OM，普通 FSR guide 路径不付这次查询成本。
+        if (!context_) return;
+        context_->OMGetRenderTargets(static_cast<UINT>(targets_.size()), targets_.data(), &depth_);
+        for (UINT i = static_cast<UINT>(targets_.size()); i != 0; --i)
+            if (targets_[i - 1])
+            {
+                target_count_ = i;
+                break;
+            }
+        bind_depth(nullptr);
+    }
+    ~SceneDepthRead()
+    {
+        if (!context_) return;
+        bind_depth(depth_);
+        for (auto *target : targets_) if (target) target->Release();
+        if (depth_) depth_->Release();
+    }
+    SceneDepthRead(const SceneDepthRead &) = delete;
+    SceneDepthRead &operator=(const SceneDepthRead &) = delete;
+private:
+    void bind_depth(ID3D11DepthStencilView *depth) noexcept
+    {
+        // 2026-11-16（OM 恢复实测）：OMSetRenderTargets(8) 清掉 slot 3 UAV；只换 DSV 并保留 UAV。
+        context_->OMSetRenderTargetsAndUnorderedAccessViews(target_count_, targets_.data(), depth,
+            0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr, nullptr);
+    }
+    ID3D11DeviceContext *context_;
+    UINT target_count_ = 0;
+    std::array<ID3D11RenderTargetView *, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> targets_ {};
+    ID3D11DepthStencilView *depth_ = nullptr;
+};
+
 bool full_texture(const D3D11_TEXTURE2D_DESC &desc, UINT width, UINT height) noexcept
 {
     return width != 0 && height != 0 && desc.Width == width && desc.Height == height &&
@@ -29,6 +69,27 @@ DXGI_FORMAT depth_srv_format(DXGI_FORMAT format) noexcept
         return DXGI_FORMAT_R32_FLOAT;
     }
 }
+
+bool float_guide_view(DXGI_FORMAT format, GuideView::Kind kind) noexcept
+{
+    // 2026-11-16：两个既有 CS 声明 Texture2D<float4>；整数视图不能冒充浮点 guide。
+    if (kind == GuideView::Kind::depth)
+        return format == DXGI_FORMAT_R32_FLOAT || format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
+            format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    switch (format)
+    {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_SNORM:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_SNORM:
+    case DXGI_FORMAT_R32G32_FLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
 }
 
 std::optional<FrameShape> copy_shape(const ffx12::FrameInput &input,
@@ -44,15 +105,40 @@ std::optional<FrameShape> copy_shape(const ffx12::FrameInput &input,
         color.Format, output.Format };
 }
 
-bool GuideView::bind(ID3D11Device &device, ID3D11Texture2D *source, Kind kind, const FrameShape &shape) noexcept
+bool GuideView::bind(ID3D11Device &device, ID3D11Texture2D *source, Kind kind, const FrameShape &shape,
+    ID3D11ShaderResourceView *source_view) noexcept
 {
     if (!source) return false;
-    if (source_ == source && view_) return true;
+    if (source_ == source && view_ && render_width_ == shape.render_width &&
+        render_height_ == shape.render_height &&
+        (source_view ? view_.Get() == source_view : !supplied_view_)) return true;
     D3D11_TEXTURE2D_DESC desc {};
     source->GetDesc(&desc);
     if (desc.Width < shape.render_width || desc.Height < shape.render_height ||
         desc.ArraySize != 1 || desc.SampleDesc.Count != 1)
         return false;
+    if (source_view)
+    {
+        // 2026-11-16（PID50264 资源复现）：保留当前 Draw 的 typed view，不能用资源格式猜 UNORM/SNORM。
+        // 缓存同时认资源和视图，换视图或验证失败时不能借用上一次成功的 guide。
+        Microsoft::WRL::ComPtr<ID3D11Resource> viewed;
+        source_view->GetResource(viewed.GetAddressOf());
+        Microsoft::WRL::ComPtr<ID3D11Device> owner;
+        source->GetDevice(owner.GetAddressOf());
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
+        source_view->GetDesc(&srv);
+        if (owner.Get() != &device || viewed.Get() != source ||
+            srv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D ||
+            srv.Texture2D.MostDetailedMip != 0 || !float_guide_view(srv.Format, kind))
+            return false;
+        view_ = source_view;
+        source_ = source;
+        supplied_view_ = true;
+        format_ = srv.Format;
+        render_width_ = shape.render_width;
+        render_height_ = shape.render_height;
+        return true;
+    }
     D3D11_SHADER_RESOURCE_VIEW_DESC srv {};
     srv.Format = kind == Kind::depth ? depth_srv_format(desc.Format) : DXGI_FORMAT_R10G10B10A2_UNORM;
     srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -61,6 +147,10 @@ bool GuideView::bind(ID3D11Device &device, ID3D11Texture2D *source, Kind kind, c
     if (FAILED(device.CreateShaderResourceView(source, &srv, next.GetAddressOf()))) return false;
     view_ = std::move(next);
     source_ = source;
+    supplied_view_ = false;
+    format_ = srv.Format;
+    render_width_ = shape.render_width;
+    render_height_ = shape.render_height;
     return true;
 }
 
@@ -121,28 +211,34 @@ FrameResources::BuildResult FrameResources::rebuild(ID3D11Device &device, const 
     return { S_OK, nullptr };
 }
 
+bool FrameGuides::bind(ID3D11Device &device, const ffx12::FrameInput &input, const FrameShape &shape) noexcept
+{
+    return depth.bind(device, input.depth, GuideView::Kind::depth, shape, input.depth_source_view) &&
+        motion.bind(device, input.motion, GuideView::Kind::motion, shape, input.motion_source_view);
+}
+
 bool FrameResources::bind_guides(ID3D11Device &device, const ffx12::FrameInput &input) noexcept
 {
-    return depth_src.bind(device, input.depth, GuideView::Kind::depth, shape) &&
-        motion_src.bind(device, input.motion, GuideView::Kind::motion, shape);
+    return guides.bind(device, input, shape);
 }
 
 void FrameResources::record_inputs(ID3D11DeviceContext &context, const ffx12::FrameInput &input,
     ID3D11ComputeShader *depth_cs, ID3D11ComputeShader *motion_cs) const noexcept
 {
+    const SceneDepthRead depth_read(context, input.depth_from_dsv);
     context.CopyResource(color.Get(), input.color);
     const UINT groups_x = (shape.render_width + 7u) / 8u;
     const UINT groups_y = (shape.render_height + 7u) / 8u;
     ID3D11Buffer *cb[] { constants.Get() };
     context.CSSetConstantBuffers(0, 1, cb);
-    ID3D11ShaderResourceView *srvs[] { depth_src.get() };
+    ID3D11ShaderResourceView *srvs[] { guides.depth.get() };
     ID3D11UnorderedAccessView *uavs[] { depth_uav.Get(), nullptr };
     context.CSSetShader(depth_cs, nullptr, 0);
     context.CSSetShaderResources(0, 1, srvs);
     context.CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     context.Dispatch(groups_x, groups_y, 1);
 
-    srvs[0] = motion_src.get();
+    srvs[0] = guides.motion.get();
     uavs[0] = motion_uav.Get();
     uavs[1] = reactive_uav.Get();
     context.CSSetShader(motion_cs, nullptr, 0);

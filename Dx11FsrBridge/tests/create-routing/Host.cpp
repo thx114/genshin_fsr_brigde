@@ -137,6 +137,96 @@ void check_alternate_draws(ID3D11Device *device, ID3D11DeviceContext *context)
     }
 }
 
+void check_command_retention(HMODULE bridge, ID3D11Device *draw_device,
+    ID3D11DeviceContext *draw_context, bool first_window)
+{
+    const auto observed = [&](ID3D11DeviceContext *context)
+    {
+        const auto routes = draw_routes(context);
+        return belongs_to(bridge, routes[0]) && belongs_to(bridge, routes[1]);
+    };
+    // 2026-11-16：独立门禁检出 Flush 丢钩；硬件预热先建立合法的
+    // shader/索引状态，且独立模式不得污染其它夹具的首次回执负控。
+    expect(draw_capture(draw_device, draw_context, CaptureEntry::indexed, {}, stdout),
+        "retention precondition draws exact pixels with a valid pipeline");
+    // 候选日志只报首次；不能清掉唯一回执后要求第二轮重复上报。
+    if (first_window)
+        expect(WaitForSingleObject(capture_receipt, 5000) == WAIT_OBJECT_0,
+            "retention precondition reached production capture");
+    for (unsigned cycle = 0; cycle < 3; ++cycle)
+    {
+        draw_context->Draw(0, 0);
+        expect(observed(draw_context), "warmup Draw retains both production routes");
+        draw_context->DrawIndexed(0, 0, 0);
+        expect(observed(draw_context), "warmup DrawIndexed retains both production routes");
+        draw_context->Flush();
+        expect(observed(draw_context), "warmup Flush retains both production routes");
+    }
+    expect(SUCCEEDED(draw_device->GetDeviceRemovedReason()),
+        "retention warmup keeps the hardware device usable");
+    D3D11_TEXTURE2D_DESC color_desc {};
+    color_desc.Width = color_desc.Height = 128;
+    color_desc.MipLevels = color_desc.ArraySize = color_desc.SampleDesc.Count = 1;
+    color_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    color_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> color, copied;
+    ComPtr<ID3D11RenderTargetView> color_view;
+    expect(SUCCEEDED(draw_device->CreateTexture2D(&color_desc, nullptr, &color)) &&
+        SUCCEEDED(draw_device->CreateTexture2D(&color_desc, nullptr, &copied)) &&
+        SUCCEEDED(draw_device->CreateRenderTargetView(color.Get(), nullptr, &color_view)),
+        "retention clear/copy precondition creates valid color resources");
+    if (color_view && copied)
+    {
+        // 2026-11-16：实读硬件把0.5清成127，WARP为128；端点颜色隔离命令路由与量化。
+        const FLOAT value[] = {0.0f, 1.0f, 1.0f, 1.0f};
+        draw_context->ClearRenderTargetView(color_view.Get(), value);
+        expect(observed(draw_context), "target clear retains both production routes before readback");
+        // 各操作独立开窗，前一项失配不能污染后一项的起点。
+        draw_context->Flush();
+        expect(observed(draw_context), "Flush establishes the next copy observation window");
+        draw_context->CopySubresourceRegion(copied.Get(), 0, 0, 0, 0, color.Get(), 0, nullptr);
+        expect(observed(draw_context), "subresource copy retains both production routes before readback");
+        draw_context->Flush();
+        color_desc.Usage = D3D11_USAGE_STAGING;
+        color_desc.BindFlags = 0;
+        color_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Texture2D> readback;
+        expect(SUCCEEDED(draw_device->CreateTexture2D(&color_desc, nullptr, &readback)),
+            "retention clear/copy readback texture exists");
+        if (readback)
+        {
+            draw_context->CopyResource(readback.Get(), copied.Get());
+            D3D11_MAPPED_SUBRESOURCE mapped {};
+            const HRESULT read = draw_context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+            expect(SUCCEEDED(read), "retention clear/copy readback maps");
+            if (SUCCEEDED(read))
+            {
+                const auto *pixel = static_cast<const unsigned char *>(mapped.pData);
+                std::printf("retention copied pixel=%u,%u,%u,%u\n",
+                    pixel[0], pixel[1], pixel[2], pixel[3]);
+                expect(pixel[0] == 0 && pixel[1] == 255 && pixel[2] == 255 && pixel[3] == 255,
+                    "retention clear and subresource copy preserve exact pixels");
+                draw_context->Unmap(readback.Get(), 0);
+            }
+        }
+    }
+    D3D11_TEXTURE2D_DESC depth_desc {};
+    depth_desc.Width = depth_desc.Height = 128;
+    depth_desc.MipLevels = depth_desc.ArraySize = depth_desc.SampleDesc.Count = 1;
+    depth_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    ComPtr<ID3D11Texture2D> depth;
+    ComPtr<ID3D11DepthStencilView> depth_view;
+    expect(SUCCEEDED(draw_device->CreateTexture2D(&depth_desc, nullptr, &depth)) &&
+        SUCCEEDED(draw_device->CreateDepthStencilView(depth.Get(), nullptr, &depth_view)),
+        "retention depth-clear precondition creates a valid DSV");
+    if (depth_view)
+    {
+        draw_context->ClearDepthStencilView(depth_view.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+        expect(observed(draw_context), "depth clear retains both production routes before readback");
+    }
+}
+
 struct ForHwndFixture
 {
     using Create = decltype(&D3D11CreateDevice);
@@ -194,7 +284,7 @@ struct ForHwndFixture
     }
 
     void run(HMODULE bridge, Create create, bool device_first, bool returned, bool mixed, bool mirrored,
-        bool multithread, unsigned present_version)
+        bool multithread, unsigned present_version, bool retention)
     {
         // 设备先用例只通过另一设备登记同一 factory；不能借此登记待测 context。
         const HRESULT created = create_device(create, !device_first);
@@ -355,6 +445,8 @@ struct ForHwndFixture
             }
             if (draw_context && draw_device)
             {
+                if (retention)
+                    check_command_retention(bridge, draw_device, draw_context, round == 0);
                 if (compare_alternates && round == 0)
                     check_alternate_draws(draw_device, draw_context);
                 if (round == rounds - 1)
@@ -634,7 +726,8 @@ int wmain(int argc, wchar_t **argv)
     else if (for_hwnd)
         hwnd_fixture.run(bridge, cached_device, device_first, returned, mixed, mirrored,
             mode.find(L"multithread") != std::wstring::npos,
-            mode.ends_with(L"-present1") ? 2 : mode.ends_with(L"-present") ? 1 : 0);
+            mode.ends_with(L"-present1") ? 2 : mode.ends_with(L"-present") ? 1 : 0,
+            mode.ends_with(L"-retention"));
     else if (real_device)
     {
         wchar_t system[MAX_PATH] {};

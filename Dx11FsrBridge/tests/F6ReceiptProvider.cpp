@@ -3,8 +3,11 @@
 #include "../ngx/F6EvalReceiptV1.h"
 #include "../interop/BeforeSrV1.h"
 #include "../third_party/ngx/nvsdk_ngx_params.h"
+#include "../Il2CppCallSiteHook.h"
+#include "../runtime/FrameTimeline.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <atomic>
@@ -57,10 +60,26 @@ private:
 };
 
 Parameters g_main, g_query;
-NVSDK_NGX_Handle g_feature { 17 };
+struct FixtureFeature
+{
+    NVSDK_NGX_Handle handle {};
+    bool active = false;
+};
+std::array<FixtureFeature, il2cpp_callsite::k_render_instance_capacity> g_features {};
+unsigned g_feature_id = 16;
+unsigned g_feature_releases = 0;
+extern "C" __declspec(dllexport) unsigned ReceiptFixtureCreates() { return g_feature_id - 16; }
+extern "C" __declspec(dllexport) unsigned ReceiptFixtureReleases() { return g_feature_releases; }
+bool active_feature(const NVSDK_NGX_Handle *handle)
+{
+    for (const auto &feature : g_features)
+        if (feature.active && &feature.handle == handle) return true;
+    return false;
+}
 unsigned g_params_issued = 0;
 unsigned g_ao_frames = 0;
 bool g_ao_fixture = false;
+bool g_scene_depth_fixture = false;
 #if !defined(BEFORE_SR_LEGACY_FIXTURE)
 unsigned g_eval = 0;
 unsigned g_receipt_display_width = 1024, g_receipt_display_height = 1024;
@@ -69,10 +88,10 @@ struct InputMapState
     bool enabled = false, delayed = false;
     std::uint64_t keys[2] {};
     unsigned create_flags = 0, create_count = 0;
+    std::array<std::uint64_t, 2> last_evaluate_tick {};
 };
 InputMapState g_input_map;
 #endif
-bool g_active = false;
 }
 
 #define EXPORT extern "C" __declspec(dllexport) NVSDK_NGX_Result NVSDK_CONV
@@ -115,7 +134,7 @@ EXPORT NVSDK_NGX_D3D11_GetFeatureRequirements(IDXGIAdapter *, const NVSDK_NGX_Fe
 EXPORT NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext *, NVSDK_NGX_Feature kind,
     [[maybe_unused]] NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
-    if (!out || g_active || kind != NVSDK_NGX_Feature_SuperSampling) return NVSDK_NGX_Result_Fail;
+    if (!out || kind != NVSDK_NGX_Feature_SuperSampling) return NVSDK_NGX_Result_Fail;
 #if !defined(BEFORE_SR_LEGACY_FIXTURE)
     if (g_input_map.enabled)
     {
@@ -124,18 +143,33 @@ EXPORT NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext *, NVSDK_NGX_Feature ki
         ++g_input_map.create_count;
     }
 #endif
-    *out = &g_feature;
-    g_active = true;
-    return NVSDK_NGX_Result_Success;
+    for (auto &feature : g_features)
+        if (!feature.active)
+        {
+            feature.handle.id = ++g_feature_id;
+            feature.active = true;
+            *out = &feature.handle;
+            return NVSDK_NGX_Result_Success;
+        }
+    return NVSDK_NGX_Result_Fail;
 }
 EXPORT NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle *handle)
 {
-    if (!g_active || handle != &g_feature) return NVSDK_NGX_Result_Fail;
-    g_active = false;
-    return NVSDK_NGX_Result_Success;
+    for (auto &feature : g_features)
+        if (feature.active && handle == &feature.handle)
+        {
+            feature.active = false;
+            ++g_feature_releases;
+            return NVSDK_NGX_Result_Success;
+        }
+    return NVSDK_NGX_Result_Fail;
 }
 extern "C" __declspec(dllexport) void ConfigureBeforeSrAoFixture() noexcept { g_ao_fixture = true; }
 extern "C" __declspec(dllexport) unsigned BeforeSrAoFixtureFrames() noexcept { return g_ao_frames; }
+extern "C" __declspec(dllexport) void ConfigureSceneDepthFixture() noexcept
+{
+    g_ao_fixture = g_scene_depth_fixture = true;
+}
 #if !defined(BEFORE_SR_LEGACY_FIXTURE)
 extern "C" __declspec(dllexport) void ConfigureReceiptFixtureDisplay(unsigned width, unsigned height) noexcept
 {
@@ -145,17 +179,45 @@ extern "C" __declspec(dllexport) void ConfigureReceiptFixtureDisplay(unsigned wi
 }
 #endif
 
+static bool scene_depth_matches(ID3D11DeviceContext *context, const NVSDK_NGX_Parameter *p)
+{
+    if (!g_scene_depth_fixture) return true;
+    // 2026-11-16：只在夹具读回 SDK 实际深度；同尺寸无关 DSV 的 0.25 必须被检测出来。
+    using Microsoft::WRL::ComPtr;
+    ID3D11Resource *depth = nullptr;
+    if (p->Get(NVSDK_NGX_Parameter_Depth, &depth) != NVSDK_NGX_Result_Success || !depth) return false;
+    ComPtr<ID3D11Device> device;
+    context->GetDevice(device.GetAddressOf());
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = desc.Height = desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> sample;
+    if (!device || FAILED(device->CreateTexture2D(&desc, nullptr, sample.GetAddressOf()))) return false;
+    const D3D11_BOX box {256, 256, 0, 257, 257, 1};
+    context->CopySubresourceRegion(sample.Get(), 0, 0, 0, 0, depth, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    if (FAILED(context->Map(sample.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    float value = 0.f;
+    std::memcpy(&value, mapped.pData, sizeof(value));
+    context->Unmap(sample.Get(), 0);
+    std::printf("scene depth source: actual=%.3f expected_fsr=0.500 unrelated_dsv=0.250\n", value);
+    return value == 0.5f;
+}
+
 static NVSDK_NGX_Result copy_eval_color(ID3D11DeviceContext *context, const NVSDK_NGX_Handle *handle,
     const NVSDK_NGX_Parameter *p)
 {
     ID3D11Resource *color = nullptr, *output = nullptr;
     unsigned render = 0, height = 0;
-    if (!context || !p || handle != &g_feature || !g_active ||
+    if (!context || !p || !active_feature(handle) ||
         p->Get(NVSDK_NGX_Parameter_Color, &color) != NVSDK_NGX_Result_Success || !color ||
         p->Get(NVSDK_NGX_Parameter_Output, &output) != NVSDK_NGX_Result_Success || !output ||
         p->Get(NVSDK_NGX_Parameter_Width, &render) != NVSDK_NGX_Result_Success || !render ||
         p->Get(NVSDK_NGX_Parameter_Height, &height) != NVSDK_NGX_Result_Success || !height)
         return NVSDK_NGX_Result_Fail;
+    if (!scene_depth_matches(context, p)) return NVSDK_NGX_Result_Fail;
     using Microsoft::WRL::ComPtr;
     ComPtr<ID3D11Texture2D> target;
     if (FAILED(output->QueryInterface(IID_PPV_ARGS(target.GetAddressOf())))) return NVSDK_NGX_Result_Fail;
@@ -261,9 +323,14 @@ NVSDK_NGX_Result evaluate_input_map(ID3D11DeviceContext &context, const NVSDK_NG
         NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     constexpr unsigned k_guide_flags = k_expected_flags | NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     const bool scale_ok = sx == k_render_width && sy == k_render_height;
+    const auto now = GetTickCount64();
+    const auto previous = g_input_map.last_evaluate_tick[test.instance];
+    const bool expected_reset = test.reset || (previous != 0 &&
+        now - previous > neo::graphics::FrameTimeline::k_takeover_gap_ms);
+    g_input_map.last_evaluate_tick[test.instance] = now;
     const bool bindings_ok = w == k_render_width && h == k_render_height && sub_w == w && sub_h == h &&
         ow == k_display_width && oh == k_display_height && jx == expected_x && jy == expected_y && scale_ok &&
-        reset == test.reset && frame.frame == ordinal &&
+        reset == int(expected_reset) && frame.frame == ordinal &&
         frame.instance == g_input_map.keys[test.instance] && frame.jitter_x == jx && frame.jitter_y == jy &&
         frame.motion_scale_x == sx && frame.motion_scale_y == sy &&
         (g_input_map.create_flags & k_guide_flags) == k_expected_flags;
@@ -271,7 +338,7 @@ NVSDK_NGX_Result evaluate_input_map(ID3D11DeviceContext &context, const NVSDK_NG
         "expected=(%.6f,%.6f) mv_scale=(%.1f,%.1f) scale_ok=%d reset=%d expected_reset=%d "
         "create_flags=0x%X create_count_total=%u request=%llu ok=%d\n",
         static_cast<unsigned long long>(frame.frame), static_cast<unsigned long long>(frame.instance),
-        w, h, sub_w, sub_h, ow, oh, jx, jy, expected_x, expected_y, sx, sy, scale_ok, reset, test.reset,
+        w, h, sub_w, sub_h, ow, oh, jx, jy, expected_x, expected_y, sx, sy, scale_ok, reset, expected_reset,
         g_input_map.create_flags, g_input_map.create_count, static_cast<unsigned long long>(request), bindings_ok);
 
     ComPtr<ID3D11Device> device;
@@ -339,7 +406,7 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
 {
     using namespace neo::ngx;
     const unsigned input_map_ordinal = g_input_map.enabled ? ++g_eval : 0;
-    if (!context || !p || !g_active || handle != &g_feature || !receipt ||
+    if (!context || !p || !active_feature(handle) || !receipt ||
         receipt->size != sizeof(F6EvalReceiptV1) || receipt->version != 1)
         return NVSDK_NGX_Result_Fail;
     if (input_map_ordinal != 0)
@@ -356,13 +423,18 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
         const auto query = reinterpret_cast<QueryBeforeSrFrameV1>(GetProcAddress(
             GetModuleHandleW(L"Dx11FsrBridge.dll"), k_query_before_sr_frame_v1));
         BeforeSrFrameV1 input, unrelated;
-        // AO 替代颜色也必须与实际参数袋同一对象；不能把原源 SRV 或 transfer 冒充输出声明。
+        // 2026-11-16：AO 写回颜色必须有自己的 UNORM 视图；不把原游戏 SRV 或未知编码冒充声明。
         if (!query || query(context, color, depth, &input) != S_OK || input.color != color ||
             input.motion != motion || input.depth != depth || input.frame != g_ao_frames + 1 ||
             input.color_storage_format != DXGI_FORMAT_R8G8B8A8_TYPELESS ||
-            input.color_view_format != DXGI_FORMAT_UNKNOWN || input.color_transfer != ColorTransfer::unknown ||
+            input.color_view_format != DXGI_FORMAT_R8G8B8A8_UNORM || input.color_transfer != ColorTransfer::unknown ||
             query(context, output, depth, &unrelated) != S_FALSE)
+        {
+            std::printf("AO producer contract mismatch: view=%u expected=%u transfer=%u\n",
+                static_cast<unsigned>(input.color_view_format),
+                static_cast<unsigned>(DXGI_FORMAT_R8G8B8A8_UNORM), static_cast<unsigned>(input.color_transfer));
             return NVSDK_NGX_Result_Fail;
+        }
         const auto result = copy_eval_color(context, handle, p);
         if (result == NVSDK_NGX_Result_Success)
         {

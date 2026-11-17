@@ -51,12 +51,9 @@ void set_use_reactive_mask(bool on);                        // NgxUseReactiveMas
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
 void set_before_sr_ao(bool enable);                         // NgxBeforeSrAo，默认 false
-// NgxCrossKeyReuse，默认 true（ini 里 1）。语义：instance_key 变了，但建池/建 feature 真正
-//   依赖的「render/display 尺寸 + color/output 格式」全等时，**复用**现有资源池与 feature，
-//   不销毁重建。false（ini 里 0）⇒ 每次 key 变化都走原来的 destroy + create，与引入该键之前
-//   逐字节同一条路径。
-// ★ 为什么需要它：destroy_instance() 里的 g_release(feature) 实测 ~502ms（E2），
-//   而进出角色界面这类 key 切换的尺寸/格式并不变，销毁重建纯属浪费 ⇒ ~500ms 卡顿 + 短暂黑屏。
+// NgxCrossKeyReuse，默认 true：实例缓存满后，新 key 可接收同尺寸/格式的 LRU 池与 feature，
+// 并 Reset。关闭时先退休旧 feature 再创建；缓存内已有实例始终各自保留历史。
+// 2026-11-16：四路宿主覆盖隔离；真实游戏的显存、切换耗时及画面尚待测量。
 void set_cross_key_reuse(bool on);
 
 // 2026-11-10（B154）：NGX 实现来源（NgxProvider 键），默认 auto。

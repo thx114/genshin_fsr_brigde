@@ -13,29 +13,32 @@ HRESULT WINAPI callback_in_progress(const BeforeSrFrameV1 *, ID3D11Texture2D **)
 std::atomic<RecordBeforeSrV1> g_callback { nullptr };
 thread_local const neo::ngx::BeforeSrInput *g_current_input = nullptr;
 
-DXGI_FORMAT copied_color_view_format(const neo::ngx::BeforeSrInput &input) noexcept
+DXGI_FORMAT producer_view_format(const neo::ngx::BeforeSrColorSource &producer) noexcept
 {
-    if (!input.source_color || !input.source_view) return DXGI_FORMAT_UNKNOWN;
+    if (!producer.texture || !producer.view) return DXGI_FORMAT_UNKNOWN;
     D3D11_SHADER_RESOURCE_VIEW_DESC desc {};
-    input.source_view->GetDesc(&desc);
+    producer.view->GetDesc(&desc);
     if (desc.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D || desc.Texture2D.MostDetailedMip != 0 ||
         desc.Texture2D.MipLevels != 1)
         return DXGI_FORMAT_UNKNOWN;
 
-    // 2026-11-15：同尺寸 typeless 副本也能创建相同的 typed SRV，唯有 CopyResource 的源能描述实际读法。
+    // 2026-11-16：同尺寸副本可以有不同读法；只接受当前 producer 自己的视图。
     ComPtr<ID3D11Resource> viewed;
-    input.source_view->GetResource(viewed.GetAddressOf());
-    if (viewed.Get() == input.source_color) return desc.Format;
+    producer.view->GetResource(viewed.GetAddressOf());
+    if (viewed.Get() == producer.texture) return desc.Format;
     ComPtr<IUnknown> view_identity, source_identity;
     return viewed && SUCCEEDED(viewed.As(&view_identity)) &&
-        SUCCEEDED(input.source_color->QueryInterface(IID_PPV_ARGS(source_identity.GetAddressOf()))) &&
+        SUCCEEDED(producer.texture->QueryInterface(IID_PPV_ARGS(source_identity.GetAddressOf()))) &&
         view_identity.Get() == source_identity.Get() ? desc.Format : DXGI_FORMAT_UNKNOWN;
 }
 
 BeforeSrFrameV1 describe_input(const neo::ngx::BeforeSrInput &input) noexcept
 {
     BeforeSrFrameV1 frame = input.frame;
-    frame.color_view_format = copied_color_view_format(input);
+    frame.color_view_format = producer_view_format(input.producer);
+    // 缺失或失配的 producer 不能借 frame 中的旧声明认证本帧。
+    frame.color_transfer = frame.color_view_format == DXGI_FORMAT_UNKNOWN ? ColorTransfer::unknown :
+        input.producer.transfer;
     return frame;
 }
 

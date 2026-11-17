@@ -54,14 +54,6 @@ FrameBindings::Resource FrameBindings::input_resource(UINT slot) noexcept
     return slot < input_count_ ? acquire_resource(inputs()[slot]) : Resource {};
 }
 
-FrameBindings::Texture FrameBindings::scene_depth() const noexcept
-{
-    // 后端读取的是当前 DSV 的纹理；不再加引四个无关 RTV。
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> view;
-    context_.OMGetRenderTargets(0, nullptr, view.GetAddressOf());
-    return texture_2d(acquire_resource(view.Get()));
-}
-
 FrameBindings::Texture FrameBindings::texture_2d(const Resource &resource) noexcept
 {
     Texture texture;

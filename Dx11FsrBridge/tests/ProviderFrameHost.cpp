@@ -4,6 +4,7 @@
 
 #include "create-routing/DrawCapture.h"
 #include "NgxInputMapFixture.h"
+#include "NgxMultiSceneFixture.h"
 #include "../game/AnchorPatterns.h"
 #include "../ngx/F6EvalReceiptV1.h"
 #include "../interop/BeforeSrV1.h"
@@ -109,6 +110,209 @@ bool run_input_map(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE p
         if (!written || count != n + 1) return false;
     }
     return true;
+}
+
+bool run_scene_depth(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
+    std::FILE *observations)
+{
+    // 2026-11-16：同一实例只改变 DSV，SDK 必须继续收到实际 FSR 输入的 0.5 深度。
+    const auto configure = reinterpret_cast<void (*)()>(GetProcAddress(provider, "ConfigureSceneDepthFixture"));
+    if (!configure) return false;
+    configure();
+    RenderFixture instance;
+    const CaptureExtent extent { 512, 512 };
+    constexpr std::uint32_t colors[] { 0xFF216BC2u, 0xFF73B133u, 0xFFCF465Au, 0xFF3AA4E5u,
+        0xFF8859C8u, 0xFFCCAB42u };
+    for (unsigned n = 0; n < std::size(colors); ++n)
+    {
+        CaptureFrame frame { extent, extent, [&] { instance.publish(extent, extent, 0.f, 0.f); }, true };
+        frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        frame.alternate_scene_pixel = colors[n];
+        frame.exact_provider_pixel = colors[n];
+        frame.typeless_depth = true;
+        if (n >= 2)
+        {
+            frame.scene_depth_format = n < 4 ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_R32_TYPELESS;
+            frame.scene_depth_readable = n >= 4;
+        }
+        const bool delivered = draw_capture(&device, &context, CaptureEntry::draw, frame, observations);
+        std::fprintf(observations, "scene depth: frame=%u instance=%c dsv=%u readable=%d delivered=%d\n",
+            n + 1, 'A', frame.scene_depth_format,
+            frame.scene_depth_readable, delivered);
+        if (!delivered) return false;
+    }
+    return true;
+}
+
+bool run_failure_recovery(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
+    std::FILE *observations)
+{
+    using Configure = void (*)() noexcept;
+    using FrameCount = unsigned (*)() noexcept;
+    const auto configure = reinterpret_cast<Configure>(GetProcAddress(provider, "ConfigureBeforeSrAoFixture"));
+    const auto evaluate_count = reinterpret_cast<FrameCount>(GetProcAddress(provider, "BeforeSrAoFixtureFrames"));
+    if (!configure || !evaluate_count) return false;
+    configure();
+    RenderFixture instances[2];
+    struct Step
+    {
+        unsigned scene;
+        bool publish, broken_motion, provider;
+        unsigned evaluations;
+    };
+    constexpr Step steps[] {
+        {0, true, false, true, 1}, {1, true, false, true, 2},
+        {0, true, true, false, 2}, {0, false, false, false, 2},
+        {1, true, false, true, 3}, {0, true, false, true, 4},
+        {1, true, false, true, 5}, {0, true, false, true, 6},
+    };
+    for (unsigned n = 0; n < std::size(steps); ++n)
+    {
+        const auto &step = steps[n];
+        const CaptureExtent extent {step.scene ? 384u : 512u, 256u};
+        CaptureFrame frame {extent, extent, [&]
+            {
+                if (step.publish) instances[step.scene].publish(extent, extent, 0.f, 0.f);
+            }, step.provider};
+        // 2026-11-16：失败后的 Draw 不发布 Render，但仍绑定完整输入，专门检验无输出时的放行。
+        frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        frame.alternate_scene_pixel = 0xFF31629Au + n * 0x000B0703u;
+        frame.exact_provider_pixel = frame.alternate_scene_pixel;
+        frame.typeless_depth = true;
+        if (step.broken_motion) frame.motion_source_format = DXGI_FORMAT_R32_UINT;
+        const bool pixels = draw_capture(&device, &context, CaptureEntry::draw, frame, observations);
+        const unsigned evaluated = evaluate_count();
+        std::fprintf(observations,
+            "failure recovery: step=%u scene=%c render=%d broken_motion=%d pixels=%d eval=%u expected=%u\n",
+            n + 1, 'A' + step.scene, step.publish, step.broken_motion, pixels, evaluated, step.evaluations);
+        if (!pixels || evaluated != step.evaluations) return false;
+    }
+    return true;
+}
+
+bool run_guide_views(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
+    std::FILE *observations)
+{
+    const auto configure = reinterpret_cast<void (*)()>(GetProcAddress(provider, "ConfigureBeforeSrAoFixture"));
+    const auto evaluations = reinterpret_cast<unsigned (*)()>(GetProcAddress(provider, "BeforeSrAoFixtureFrames"));
+    const auto creates = reinterpret_cast<unsigned (*)()>(GetProcAddress(provider, "ReceiptFixtureCreates"));
+    const auto releases = reinterpret_cast<unsigned (*)()>(GetProcAddress(provider, "ReceiptFixtureReleases"));
+    if (!configure || !evaluations || !creates || !releases) return false;
+    configure();
+    RenderFixture instances[2];
+    CaptureTextures retained[2];
+    struct Case { unsigned scene, width; bool unknown; DXGI_FORMAT view; };
+    constexpr Case cases[] {
+        {0, 512, false, DXGI_FORMAT_UNKNOWN}, {1, 512, false, DXGI_FORMAT_UNKNOWN},
+        {0, 384, true, DXGI_FORMAT_R8G8_UNORM}, {0, 512, false, DXGI_FORMAT_UNKNOWN},
+        {1, 384, true, DXGI_FORMAT_R8G8_UNORM}, {1, 512, false, DXGI_FORMAT_UNKNOWN},
+        {0, 512, true, DXGI_FORMAT_R8G8_SNORM}, {0, 512, false, DXGI_FORMAT_UNKNOWN},
+    };
+    unsigned expected_evaluations = 0;
+    for (unsigned n = 0; n < std::size(cases); ++n)
+    {
+        const auto &test = cases[n];
+        const unsigned scene = test.scene;
+        const CaptureExtent extent {test.width, 256};
+        CaptureFrame frame {extent, extent,
+            [&] { instances[scene].publish(extent, extent, 0.f, 0.f); }, !test.unknown};
+        frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        frame.alternate_scene_pixel = 0xFF314A65u + n * 0x00070305u;
+        frame.exact_provider_pixel = frame.alternate_scene_pixel;
+        frame.typeless_depth = true;
+        frame.retained_textures = &retained[scene];
+        if (test.unknown)
+        {
+            // 2026-11-16：重放日志中的资源类型，视图由夹具明确创建，不能据此推定游戏编码。
+            frame.depth_source_format = DXGI_FORMAT_R32G8X24_TYPELESS;
+            frame.motion_source_format = DXGI_FORMAT_R8G8_TYPELESS;
+            frame.motion_source_view = test.view;
+        }
+        const bool pixels = draw_capture(&device, &context, CaptureEntry::draw, frame, observations);
+        const unsigned expected_features = n == 0 ? 1 : 2;
+        if (!test.unknown) ++expected_evaluations;
+        std::fprintf(observations,
+            "guide views: frame=%u scene=%c motion=%u view=%u pixels=%d eval=%u create=%u release=%u\n",
+            n + 1, 'A' + scene, static_cast<unsigned>(frame.motion_source_format),
+            static_cast<unsigned>(frame.motion_source_view), pixels, evaluations(), creates(), releases());
+        if (!pixels || evaluations() != expected_evaluations || creates() != expected_features || releases() != 0)
+            return false;
+    }
+    // 2026-11-16：只在诊断构型要求一次真实 DXBC/CB 回执；正式构型必须裁掉采集。
+    std::string log;
+    for (unsigned attempt = 0; attempt < 50; ++attempt)
+    {
+        std::ifstream file("Dx11FsrBridge.log", std::ios::binary);
+        log.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+        if (!DX11FSRBRIDGE_TEST_DIAGNOSTICS || log.find("before_sr_consumer_bindings") != std::string::npos) break;
+        Sleep(10);
+    }
+    const auto first = log.find("before_sr_consumer_bindings");
+    const bool captured = first != std::string::npos;
+    if (captured != static_cast<bool>(DX11FSRBRIDGE_TEST_DIAGNOSTICS)) return false;
+    if (captured && (log.find("before_sr_consumer_bindings", first + 1) != std::string::npos ||
+        log.find("\"binding_bytes_complete\":true", first) == std::string::npos ||
+        log.find("\"view_format\":49", first) == std::string::npos)) return false;
+    return true;
+}
+
+bool run_multi_scene(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
+    std::FILE *observations)
+{
+    using namespace neo::tests::multi_scene;
+    const auto configure = reinterpret_cast<Configure>(GetProcAddress(provider, "ConfigureMultiSceneFixture"));
+    const auto select = reinterpret_cast<Select>(GetProcAddress(provider, "SelectMultiSceneFrame"));
+    const auto complete = reinterpret_cast<Complete>(GetProcAddress(provider, "MultiSceneComplete"));
+    if (!configure || !select || !complete) return false;
+    std::array<RenderFixture, k_scene_count> instances;
+    std::array<std::array<CaptureTextures, 2>, k_scene_count> textures;
+    std::array<unsigned, k_scene_count> draw_counts {};
+    std::array<std::uint64_t, k_scene_count> keys {};
+    for (std::size_t i = 0; i < keys.size(); ++i) keys[i] = instances[i].key();
+    configure(keys.data());
+    std::uint64_t batch_tick = 0;
+    for (unsigned n = 0; n < std::size(k_frames); ++n)
+    {
+        const auto &test = k_frames[n];
+        const CaptureExtent extent {test.width, test.height};
+        auto &instance = instances[test.scene];
+        std::uint64_t pending_age = 0;
+        CaptureFrame frame {extent, extent, [&]
+            {
+                if (n < k_simultaneous_begin) instance.publish(extent, extent, 0.f, 0.f);
+                else
+                {
+                    if ((n - k_simultaneous_begin) % k_scene_count == 0)
+                    {
+                        // 2026-11-16：第一笔 Draw 准备好后再发布四路，不让 shader 编译占用 token 窗口。
+                        batch_tick = GetTickCount64();
+                        for (unsigned offset = 0; offset < k_scene_count; ++offset)
+                        {
+                            const auto &pending = k_frames[n + k_scene_count - 1 - offset];
+                            const CaptureExtent size {pending.width, pending.height};
+                            instances[pending.scene].publish(size, size, 0.f, 0.f);
+                        }
+                    }
+                    pending_age = GetTickCount64() - batch_tick;
+                }
+            }, true};
+        frame.retained_textures = &textures[test.scene][draw_counts[test.scene]++ % 2];
+        frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        frame.alternate_scene_pixel = color(n);
+        frame.exact_provider_pixel = color(n);
+        frame.typeless_depth = true;
+        // 2026-11-16：各路携带独立且无关的 DSV；可读性不能覆盖实际 FSR depth SRV。
+        frame.scene_depth_format = test.readable_dsv ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_D32_FLOAT;
+        frame.scene_depth_readable = test.readable_dsv;
+        select(n);
+        const bool delivered = draw_capture(&device, &context, CaptureEntry::draw, frame, observations);
+        std::fprintf(observations,
+            "multi scene: frame=%u scene=%c simultaneous=%d pending_age_ms=%llu delivered=%d\n",
+            n + 1, 'A' + test.scene, n >= k_simultaneous_begin,
+            static_cast<unsigned long long>(pending_age), delivered);
+        if (!delivered) return false;
+    }
+    return complete();
 }
 }
 
@@ -219,19 +423,33 @@ int wmain(int argc, wchar_t **argv)
     const bool receipt = check_prewarm || mode == L"ngx-receipt" || mode == L"ngx-receipt-dlaa";
     const bool same_size = mode == L"ngx-receipt-dlaa" || mode == L"ngx-v1-dlaa" ||
         mode == L"ngx-nvidia-dlaa";
+    const bool producer_overwrite = mode == L"ngx-producer-overwrite";
+    const bool producer_other_sdk = mode == L"ngx-producer-other-sdk";
+    const bool producer_om_uav = mode == L"ngx-producer-om-uav";
+    const int producer_write_operation = mode == L"ngx-producer-copy" ? 0 :
+        mode == L"ngx-producer-copy-region" ? 1 : mode == L"ngx-producer-clear" ? 2 :
+        mode == L"ngx-producer-update" ? 3 : -1;
+    const bool producer_capture = producer_overwrite || producer_other_sdk || producer_om_uav ||
+        producer_write_operation >= 0 || mode == L"ngx-producer-capture";
     const bool before_sr = mode == L"ngx-before-sr";
     const bool ao_v1 = mode == L"ngx-ao-v1";
     const bool f6_ao = mode == L"ngx-v1-ao-on" || mode == L"ngx-v1-ao-off";
     const bool nvidia_ao = mode == L"ngx-nvidia-ao-on" || mode == L"ngx-nvidia-ao-off";
-    const bool present_before_draw = mode == L"ngx-v1-present" || mode == L"ngx-nvidia-present";
+    const bool present_before_draw = producer_capture || mode == L"ngx-v1-present" || mode == L"ngx-nvidia-present";
     const bool nvidia = nvidia_ao || mode == L"ngx-nvidia-present" || mode == L"ngx-nvidia-dlaa";
     const bool ao_enabled = mode == L"ngx-ao" || ao_v1 || mode.ends_with(L"-ao-on");
     const bool ao_fixture = mode == L"ngx-ao" || mode == L"ngx-ao-off" || ao_v1;
     const bool test_ao = ao_fixture || f6_ao || nvidia_ao;
     const bool delayed_input = mode == L"ngx-input-map-delayed";
     const bool input_map = mode == L"ngx-input-map-current" || delayed_input;
-    const bool fixture = receipt || before_sr || input_map || ao_fixture;
-    const wchar_t *fixture_name = before_sr || (ao_fixture && !ao_v1) ? L"BeforeSrProvider.dll" :
+    const bool scene_depth = mode == L"ngx-scene-depth";
+    const bool multi_scene = mode == L"ngx-multi-scene";
+    const bool failure_recovery = mode == L"ngx-failure-recovery";
+    const bool guide_views = mode == L"ngx-guide-views";
+    const bool fixture = receipt || before_sr || input_map || ao_fixture ||
+        scene_depth || multi_scene || failure_recovery || producer_capture || guide_views;
+    const wchar_t *fixture_name = multi_scene ? L"NgxMultiSceneProvider.dll" :
+        before_sr || producer_capture || scene_depth || failure_recovery || guide_views || (ao_fixture && !ao_v1) ? L"BeforeSrProvider.dll" :
         L"F6ReceiptProvider.dll";
     if (argc != 2 && (argc != 4 || !fixture))
     {
@@ -279,9 +497,11 @@ int wmain(int argc, wchar_t **argv)
         << "Fsr2Il2CppRenderRva=0x" << std::hex << ucb + k_render_offset << "\nFsr2Il2CppUcbRva=0x" << ucb << '\n';
     if (ngx)
     {
+        if (producer_capture || guide_views) config << "Fsr2TraceColorProducers=1\nFsr2FamilySkip=0\n";
         config << "Ffx12Backend=ngx\nNgxHdr=0\nNgxLogLevel=3\nNgxProvider="
             << (nvidia ? "nvidia" : "external") << '\n';
         if (prewarm) config << "NgxPrewarmAtSwapchain=1\n";
+        if (failure_recovery) config << "Fsr2FamilySkip=1\n";
         if (test_ao)
             config << "NgxBeforeSrAo=" << ao_enabled << "\nFfx12DepthInverted=1\nFfx12CameraNear=0.5\nFfx12CameraFar=100\n";
         if (input_map)
@@ -303,7 +523,7 @@ int wmain(int argc, wchar_t **argv)
         provider_module = LoadLibraryW(provider.c_str());
         if (!provider_module || !GetProcAddress(provider_module, "NVSDK_NGX_D3D11_Init_Ext")) return 3;
         const bool has_receipt = GetProcAddress(provider_module, neo::ngx::k_f6_evaluate_v1) != nullptr;
-        const bool expect_receipt = receipt || input_map || real_receipt || ao_v1;
+        const bool expect_receipt = receipt || input_map || real_receipt || ao_v1 || multi_scene;
         std::fprintf(observations.get(), "provider export: v1=%d expected=%d\n", has_receipt, expect_receipt);
         if (has_receipt != expect_receipt) return 3;
         if (receipt && same_size)
@@ -359,8 +579,8 @@ int wmain(int argc, wchar_t **argv)
         window.handle = CreateWindowExW(0, L"STATIC", L"Neo provider Present fixture", WS_POPUP,
             0, 0, 2560, 1600, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
         DXGI_SWAP_CHAIN_DESC1 desc {};
-        desc.Width = 2560;
-        desc.Height = 1600;
+        desc.Width = producer_capture ? 1024 : 2560;
+        desc.Height = producer_capture ? 1024 : 1600;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         desc.SampleDesc.Count = 1;
         desc.BufferCount = 1;
@@ -381,6 +601,68 @@ int wmain(int argc, wchar_t **argv)
         }
         return draw_capture(device.Get(), context.Get(), entry, frame, observations.get());
     };
+    if (scene_depth)
+        return run_scene_depth(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+    if (multi_scene)
+        return run_multi_scene(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+    if (failure_recovery)
+        return run_failure_recovery(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+    if (guide_views)
+        return run_guide_views(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+    if (producer_capture)
+    {
+        RenderFixture target_instance, other_instance;
+        const CaptureExtent render {512, 512}, display {1024, 1024};
+        CaptureFrame frame {render, display, [&] { target_instance.publish(render, display, 0.f, 0.f); }, true};
+        frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        frame.exact_provider_pixel = frame.alternate_scene_pixel;
+        frame.producer_roundtrip = true;
+        frame.producer_overwrite = producer_overwrite;
+        frame.producer_om_uav = producer_om_uav;
+        frame.producer_write_operation = producer_write_operation;
+        if (producer_other_sdk)
+        {
+            frame.producer_before_consume = [&]
+            {
+                // 2026-11-16：同 context、不同颜色和实例先经过真实 SDK，再回到原目标。
+                CaptureFrame other {render, display,
+                    [&] { other_instance.publish(render, display, 0.f, 0.f); }, true};
+                other.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+                other.alternate_scene_pixel = 0xFF826437u;
+                other.exact_provider_pixel = other.alternate_scene_pixel;
+                const bool delivered = draw_capture(device.Get(), context.Get(), CaptureEntry::draw,
+                    other, observations.get());
+                std::fprintf(observations.get(), "producer other SDK: instance=%llu exact_pixels=%d\n",
+                    static_cast<unsigned long long>(other_instance.key()), delivered);
+                return delivered;
+            };
+        }
+        const bool result = capture(CaptureEntry::draw, frame);
+        // 实际异步 logger 写完后再由外层读取日志；不读取或改写游戏配置。
+        std::fflush(observations.get());
+        Sleep(100);
+        std::ifstream log(root / L"Dx11FsrBridge.log");
+        const std::string contents((std::istreambuf_iterator<char>(log)), std::istreambuf_iterator<char>());
+        const auto begin = contents.find("before_sr_producer_bindings");
+        const auto end = begin == std::string::npos ? begin : contents.find('\n', begin);
+        const auto receipt = begin == std::string::npos ? std::string {} : contents.substr(begin, end - begin);
+        const bool captured = receipt.find("\"binding_bytes_complete\":true") != std::string::npos &&
+            receipt.find("\"sdk_observed\":true") != std::string::npos &&
+            receipt.find("\"sdk_instance\":" + std::to_string(target_instance.key()) + ',') != std::string::npos &&
+            receipt.find(producer_overwrite || producer_om_uav || producer_write_operation >= 0 ?
+                "\"latest_writer_matches\":false" :
+                "\"latest_writer_matches\":true") != std::string::npos &&
+            receipt.find("\"transfer\":\"unknown\"") != std::string::npos &&
+            receipt.find("\"writer_execution\":\"not-proven\"") != std::string::npos &&
+            receipt.find("\"original_call_returned\":true") != std::string::npos &&
+            (producer_write_operation < 0 ||
+                (receipt.find("\"overwrite_count_window\":1") != std::string::npos &&
+                    receipt.find("\"last_overwrite\":" + std::to_string(producer_write_operation) + ',') !=
+                        std::string::npos)) &&
+            receipt.find("0000403f0000403f") != std::string::npos;
+        std::fprintf(observations.get(), "producer capture: pixels=%d binding_snapshot=%d\n", result, captured);
+        return result && captured ? 0 : 1;
+    }
     if (input_map)
     {
         std::printf("input map: mode=3 delay=%d render=%ux%u display=%ux%u "

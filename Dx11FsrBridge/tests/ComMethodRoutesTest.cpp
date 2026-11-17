@@ -117,12 +117,78 @@ void test_vtable_slots()
     expect(info.Protect == PAGE_EXECUTE_READ && pages[next] == reinterpret_cast<void *>(22), "second page restored");
     VirtualFree(pages, 0, MEM_RELEASE);
 }
+
+void transition_complete(ID3D11DeviceContext *object);
+void STDMETHODCALLTYPE transition_observe(ID3D11DeviceContext *object, UINT count, UINT start);
+using TransitionRoutes = ComMethodRoutes<Draw, &transition_observe, 13, true, &transition_complete>;
+TransitionRoutes transition_original;
+void *transition_table[116] {};
+Context transition_context { transition_table };
+unsigned transition_calls = 0, completion_calls = 0, transition_takeovers = 0;
+
+void STDMETHODCALLTYPE transition_native(ID3D11DeviceContext *object, UINT, UINT)
+{
+    expect(object == reinterpret_cast<ID3D11DeviceContext *>(&transition_context),
+        "transition preserves the native receiver");
+    ++transition_calls;
+    transition_table[13] = reinterpret_cast<void *>(&transition_native);
+}
+
+void transition_complete(ID3D11DeviceContext *object)
+{
+    ++completion_calls;
+    if (!TransitionRoutes::bound_on(object))
+        expect(com_vtable::patch(object, 115, { TransitionRoutes::slot() }),
+            "completion repairs the runtime-written public slot");
+}
+
+void STDMETHODCALLTYPE transition_observe(ID3D11DeviceContext *object, UINT count, UINT start)
+{
+    if (count == 3)
+    {
+        ++transition_takeovers;
+        return;
+    }
+    transition_original(object, count, start);
+}
+
+void test_completion()
+{
+    // 2026-11-16：重现运行时原位还原入口，确认透传/业务早退/构造旁路各自的完成语义。
+    auto *object = reinterpret_cast<ID3D11DeviceContext *>(&transition_context);
+    transition_table[13] = TransitionRoutes::bind(reinterpret_cast<void *>(&transition_native));
+    transition_table[115] = reinterpret_cast<void *>(116);
+    object->Draw(0, 0);
+    expect(transition_calls == 1 && completion_calls == 1 && TransitionRoutes::bound_on(object),
+        "completion restores a slot before returning to the caller");
+    {
+        ContextPolicyBypass bypass(object);
+        object->Draw(3, 0);
+    }
+    expect(transition_calls == 2 && completion_calls == 2 && transition_takeovers == 0 &&
+        TransitionRoutes::bound_on(object), "internal forwarding still completes route maintenance");
+    {
+        D3D11CreationScope creation;
+        object->Draw(3, 0);
+    }
+    expect(transition_calls == 3 && completion_calls == 2 && !TransitionRoutes::bound_on(object),
+        "unfinished construction forwards without querying or repairing the object");
+    expect(com_vtable::patch(object, 115, { TransitionRoutes::slot() }), "completed object can rebind");
+    object->Draw(3, 0);
+    expect(transition_calls == 3 && completion_calls == 3 && transition_takeovers == 1,
+        "business takeover completes once without issuing the original Draw");
+    expect(transition_context.table == transition_table && transition_table[115] == reinterpret_cast<void *>(116),
+        "completion retains the private tail and the original vptr");
+}
 }
 
 int main()
 {
     native_table[13] = Routes::bind(reinterpret_cast<void *>(&native_draw));
     proxy_table[13] = reinterpret_cast<void *>(&proxy_draw);
+    expect(Routes::bound_on(reinterpret_cast<ID3D11DeviceContext *>(&native)) &&
+        !Routes::bound_on(reinterpret_cast<ID3D11DeviceContext *>(&proxy)),
+        "COM ownership distinguishes a routed native from an unbound forwarding proxy");
     const auto draw = reinterpret_cast<Draw>(proxy_table[13]);
     auto *context = reinterpret_cast<ID3D11DeviceContext *>(&proxy);
     draw(context, 3, 0);
@@ -162,6 +228,7 @@ int main()
     expect(!D3D11CreationScope::active() && takeovers == 3 && gpu_draws == 5,
         "bridge takeover resumes after the completed creation boundary");
     test_vtable_slots();
+    test_completion();
     std::printf("ComMethodRoutes takeover/bypass: %u failures\n", failures);
     return failures ? 1 : 0;
 }

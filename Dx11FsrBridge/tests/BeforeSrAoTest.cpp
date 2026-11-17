@@ -101,9 +101,22 @@ bool run(ID3D11Device &device, ID3D11DeviceContext &context, DXGI_FORMAT format)
     context.CSSetShaderResources(1, 1, &bound);
     BeforeSrAo ao;
     const bool flat_out = ao.record(device, context, *color.Get(), *depth.Get(), k_normal);
+    const auto producer = ao.color_output();
+    D3D11_SHADER_RESOURCE_VIEW_DESC output_view {};
+    ComPtr<ID3D11Resource> viewed_output;
+    if (producer.view)
+    {
+        producer.view->GetDesc(&output_view);
+        producer.view->GetResource(viewed_output.GetAddressOf());
+    }
+    const bool producer_ok = producer.texture == color.Get() && viewed_output.Get() == color.Get() &&
+        output_view.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+        output_view.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D &&
+        output_view.Texture2D.MostDetailedMip == 0 && output_view.Texture2D.MipLevels == 1 &&
+        producer.transfer == neo::interop::ColorTransfer::unknown;
     ComPtr<ID3D11ShaderResourceView> after;
     context.CSGetShaderResources(1, 1, after.GetAddressOf());
-    if (!flat_out || after.Get() != sentinel.Get()) return false;
+    if (!flat_out || !producer_ok || after.Get() != sentinel.Get()) return false;
     const auto plane = pixels(device, context, *color.Get());
     context.UpdateSubresource(depth.Get(), 0, nullptr, wall.data(), k_width * 4u, 0);
     if (!ao.record(device, context, *color.Get(), *depth.Get(), k_normal)) return false;

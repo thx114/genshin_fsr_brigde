@@ -40,6 +40,10 @@ struct FrameInput
     bool use_transparency_mask = false;
     float sharpness = 0.0f;
     ID3D11ShaderResourceView *color_source_view = nullptr; // 借用同次 Draw 中 color 的源视图。
+    bool depth_from_dsv = false; // NGX 采样前必须解除该场景深度的 OM 写绑定。
+    // 2026-11-16（guide 格式复现）：typeless 资源不能说明本次 Draw 的实际读法，必须保留源 SRV。
+    ID3D11ShaderResourceView *depth_source_view = nullptr;
+    ID3D11ShaderResourceView *motion_source_view = nullptr;
 };
 
 // 初始化：解析游戏 D3D11 设备的适配器 → 建 D3D12 设备 → 加载 ffx-api runtime。

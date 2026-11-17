@@ -25,12 +25,24 @@ class GuideView
 {
 public:
     enum class Kind { depth, motion };
-    bool bind(ID3D11Device &device, ID3D11Texture2D *source, Kind kind, const FrameShape &shape) noexcept;
+    bool bind(ID3D11Device &device, ID3D11Texture2D *source, Kind kind, const FrameShape &shape,
+        ID3D11ShaderResourceView *source_view = nullptr) noexcept;
     ID3D11ShaderResourceView *get() const noexcept { return view_.Get(); }
+    DXGI_FORMAT format() const noexcept { return format_; }
 
 private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view_;
     ID3D11Texture2D *source_ = nullptr; // view_ 持有该资源，因而缓存命中时不会发生地址复用。
+    bool supplied_view_ = false;
+    DXGI_FORMAT format_ = DXGI_FORMAT_UNKNOWN;
+    UINT render_width_ = 0, render_height_ = 0;
+};
+
+struct FrameGuides
+{
+    GuideView depth, motion;
+    bool bind(ID3D11Device &device, const ffx12::FrameInput &input, const FrameShape &shape) noexcept;
+    bool known_motion_encoding() const noexcept { return motion.format() == DXGI_FORMAT_R10G10B10A2_UNORM; }
 };
 
 struct FrameResources
@@ -39,7 +51,7 @@ struct FrameResources
     Microsoft::WRL::ComPtr<ID3D11Texture2D> color, depth, motion, reactive, output;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> depth_uav, motion_uav, reactive_uav;
     Microsoft::WRL::ComPtr<ID3D11Buffer> constants;
-    GuideView depth_src, motion_src;
+    FrameGuides guides;
 
     struct BuildResult
     {

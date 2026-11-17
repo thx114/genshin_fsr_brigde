@@ -32,7 +32,7 @@ struct BeforeSrFrameV1
     std::uint32_t render_width = 0, render_height = 0;
     std::uint32_t display_width = 0, display_height = 0;
     DXGI_FORMAT color_storage_format = DXGI_FORMAT_UNKNOWN;
-    DXGI_FORMAT color_view_format = DXGI_FORMAT_UNKNOWN; // 本次游戏累积 Draw 读取的实际 SRV 格式。
+    DXGI_FORMAT color_view_format = DXGI_FORMAT_UNKNOWN; // 本次颜色来源的实际 typed view；AO 使用自己的 UNORM 输出视图。
     ColorTransfer color_transfer = ColorTransfer::unknown;
     std::uint32_t flags = 0;
     float jitter_x = 0, jitter_y = 0; // render 像素。

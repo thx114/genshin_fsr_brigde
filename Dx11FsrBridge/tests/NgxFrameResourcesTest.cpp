@@ -129,18 +129,114 @@ int main()
     frame.depth = depth.Get();
     frame.motion = mv.Get();
     CHECK(pool.bind_guides(*device.Get(), frame));
-    const auto *motion_srv = pool.motion_src.get();
+    const auto *motion_srv = pool.guides.motion.get();
     frame.motion = wrong_mv.Get();
     CHECK(!pool.bind_guides(*device.Get(), frame));
     frame.motion = mv.Get();
-    CHECK(pool.bind_guides(*device.Get(), frame) && pool.motion_src.get() == motion_srv);
+    CHECK(pool.bind_guides(*device.Get(), frame) && pool.guides.motion.get() == motion_srv);
     frame.depth = small_depth.Get();
     CHECK(!pool.bind_guides(*device.Get(), frame));
+
+    // 2026-11-16（PID50264）：先复刻日志中的资源描述，单独定位失败的 guide，避免猜槽位。
+    auto logged_depth_desc = desc(frame.render_w, frame.render_h, DXGI_FORMAT_R32G8X24_TYPELESS);
+    logged_depth_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DEPTH_STENCIL;
+    auto logged_motion_desc = desc(frame.render_w, frame.render_h, DXGI_FORMAT_R8G8_TYPELESS);
+    logged_motion_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET |
+        D3D11_BIND_UNORDERED_ACCESS;
+    ComPtr<ID3D11Texture2D> logged_depth, logged_motion;
+    CHECK(SUCCEEDED(device->CreateTexture2D(&logged_depth_desc, nullptr, &logged_depth)));
+    CHECK(SUCCEEDED(device->CreateTexture2D(&logged_motion_desc, nullptr, &logged_motion)));
+    GuideView logged_depth_view, logged_motion_view;
+    const bool logged_depth_bound = logged_depth_view.bind(*device.Get(), logged_depth.Get(),
+        GuideView::Kind::depth, pool.shape);
+    const bool logged_motion_bound = logged_motion_view.bind(*device.Get(), logged_motion.Get(),
+        GuideView::Kind::motion, pool.shape);
+    D3D11_SHADER_RESOURCE_VIEW_DESC logged_view_desc {};
+    logged_view_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    logged_view_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    logged_view_desc.Texture2D.MipLevels = 1;
+    ComPtr<ID3D11ShaderResourceView> incompatible_view, logged_motion_srv;
+    const HRESULT incompatible_hr = device->CreateShaderResourceView(logged_motion.Get(),
+        &logged_view_desc, &incompatible_view);
+    // 受控 UNORM 视图只证明 API 兼容性；现场实际 SRV 与运动编码仍须独立取证。
+    logged_view_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+    const HRESULT observed_view_hr = device->CreateShaderResourceView(logged_motion.Get(),
+        &logged_view_desc, &logged_motion_srv);
+    std::printf("PID50264 resource repro: depth19/bind0x48=%d motion48/bind0xA8=%d "
+        "forced24_hr=0x%08X supplied49_hr=0x%08X\n", logged_depth_bound, logged_motion_bound,
+        static_cast<unsigned>(incompatible_hr), static_cast<unsigned>(observed_view_hr));
+    CHECK(logged_depth_bound && !logged_motion_bound && FAILED(incompatible_hr) &&
+        SUCCEEDED(observed_view_hr) && logged_motion_srv);
+    ComPtr<ID3D11ShaderResourceView> logged_depth_srv, signed_motion_srv;
+    logged_view_desc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    CHECK(SUCCEEDED(device->CreateShaderResourceView(logged_depth.Get(), &logged_view_desc, &logged_depth_srv)));
+    logged_view_desc.Format = DXGI_FORMAT_R8G8_SNORM;
+    CHECK(SUCCEEDED(device->CreateShaderResourceView(logged_motion.Get(), &logged_view_desc, &signed_motion_srv)));
+    auto observed_frame = frame;
+    observed_frame.depth = logged_depth.Get();
+    observed_frame.motion = logged_motion.Get();
+    observed_frame.depth_source_view = logged_depth_srv.Get();
+    observed_frame.motion_source_view = logged_motion_srv.Get();
+    CHECK(pool.bind_guides(*device.Get(), observed_frame));
+    CHECK(!pool.guides.known_motion_encoding());
+    CHECK(pool.guides.depth.get() == logged_depth_srv.Get() && pool.guides.motion.get() == logged_motion_srv.Get());
+    observed_frame.motion_source_view = signed_motion_srv.Get();
+    CHECK(pool.bind_guides(*device.Get(), observed_frame) && pool.guides.motion.get() == signed_motion_srv.Get());
+    observed_frame.motion = mv.Get();
+    CHECK(!pool.bind_guides(*device.Get(), observed_frame));
+    observed_frame.motion = logged_motion.Get();
+    observed_frame.motion_source_view = nullptr;
+    CHECK(!pool.bind_guides(*device.Get(), observed_frame));
+    observed_frame.motion_source_view = logged_motion_srv.Get();
+    CHECK(pool.bind_guides(*device.Get(), observed_frame) && pool.guides.motion.get() == logged_motion_srv.Get());
+    std::puts("guide views: supplied format49/51 kept; foreign resource and missing evidence rejected");
+
+    // 2026-11-16：解除 DSV 写绑定不能吞掉原有 OM UAV；先核验前置状态，再执行被测路径。
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(context.GetAddressOf());
+    auto scene_desc = desc(frame.render_w, frame.render_h, DXGI_FORMAT_R32_TYPELESS);
+    scene_desc.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+    ComPtr<ID3D11Texture2D> scene_depth, scene_color;
+    ComPtr<ID3D11DepthStencilView> scene_dsv;
+    ComPtr<ID3D11UnorderedAccessView> scene_uav;
+    CHECK(SUCCEEDED(device->CreateTexture2D(&scene_desc, nullptr, &scene_depth)));
+    CHECK(SUCCEEDED(device->CreateTexture2D(&color, nullptr, &scene_color)));
+    D3D11_DEPTH_STENCIL_VIEW_DESC dsv_desc {};
+    dsv_desc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsv_desc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    CHECK(SUCCEEDED(device->CreateDepthStencilView(scene_depth.Get(), &dsv_desc, &scene_dsv)));
+    CHECK(SUCCEEDED(device->CreateUnorderedAccessView(pool.output.Get(), nullptr, &scene_uav)));
+    context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, scene_dsv.Get(), 3, 1,
+        scene_uav.GetAddressOf(), nullptr);
+    ComPtr<ID3D11DepthStencilView> bound_depth;
+    ComPtr<ID3D11UnorderedAccessView> bound_uav;
+    context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, &bound_depth, 3, 1, &bound_uav);
+    const bool initial_bindings = bound_depth == scene_dsv && bound_uav == scene_uav;
+    CHECK(initial_bindings);
+    constexpr char noop[] = "[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID) {}";
+    ComPtr<ID3DBlob> noop_code;
+    ComPtr<ID3D11ComputeShader> noop_shader;
+    CHECK(SUCCEEDED(D3DCompile(noop, sizeof(noop), nullptr, nullptr, nullptr,
+        "main", "cs_5_0", 0, 0, &noop_code, nullptr)));
+    CHECK(SUCCEEDED(device->CreateComputeShader(noop_code->GetBufferPointer(),
+        noop_code->GetBufferSize(), nullptr, &noop_shader)));
+    frame.color = scene_color.Get();
+    frame.depth = scene_depth.Get();
+    frame.depth_from_dsv = true;
+    CHECK(pool.bind_guides(*device.Get(), frame));
+    pool.record_inputs(*context.Get(), frame, noop_shader.Get(), noop_shader.Get());
+    context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr,
+        bound_depth.ReleaseAndGetAddressOf(), 3, 1, bound_uav.ReleaseAndGetAddressOf());
+    std::printf("scene OM restore: initial=%d dsv=%d uav=%d\n",
+        initial_bindings, bound_depth == scene_dsv, bound_uav == scene_uav);
+    const bool restored_bindings = bound_depth == scene_dsv && bound_uav == scene_uav;
+    CHECK(restored_bindings);
+    context->ClearState();
 
     auto resized = *shape;
     resized.output_width *= 2;
     CHECK(SUCCEEDED(pool.rebuild(*device.Get(), resized).hr) && pool.shape == resized && pool.output != before);
-    CHECK(pool.depth_src.get() == nullptr && pool.motion_src.get() == nullptr);
+    CHECK(pool.guides.depth.get() == nullptr && pool.guides.motion.get() == nullptr);
     std::puts("NGX: feature ownership, invalid copy layouts, WARP pool rollback and guide rebinding passed");
     return 0;
 }

@@ -146,7 +146,7 @@ add_library(Dx11FsrBridge SHARED
 # `fsr2_input_dump*` / `fsr2dump` 等字符串全部不会进产物。
 # 源码文件本身**保留在仓库里**（不删），靠本开关切换。
 if(DX11FSRBRIDGE_DIAGNOSTICS_ON)
-    target_sources(Dx11FsrBridge PRIVATE Fsr2InputDump.cpp)
+    target_sources(Dx11FsrBridge PRIVATE Fsr2InputDump.cpp diagnostics/BeforeSrProducerCapture.cpp)
 endif()
 
 # 诊断开关宏：只有打开时才定义（发布构建**不定义** ⇒ 所有
@@ -391,6 +391,15 @@ if(DX11FSRBRIDGE_BUILD_FAMILY_TEST)
 endif()
 
 if(DX11FSRBRIDGE_BUILD_TESTS)
+    # 2026-11-16：显式提供两个发布 DLL 才能作性能对照，不把单边耗时注册为 CTest 通过。
+    add_executable(BridgeCpuParityBench tests/BridgeCpuParityBench.cpp)
+    fsrbridge_configure_test(BridgeCpuParityBench)
+    target_link_libraries(BridgeCpuParityBench PRIVATE d3d11)
+    add_executable(BeforeSrProducerCaptureTest tests/BeforeSrProducerCaptureTest.cpp
+        diagnostics/BeforeSrProducerCapture.cpp)
+    fsrbridge_configure_test(BeforeSrProducerCaptureTest)
+    target_link_libraries(BeforeSrProducerCaptureTest PRIVATE d3d11 d3dcompiler)
+    add_test(NAME BeforeSrProducerCaptureTest COMMAND BeforeSrProducerCaptureTest)
     add_executable(CreateFunctionRoutesTest tests/CreateFunctionRoutesTest.cpp)
     fsrbridge_configure_test(CreateFunctionRoutesTest)
     target_include_directories(CreateFunctionRoutesTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -425,6 +434,8 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         add_library(BeforeSrProvider SHARED tests/F6ReceiptProvider.cpp)
         fsrbridge_configure_test(BeforeSrProvider)
         target_compile_definitions(BeforeSrProvider PRIVATE BEFORE_SR_LEGACY_FIXTURE=1)
+        add_library(NgxMultiSceneProvider SHARED tests/NgxMultiSceneProvider.cpp)
+        fsrbridge_configure_test(NgxMultiSceneProvider)
         add_executable(NgxProviderDiscoveryTest tests/NgxProviderDiscoveryTest.cpp ngx/ProviderDiscovery.cpp)
         fsrbridge_configure_test(NgxProviderDiscoveryTest)
         target_link_libraries(NgxProviderDiscoveryTest PRIVATE advapi32)
@@ -482,8 +493,29 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         "${FFX_API_STAGE_ROOT}/upscalers/include")
     add_executable(ProviderFrameHost tests/ProviderFrameHost.cpp)
     fsrbridge_configure_test(ProviderFrameHost)
+    target_compile_definitions(ProviderFrameHost PRIVATE
+        DX11FSRBRIDGE_TEST_DIAGNOSTICS=$<BOOL:${DX11FSRBRIDGE_DIAGNOSTICS_ON}>)
     target_link_libraries(ProviderFrameHost PRIVATE d3d11 d3dcompiler)
     if(DX11FSRBRIDGE_ENABLE_NGX)
+        if(DX11FSRBRIDGE_DIAGNOSTICS_ON AND NOT DX11FSRBRIDGE_RELEASE_RUNTIME)
+            add_test(NAME BeforeSrProducerCaptureIntegration COMMAND ProviderFrameHost ngx-producer-capture
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+            set_tests_properties(BeforeSrProducerCaptureIntegration PROPERTIES TIMEOUT 45)
+            add_test(NAME BeforeSrProducerOverwriteIntegration COMMAND ProviderFrameHost ngx-producer-overwrite
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+            set_tests_properties(BeforeSrProducerOverwriteIntegration PROPERTIES TIMEOUT 45)
+            add_test(NAME BeforeSrProducerOtherSdkIntegration COMMAND ProviderFrameHost ngx-producer-other-sdk
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+            set_tests_properties(BeforeSrProducerOtherSdkIntegration PROPERTIES TIMEOUT 45)
+            add_test(NAME BeforeSrProducerOmUavIntegration COMMAND ProviderFrameHost ngx-producer-om-uav
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+            set_tests_properties(BeforeSrProducerOmUavIntegration PROPERTIES TIMEOUT 45)
+            foreach(operation IN ITEMS copy copy-region clear update)
+                add_test(NAME BeforeSrProducer-${operation} COMMAND ProviderFrameHost ngx-producer-${operation}
+                    "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+                set_tests_properties(BeforeSrProducer-${operation} PROPERTIES TIMEOUT 45)
+            endforeach()
+        endif()
         add_test(NAME F6EvalReceiptIntegration COMMAND ProviderFrameHost ngx-receipt
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
         foreach(mode IN ITEMS ngx-prewarm ngx-prewarm-off ngx-prewarm-retry)
@@ -499,6 +531,14 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
         add_test(NAME NgxInputMapDelayedIntegration COMMAND ProviderFrameHost ngx-input-map-delayed
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        add_test(NAME NgxSceneDepthIntegration COMMAND ProviderFrameHost ngx-scene-depth
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+        add_test(NAME NgxMultiSceneIntegration COMMAND ProviderFrameHost ngx-multi-scene
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:NgxMultiSceneProvider>")
+        add_test(NAME NgxFailureRecoveryIntegration COMMAND ProviderFrameHost ngx-failure-recovery
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+        add_test(NAME NgxGuideViewsIntegration COMMAND ProviderFrameHost ngx-guide-views
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME BeforeSrAoIntegration COMMAND ProviderFrameHost ngx-ao
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME BeforeSrAoOffIntegration COMMAND ProviderFrameHost ngx-ao-off
@@ -508,7 +548,8 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         set_tests_properties(BeforeSrAoIntegration BeforeSrAoOffIntegration BeforeSrAoReceiptIntegration
             PROPERTIES TIMEOUT 45)
         set_tests_properties(F6EvalReceiptIntegration F6EvalReceiptDlaaIntegration BeforeSrIntegration
-            NgxInputMapCurrentIntegration NgxInputMapDelayedIntegration PROPERTIES TIMEOUT 45)
+            NgxInputMapCurrentIntegration NgxInputMapDelayedIntegration NgxSceneDepthIntegration
+            NgxMultiSceneIntegration NgxFailureRecoveryIntegration PROPERTIES TIMEOUT 45)
     endif()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
     target_link_libraries(CreateRouteIntegrationTest PRIVATE d3dcompiler dxgi)
@@ -530,6 +571,7 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         warp-cached-factory-combined-device-only hardware-cached-factory-combined-device-only
         warp-cached-factory-free-library hardware-cached-factory-free-library
         warp-for-hwnd-bridge-first hardware-for-hwnd-bridge-first
+        warp-for-hwnd-bridge-first-retention hardware-for-hwnd-bridge-first-retention
         warp-for-hwnd-device-first hardware-for-hwnd-device-first
         warp-for-hwnd-bridge-first-indexed warp-for-hwnd-device-first-indexed
         hardware-for-hwnd-bridge-first-returned hardware-for-hwnd-device-first-returned

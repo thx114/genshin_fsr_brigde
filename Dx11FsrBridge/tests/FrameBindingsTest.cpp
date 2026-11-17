@@ -41,10 +41,38 @@ int main()
             std::printf("FAIL: %s\n", what);
         }
     };
+    // 2026-11-16：预筛/识别共用绑定快照，必须保留未读零引用、重复读取只持有一次的契约。
+    const auto references = [](IUnknown *object)
+    {
+        object->AddRef();
+        return object->Release();
+    };
+    const ULONG input_references = references(srv.Get());
+    {
+        FrameBindings unused(*context.Get());
+        check(references(srv.Get()) == input_references, "prescreen does not acquire input views");
+    }
+    check(references(srv.Get()) == input_references, "unread snapshot does not release input views");
+    context->PSSetShaderResources(7, 1, srv.GetAddressOf());
+    const ULONG bound_references = references(srv.Get());
+    {
+        FrameBindings signature(*context.Get());
+        check(signature.inputs().size() == 7 && signature.inputs()[2] == srv.Get(),
+            "signature reads only its seven input slots");
+        check(references(srv.Get()) == bound_references + 1, "repeated input access acquires one lease");
+    }
+    check(references(srv.Get()) == bound_references, "signature releases its acquired lease");
+    {
+        FrameBindings legacy(*context.Get(), FrameBindings::Extent::legacy);
+        check(legacy.inputs().size() == 8 && legacy.inputs()[7] == srv.Get(), "legacy retains its eighth input");
+        check(references(srv.Get()) == bound_references + 2, "each bound slot owns one reference");
+    }
+    check(references(srv.Get()) == bound_references, "legacy releases both acquired leases");
+    ID3D11ShaderResourceView *empty = nullptr;
+    context->PSSetShaderResources(7, 1, &empty);
     {
         FrameBindings bindings(*context.Get());
         check(bindings.targets()[0] == rtv.Get() && !bindings.targets()[1], "only bound RTV is selected");
-        check(bindings.scene_depth().Get() == depth.Get(), "scene depth lease uses the DSV resource");
         check(bindings.inputs()[2] == srv.Get() && !bindings.input_resource(0) && !bindings.input_resource(UINT(-1)),
             "empty and missing slots are not routed");
         check(FrameBindings::texture_2d(bindings.target_resource(0)).Get() == output.Get(), "correct output lease");
@@ -54,7 +82,6 @@ int main()
         check(FrameBindings::texture_2d(bindings.input_resource(2)).Get() == input.Get() &&
             FrameBindings::texture_2d(bindings.target_resource(0)).Get() == output.Get(),
             "same-draw lease owns views after rebinding and absence of caller references");
-        check(!bindings.scene_depth(), "scene depth is queried on the execution context, not cached globally");
     }
     FrameBindings next(*context.Get());
     check(!next.input_resource(2) && !next.target_resource(0), "next Draw cannot reuse last Draw's bindings");

@@ -35,6 +35,13 @@ struct CaptureGuidePixel
     float depth;
 };
 
+struct CaptureTextures
+{
+    std::array<Microsoft::WRL::ComPtr<ID3D11Texture2D>, 9> textures;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
+};
+
 struct CaptureFrame
 {
     CaptureExtent render {64, 64};
@@ -48,7 +55,18 @@ struct CaptureFrame
     std::span<const CaptureGuidePixel> guides;
     bool typeless_depth = false;
     bool replay_draw = false;
+    DXGI_FORMAT scene_depth_format = DXGI_FORMAT_UNKNOWN;
+    bool scene_depth_readable = false;
     bool expect_attenuated_color = false;
+    DXGI_FORMAT motion_source_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT motion_source_view = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT depth_source_format = DXGI_FORMAT_UNKNOWN;
+    CaptureTextures *retained_textures = nullptr;
+    bool producer_roundtrip = false;
+    bool producer_overwrite = false;
+    std::function<bool()> producer_before_consume;
+    bool producer_om_uav = false;
+    int producer_write_operation = -1;
 };
 
 inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
@@ -78,10 +96,21 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         if (!compile("cs", "cs_5_0", first_code) || FAILED(device->CreateComputeShader(first_code->GetBufferPointer(),
             first_code->GetBufferSize(), nullptr, &cs))) return false;
     }
+    else if (frame.retained_textures && frame.retained_textures->vertex_shader &&
+        frame.retained_textures->pixel_shader)
+    {
+        vs = frame.retained_textures->vertex_shader;
+        ps = frame.retained_textures->pixel_shader;
+    }
     else if (!compile("vs", "vs_5_0", first_code) || !compile("ps", "ps_5_0", ps_code) ||
         FAILED(device->CreateVertexShader(first_code->GetBufferPointer(), first_code->GetBufferSize(), nullptr, &vs)) ||
         FAILED(device->CreatePixelShader(ps_code->GetBufferPointer(), ps_code->GetBufferSize(), nullptr, &ps)))
         return false;
+    if (frame.retained_textures && !compute)
+    {
+        frame.retained_textures->vertex_shader = vs;
+        frame.retained_textures->pixel_shader = ps;
+    }
     std::array<ComPtr<ID3D11Texture2D>, 9> textures;
     std::array<ComPtr<ID3D11ShaderResourceView>, 7> views;
     std::array<ID3D11ShaderResourceView *, 7> inputs {};
@@ -92,6 +121,8 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     D3D11_TEXTURE2D_DESC desc {};
     desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
     std::vector<std::uint32_t> pixels;
+    std::vector<std::uint64_t> wide_depth;
+    std::vector<std::uint16_t> narrow_motion;
     // 非原生分支只可能由场景输入取得蓝色；原生目标一个红、一个绿。
     for (unsigned n = 0; n < textures.size(); ++n)
     {
@@ -101,12 +132,22 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         desc.Format = n == 2 ? DXGI_FORMAT_R32_FLOAT : n == 3 ?
             (frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16_FLOAT) :
             (n == 0 && frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM);
+        if (n == 3 && frame.motion_source_format != DXGI_FORMAT_UNKNOWN)
+            desc.Format = frame.motion_source_format;
         const bool alternate_color = n == 0 && frame.color_source_view != DXGI_FORMAT_UNKNOWN;
         const bool typeless_depth = n == 2 && frame.typeless_depth;
         if (alternate_color) desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
         if (typeless_depth) desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        if (n == 2 && frame.depth_source_format != DXGI_FORMAT_UNKNOWN)
+            desc.Format = frame.depth_source_format;
         desc.BindFlags = n < 7 ? D3D11_BIND_SHADER_RESOURCE :
             (compute ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_RENDER_TARGET);
+        if (n == 0 && frame.producer_roundtrip) desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+        if (n == 0 && frame.producer_om_uav) desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+        if (n == 2 && desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
+            desc.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
+        if (n == 3 && desc.Format == DXGI_FORMAT_R8G8_TYPELESS)
+            desc.BindFlags |= D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
         D3D11_SUBRESOURCE_DATA init {};
         if (frame.publish_render)
         {
@@ -127,15 +168,49 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             }
             init.pSysMem = pixels.data();
             init.SysMemPitch = desc.Width * sizeof(std::uint32_t);
+            if (n == 2 && desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
+            {
+                wide_depth.assign(pixels.size(), 0x3F000000ull);
+                init.pSysMem = wide_depth.data();
+                init.SysMemPitch = desc.Width * sizeof(std::uint64_t);
+            }
+            if (n == 3 && desc.Format == DXGI_FORMAT_R8G8_TYPELESS)
+            {
+                narrow_motion.assign(pixels.size(), 0x8080u);
+                init.pSysMem = narrow_motion.data();
+                init.SysMemPitch = desc.Width * sizeof(std::uint16_t);
+            }
         }
-        if (FAILED(device->CreateTexture2D(&desc, init.pSysMem ? &init : nullptr, &textures[n]))) return false;
+        if (frame.retained_textures && frame.retained_textures->textures[n])
+        {
+            const auto &previous = frame.retained_textures->textures[n];
+            D3D11_TEXTURE2D_DESC old {};
+            previous->GetDesc(&old);
+            if (old.Width == desc.Width && old.Height == desc.Height &&
+                old.Format == desc.Format && old.BindFlags == desc.BindFlags)
+                textures[n] = previous;
+        }
+        if (textures[n])
+        {
+            if (init.pSysMem) context->UpdateSubresource(textures[n].Get(), 0, nullptr,
+                init.pSysMem, init.SysMemPitch, 0);
+        }
+        else if (FAILED(device->CreateTexture2D(&desc, init.pSysMem ? &init : nullptr, &textures[n])))
+            return false;
+        if (frame.retained_textures) frame.retained_textures->textures[n] = textures[n];
         if (n < 7)
         {
             D3D11_SHADER_RESOURCE_VIEW_DESC view {};
             view.Format = typeless_depth ? DXGI_FORMAT_R32_FLOAT : frame.color_source_view;
+            if (n == 2 && desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
+                view.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            if (n == 3 && frame.motion_source_view != DXGI_FORMAT_UNKNOWN)
+                view.Format = frame.motion_source_view;
             view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             view.Texture2D.MipLevels = 1;
-            const auto *explicit_view = alternate_color || typeless_depth ? &view : nullptr;
+            const auto *explicit_view = alternate_color || typeless_depth ||
+                (n == 2 && desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS) ||
+                (n == 3 && frame.motion_source_view != DXGI_FORMAT_UNKNOWN) ? &view : nullptr;
             if (FAILED(device->CreateShaderResourceView(textures[n].Get(), explicit_view, &views[n]))) return false;
             inputs[n] = views[n].Get();
         }
@@ -149,6 +224,49 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             if (FAILED(device->CreateRenderTargetView(textures[n].Get(), nullptr, &targets[n - 7]))) return false;
             outputs[n - 7] = targets[n - 7].Get();
         }
+    }
+    if (frame.retained_textures)
+    {
+        // 2026-11-16（方法槽实测）：WARP 更新旧资源会更换 Draw 入口；真实 Map 走既有路由恢复，
+        // 同时独立核验输入已更新，避免将夹具绕过钩子误判为多实例匹配失败。
+        D3D11_TEXTURE2D_DESC sample_desc {};
+        textures[0]->GetDesc(&sample_desc);
+        sample_desc.Width = sample_desc.Height = 1;
+        sample_desc.Usage = D3D11_USAGE_STAGING;
+        sample_desc.BindFlags = 0;
+        sample_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Texture2D> sample;
+        if (FAILED(device->CreateTexture2D(&sample_desc, nullptr, &sample))) return false;
+        const D3D11_BOX center {frame.render.width / 2, frame.render.height / 2, 0,
+            frame.render.width / 2 + 1, frame.render.height / 2 + 1, 1};
+        context->CopySubresourceRegion(sample.Get(), 0, 0, 0, 0, textures[0].Get(), 0, &center);
+        D3D11_MAPPED_SUBRESOURCE mapped {};
+        if (FAILED(context->Map(sample.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+        std::uint32_t actual = 0;
+        std::memcpy(&actual, mapped.pData, sizeof(actual));
+        context->Unmap(sample.Get(), 0);
+        if (actual != frame.alternate_scene_pixel) return false;
+    }
+    ComPtr<ID3D11Texture2D> scene_depth;
+    ComPtr<ID3D11DepthStencilView> scene_dsv;
+    if (frame.scene_depth_format != DXGI_FORMAT_UNKNOWN)
+    {
+        D3D11_TEXTURE2D_DESC scene_desc {};
+        scene_desc.Width = frame.display.width;
+        scene_desc.Height = frame.display.height;
+        scene_desc.MipLevels = scene_desc.ArraySize = scene_desc.SampleDesc.Count = 1;
+        scene_desc.Format = frame.scene_depth_format;
+        scene_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL |
+            (frame.scene_depth_readable ? D3D11_BIND_SHADER_RESOURCE : 0u);
+        D3D11_DEPTH_STENCIL_VIEW_DESC view {};
+        view.Format = DXGI_FORMAT_D32_FLOAT;
+        view.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        // 2026-11-16：WARP 的 ClearDepthStencilView 会重置 Draw 方法槽，绕过被测桥。
+        // 创建时写入深度，保证本用例实际经过同一条捕获入口。
+        const std::vector<float> depth_pixels(static_cast<std::size_t>(scene_desc.Width) * scene_desc.Height, 0.25f);
+        const D3D11_SUBRESOURCE_DATA initial_depth { depth_pixels.data(), scene_desc.Width * sizeof(float), 0 };
+        if (FAILED(device->CreateTexture2D(&scene_desc, &initial_depth, &scene_depth)) ||
+            FAILED(device->CreateDepthStencilView(scene_depth.Get(), &view, &scene_dsv))) return false;
     }
     ComPtr<ID3D11DeviceContext> deferred;
     if (entry == CaptureEntry::command_list && FAILED(device->CreateDeferredContext(0, &deferred))) return false;
@@ -164,7 +282,14 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         commands->PSSetShader(ps.Get(), nullptr, 0);
         commands->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
         commands->PSSetShaderResources(0, 7, inputs.data());
-        commands->OMSetRenderTargets(2, outputs, nullptr);
+        commands->OMSetRenderTargets(2, outputs, scene_dsv.Get());
+        if (scene_dsv)
+        {
+            ComPtr<ID3D11DepthStencilView> bound;
+            commands->OMGetRenderTargets(0, nullptr, &bound);
+            if (bound != scene_dsv) return false;
+        }
+        return true;
     };
     if (!compute)
     {
@@ -174,7 +299,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         std::array<std::uint8_t, neo::graphics::k_min_fsr_constants> zero_constants {};
         const D3D11_SUBRESOURCE_DATA initial_cb {zero_constants.data(), 0, 0};
         if (FAILED(device->CreateBuffer(&cb, &initial_cb, &constants))) return false;
-        bind_graphics();
+        if (!bind_graphics()) return false;
     }
     if (entry == CaptureEntry::indexed || entry == CaptureEntry::indexed_instanced ||
         entry == CaptureEntry::indexed_indirect)
@@ -233,55 +358,194 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         if (FAILED(deferred->FinishCommandList(FALSE, &list))) return false;
         context->ExecuteCommandList(list.Get(), FALSE);
     }
+    if (scene_dsv)
+    {
+        ComPtr<ID3D11DepthStencilView> restored;
+        context->OMGetRenderTargets(0, nullptr, &restored);
+        if (restored != scene_dsv) return false;
+    }
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ComPtr<ID3D11Texture2D> readback;
     if (FAILED(device->CreateTexture2D(&desc, nullptr, &readback))) return false;
     context->OMSetRenderTargets(0, nullptr, nullptr);
-    bool pixels_match = true;
-    for (unsigned n = 0; n < 2; ++n)
+    const auto read_outputs = [&](std::optional<std::uint32_t> expected)
     {
-        context->CopyResource(readback.Get(), textures[n + 7].Get());
-        D3D11_MAPPED_SUBRESOURCE mapped {};
-        if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
-        const auto *pixel = static_cast<const unsigned char *>(mapped.pData) +
-            (frame.display.height / 2) * mapped.RowPitch + (frame.display.width / 2) * 4;
-        const bool native_pixel = pixel[n] == 255 && pixel[n ^ 1u] == 0 && pixel[2] == 0 && pixel[3] == 255;
-        const auto close_to_input = [](unsigned value, unsigned ten_bit)
+        bool pixels_match = true;
+        for (unsigned n = 0; n < 2; ++n)
         {
-            const int expected = static_cast<int>((ten_bit * 255 + 511) / 1023);
-            const int delta = static_cast<int>(value) - expected;
-            return delta >= -26 && delta <= 26;
-        };
-        std::uint32_t raw {};
-        std::memcpy(&raw, pixel, sizeof(raw));
-        const auto attenuated = [&]
-        {
-            if (pixel[3] != (frame.alternate_scene_pixel >> 24)) return false;
-            for (unsigned i = 0; i < 3; ++i)
+            context->CopyResource(readback.Get(), textures[n + 7].Get());
+            D3D11_MAPPED_SUBRESOURCE mapped {};
+            if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+            const auto *pixel = static_cast<const unsigned char *>(mapped.pData) +
+                (frame.display.height / 2) * mapped.RowPitch + (frame.display.width / 2) * 4;
+            const bool native_pixel = pixel[n] == 255 && pixel[n ^ 1u] == 0 && pixel[2] == 0 && pixel[3] == 255;
+            const auto close_to_input = [](unsigned value, unsigned ten_bit)
             {
-                const unsigned original = (frame.alternate_scene_pixel >> (8u * i)) & 255u;
-                if (pixel[i] + 2u >= original || pixel[i] * 2u < original) return false;
+                const int expected = static_cast<int>((ten_bit * 255 + 511) / 1023);
+                const int delta = static_cast<int>(value) - expected;
+                return delta >= -26 && delta <= 26;
+            };
+            std::uint32_t raw {};
+            std::memcpy(&raw, pixel, sizeof(raw));
+            const auto attenuated = [&]
+            {
+                if (pixel[3] != (frame.alternate_scene_pixel >> 24)) return false;
+                for (unsigned i = 0; i < 3; ++i)
+                {
+                    const unsigned original = (frame.alternate_scene_pixel >> (8u * i)) & 255u;
+                    if (pixel[i] + 2u >= original || pixel[i] * 2u < original) return false;
+                }
+                return true;
+            };
+            const bool provider_pixel = n == 0 ? pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 :
+                frame.expect_attenuated_color ? attenuated() :
+                expected ? raw == *expected :
+                close_to_input(pixel[0], frame.color_r10) && close_to_input(pixel[1], frame.color_g10) &&
+                close_to_input(pixel[2], frame.color_b10);
+            const bool correct = frame.expect_provider ? provider_pixel : native_pixel;
+            if (pixel_receipt)
+                std::fprintf(pixel_receipt, "target=%u pixel=%u,%u,%u,%u expected=%s ok=%u\n", n,
+                    pixel[0], pixel[1], pixel[2], pixel[3], frame.expect_provider ? "provider" : "native", correct);
+            context->Unmap(readback.Get(), 0);
+            pixels_match &= correct;
+        }
+        return pixels_match;
+    };
+    bool pixels_match = read_outputs(frame.exact_provider_pixel);
+    if (pixels_match && frame.producer_roundtrip)
+    {
+        // 2026-11-16：首个 SDK 已武装这张源颜色；现在用真实 Draw 写同一资源。
+        // 后续更新 CB，再进入 SDK，验证捕获的是 writer 时刻而非 SDK 时刻的常量。
+        ComPtr<ID3D11RenderTargetView> producer;
+        D3D11_RENDER_TARGET_VIEW_DESC view {};
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        if (compute || !frame.publish_render ||
+            FAILED(device->CreateRenderTargetView(textures[0].Get(), &view, producer.GetAddressOf()))) return false;
+        std::array<ID3D11ShaderResourceView *, 7> none {};
+        commands->PSSetShaderResources(0, 7, none.data());
+        commands->OMSetRenderTargets(1, producer.GetAddressOf(), nullptr);
+        D3D11_VIEWPORT viewport {0, 0, static_cast<float>(frame.render.width),
+            static_cast<float>(frame.render.height), 0, 1};
+        commands->RSSetViewports(1, &viewport);
+        std::array<std::uint32_t, neo::graphics::k_min_fsr_constants / 4> values;
+        values.fill(0x3f400000);
+        commands->UpdateSubresource(constants.Get(), 0, nullptr, values.data(), 0, 0);
+        commands->Draw(3, 0);
+        commands->OMSetRenderTargets(0, nullptr, nullptr);
+        values.fill(0);
+        commands->UpdateSubresource(constants.Get(), 0, nullptr, values.data(), 0, 0);
+        if (frame.producer_overwrite)
+        {
+            // 旧状态表仍记住另一 RTV，实际 OM UAV 接口恢复源颜色后再写一次。
+            commands->OMSetRenderTargets(1, outputs, nullptr);
+            commands->OMSetRenderTargetsAndUnorderedAccessViews(1, producer.GetAddressOf(), nullptr,
+                1, 0, nullptr, nullptr);
+            commands->Draw(3, 0);
+            commands->OMSetRenderTargets(0, nullptr, nullptr);
+        }
+        if (frame.producer_om_uav)
+        {
+            // 2026-11-16：实际像素着色器经 OM UAV 覆盖源颜色，RTV 绑定看不到这笔 writer。
+            constexpr char uav_shader[] = "RWTexture2D<float4> color:register(u1);"
+                "void main(float4 p:SV_Position){color[uint2(p.xy)]=float4(0,1,0,1);}";
+            ComPtr<ID3DBlob> code;
+            ComPtr<ID3D11PixelShader> uav_pixel;
+            ComPtr<ID3D11UnorderedAccessView> source_uav;
+            D3D11_UNORDERED_ACCESS_VIEW_DESC uav_view {};
+            uav_view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            uav_view.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+            if (FAILED(D3DCompile(uav_shader, sizeof(uav_shader), nullptr, nullptr, nullptr, "main", "ps_5_0",
+                0, 0, &code, nullptr)) || FAILED(device->CreatePixelShader(code->GetBufferPointer(),
+                    code->GetBufferSize(), nullptr, &uav_pixel)) ||
+                FAILED(device->CreateUnorderedAccessView(textures[0].Get(), &uav_view, &source_uav))) return false;
+            commands->PSSetShader(uav_pixel.Get(), nullptr, 0);
+            commands->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 1, 1,
+                source_uav.GetAddressOf(), nullptr);
+            commands->Draw(3, 0);
+            ID3D11UnorderedAccessView *none_uav = nullptr;
+            commands->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 1, 1, &none_uav, nullptr);
+        }
+        if (frame.producer_write_operation >= 0)
+        {
+            // 2026-11-16：实际改写 SDK 颜色后再消费；四种入口必须使旧 writer 失配。
+            D3D11_TEXTURE2D_DESC source_desc {};
+            textures[0]->GetDesc(&source_desc);
+            source_desc.BindFlags = 0;
+            std::vector<std::uint32_t> green(static_cast<std::size_t>(source_desc.Width) * source_desc.Height,
+                0xff00ff00);
+            const D3D11_SUBRESOURCE_DATA data {green.data(), source_desc.Width * 4u, 0};
+            ComPtr<ID3D11Texture2D> source;
+            if (FAILED(device->CreateTexture2D(&source_desc, &data, &source))) return false;
+            switch (frame.producer_write_operation)
+            {
+            case 0: commands->CopyResource(textures[0].Get(), source.Get()); break;
+            case 1:
+                commands->CopySubresourceRegion(textures[0].Get(), 0, 0, 0, 0, source.Get(), 0, nullptr);
+                break;
+            case 2:
+            {
+                const FLOAT value[] {0, 1, 0, 1};
+                commands->ClearRenderTargetView(producer.Get(), value);
+                break;
             }
-            return true;
-        };
-        const bool provider_pixel = n == 0 ? pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 :
-            frame.expect_attenuated_color ? attenuated() :
-            frame.exact_provider_pixel ? raw == *frame.exact_provider_pixel :
-            close_to_input(pixel[0], frame.color_r10) && close_to_input(pixel[1], frame.color_g10) &&
-            close_to_input(pixel[2], frame.color_b10);
-        const bool correct = frame.expect_provider ? provider_pixel : native_pixel;
-        if (pixel_receipt)
-            std::fprintf(pixel_receipt, "target=%u pixel=%u,%u,%u,%u expected=%s ok=%u\n", n,
-                pixel[0], pixel[1], pixel[2], pixel[3], frame.expect_provider ? "provider" : "native", correct);
-        context->Unmap(readback.Get(), 0);
-        pixels_match &= correct;
+            case 3:
+                commands->UpdateSubresource(textures[0].Get(), 0, nullptr, green.data(), data.SysMemPitch, 0);
+                break;
+            default: return false;
+            }
+        }
+        if (frame.producer_before_consume)
+        {
+            // 2026-11-16：测试宿主先实读源像素，保证 writer 前的 CB 快照已退休，
+            // 再让另一实例 SDK 先到；不能靠 GPU 尚未完成使错误的报告门控碰巧通过。
+            D3D11_TEXTURE2D_DESC sample_desc {};
+            textures[0]->GetDesc(&sample_desc);
+            sample_desc.Width = sample_desc.Height = 1;
+            sample_desc.Usage = D3D11_USAGE_STAGING;
+            sample_desc.BindFlags = 0;
+            sample_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> sample;
+            if (FAILED(device->CreateTexture2D(&sample_desc, nullptr, &sample))) return false;
+            const D3D11_BOX center {frame.render.width / 2, frame.render.height / 2, 0,
+                frame.render.width / 2 + 1, frame.render.height / 2 + 1, 1};
+            context->CopySubresourceRegion(sample.Get(), 0, 0, 0, 0, textures[0].Get(), 0, &center);
+            D3D11_MAPPED_SUBRESOURCE mapped {};
+            if (FAILED(context->Map(sample.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+            std::uint32_t actual = 0;
+            std::memcpy(&actual, mapped.pData, sizeof(actual));
+            context->Unmap(sample.Get(), 0);
+            if (actual != 0xff0000ff || !frame.producer_before_consume()) return false;
+        }
+        for (unsigned next = 0; next < 3; ++next)
+        {
+            constexpr FLOAT clear[4] {};
+            for (auto *output : outputs) commands->ClearRenderTargetView(output, clear);
+            if (!bind_graphics()) return false;
+            std::array<ID3D11ShaderResourceView *, 7> checked {};
+            commands->PSGetShaderResources(0, 7, checked.data());
+            bool bindings_ok = true;
+            for (unsigned i = 0; i < checked.size(); ++i)
+            {
+                bindings_ok &= checked[i] == inputs[i];
+                if (pixel_receipt) std::fprintf(pixel_receipt, "producer binding round=%u slot=%u exact=%u\n",
+                    next, i, checked[i] == inputs[i]);
+                if (checked[i]) checked[i]->Release();
+            }
+            if (!bindings_ok) return false;
+            frame.publish_render();
+            commands->Draw(3, 0);
+            commands->OMSetRenderTargets(0, nullptr, nullptr);
+            pixels_match &= read_outputs(frame.producer_om_uav || frame.producer_write_operation >= 0 ?
+                0xff00ff00 : 0xff0000ff);
+        }
     }
     if (pixels_match && frame.replay_draw && entry == CaptureEntry::draw)
     {
         // 2026-11-15（PR #16）：先验首笔写回。重复 Draw 可能回落原生，另由宿主验 Evaluate 次数。
-        bind_graphics();
+        if (!bind_graphics()) return false;
         commands->Draw(3, 0);
         commands->OMSetRenderTargets(0, nullptr, nullptr);
     }

@@ -46,6 +46,9 @@
 #include "Fsr2InputDump.h"
 #include "BridgeLogger.h"
 #include "PerfProbe.h"
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS) && !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+#include "diagnostics/BeforeSrProducerCapture.h"
+#endif
 // 旧方案（On12 引导 / FSR2 翻译层）已移除，不再编译。
 //
 // 【本文件中的 `B1xx` 编号】= 本项目历次变更批次的编号（`B103`…`B109`）；
@@ -105,6 +108,7 @@ constexpr std::size_t k_idx_vs_set_shader = k_context_base_methods + 4;
 constexpr std::size_t k_idx_ps_set_constant_buffers = k_context_base_methods + 9;
 constexpr std::size_t k_idx_map = k_context_base_methods + 7;
 constexpr std::size_t k_idx_unmap = k_context_base_methods + 8;
+constexpr std::size_t k_idx_flush = k_context_base_methods + 104;
 constexpr std::size_t k_idx_draw_indexed = k_context_base_methods + 5;
 constexpr std::size_t k_idx_draw = k_context_base_methods + 6;
 constexpr std::size_t k_idx_om_set_render_targets = k_context_base_methods + 26;
@@ -645,6 +649,24 @@ DispatchState g_state;
 std::mutex g_color_source_mutex;
 std::unordered_map<std::uint64_t, std::deque<ColorSourceWrite>> g_color_source_writes;
 std::atomic_uint64_t g_color_source_sequence = 0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS) && !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+// 诊断只有一次有界快照。未确认 GPU 退休时保留实际对象，进程退出前不清理未知工作。
+auto &before_sr_producer_capture()
+{
+    static auto *capture = new neo::diagnostics::BeforeSrProducerCapture;
+    return *capture;
+}
+std::atomic_bool g_before_sr_producer_dumped = false;
+std::atomic_bool g_before_sr_producer_observation_gap = false;
+std::mutex g_before_sr_producer_mutex;
+auto &before_sr_consumer_capture()
+{
+    static auto *capture = new neo::diagnostics::BeforeSrProducerCapture;
+    return *capture;
+}
+std::atomic_bool g_before_sr_consumer_dumped = false;
+std::string g_before_sr_consumer_identity;
+#endif
 std::mutex g_hook_scan_mutex;
 std::string g_last_create_hook_scan;
 std::string g_last_loader_hook_scan;
@@ -748,6 +770,7 @@ using draw_indexed_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, U
 using draw_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT);
 using map_fn = HRESULT(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE *);
 using unmap_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT);
+using flush_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *);
 using rs_set_viewports_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, const D3D11_VIEWPORT *);
 using copy_resource_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, ID3D11Resource *);
 using copy_subresource_region_fn = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, UINT, UINT, UINT, ID3D11Resource *, UINT, const D3D11_BOX *);
@@ -771,24 +794,34 @@ get_proc_address_fn g_original_get_proc_address = nullptr;
 display_config_get_device_info_fn g_original_display_config_get_device_info = nullptr;
 display_config_set_device_info_fn g_original_display_config_set_device_info = nullptr;
 output_get_desc1_fn g_original_output_get_desc1 = nullptr;
+void repair_context_dispatch(ID3D11DeviceContext *context);
+
+template <typename Function, Function Observe, std::size_t Method, bool SkipNested = false>
+using ContextMethodRoutes = ComMethodRoutes<Function, Observe, Method, SkipNested, &repair_context_dispatch>;
+
 void STDMETHODCALLTYPE hooked_vs_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers);
-ComMethodRoutes<vs_set_constant_buffers_fn, &hooked_vs_set_constant_buffers, k_idx_vs_set_constant_buffers> g_original_vs_set_constant_buffers;
+ContextMethodRoutes<vs_set_constant_buffers_fn, &hooked_vs_set_constant_buffers,
+    k_idx_vs_set_constant_buffers> g_original_vs_set_constant_buffers;
 void STDMETHODCALLTYPE hooked_vs_set_shader(ID3D11DeviceContext *context, ID3D11VertexShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count);
-ComMethodRoutes<vs_set_shader_fn, &hooked_vs_set_shader, k_idx_vs_set_shader> g_original_vs_set_shader;
+ContextMethodRoutes<vs_set_shader_fn, &hooked_vs_set_shader, k_idx_vs_set_shader> g_original_vs_set_shader;
 void STDMETHODCALLTYPE hooked_ps_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views);
-ComMethodRoutes<ps_set_shader_resources_fn, &hooked_ps_set_shader_resources, k_idx_ps_set_shader_resources> g_original_ps_set_shader_resources;
+ContextMethodRoutes<ps_set_shader_resources_fn, &hooked_ps_set_shader_resources,
+    k_idx_ps_set_shader_resources> g_original_ps_set_shader_resources;
 void STDMETHODCALLTYPE hooked_ps_set_shader(ID3D11DeviceContext *context, ID3D11PixelShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count);
-ComMethodRoutes<ps_set_shader_fn, &hooked_ps_set_shader, k_idx_ps_set_shader> g_original_ps_set_shader;
+ContextMethodRoutes<ps_set_shader_fn, &hooked_ps_set_shader, k_idx_ps_set_shader> g_original_ps_set_shader;
 void STDMETHODCALLTYPE hooked_ps_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers);
-ComMethodRoutes<ps_set_constant_buffers_fn, &hooked_ps_set_constant_buffers, k_idx_ps_set_constant_buffers> g_original_ps_set_constant_buffers;
+ContextMethodRoutes<ps_set_constant_buffers_fn, &hooked_ps_set_constant_buffers,
+    k_idx_ps_set_constant_buffers> g_original_ps_set_constant_buffers;
 void STDMETHODCALLTYPE hooked_cs_set_shader_resources(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11ShaderResourceView *const *views);
-ComMethodRoutes<cs_set_shader_resources_fn, &hooked_cs_set_shader_resources, k_idx_cs_set_shader_resources> g_original_cs_set_shader_resources;
+ContextMethodRoutes<cs_set_shader_resources_fn, &hooked_cs_set_shader_resources,
+    k_idx_cs_set_shader_resources> g_original_cs_set_shader_resources;
 void STDMETHODCALLTYPE hooked_cs_set_uavs(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11UnorderedAccessView *const *views, const UINT *initial_counts);
-ComMethodRoutes<cs_set_uavs_fn, &hooked_cs_set_uavs, k_idx_cs_set_uavs> g_original_cs_set_uavs;
+ContextMethodRoutes<cs_set_uavs_fn, &hooked_cs_set_uavs, k_idx_cs_set_uavs> g_original_cs_set_uavs;
 void STDMETHODCALLTYPE hooked_cs_set_shader(ID3D11DeviceContext *context, ID3D11ComputeShader *shader, ID3D11ClassInstance *const *class_instances, UINT class_instances_count);
-ComMethodRoutes<cs_set_shader_fn, &hooked_cs_set_shader, k_idx_cs_set_shader> g_original_cs_set_shader;
+ContextMethodRoutes<cs_set_shader_fn, &hooked_cs_set_shader, k_idx_cs_set_shader> g_original_cs_set_shader;
 void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *dsv);
-ComMethodRoutes<om_set_render_targets_fn, &hooked_om_set_render_targets, k_idx_om_set_render_targets> g_original_om_set_render_targets;
+ContextMethodRoutes<om_set_render_targets_fn, &hooked_om_set_render_targets,
+    k_idx_om_set_render_targets> g_original_om_set_render_targets;
 void STDMETHODCALLTYPE hooked_om_set_render_targets_and_uavs(
     ID3D11DeviceContext *context,
     UINT render_target_count,
@@ -798,37 +831,43 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets_and_uavs(
     UINT uav_count,
     ID3D11UnorderedAccessView *const *unordered_access_views,
     const UINT *uav_initial_counts);
-ComMethodRoutes<om_set_render_targets_and_uavs_fn, &hooked_om_set_render_targets_and_uavs, k_idx_om_set_render_targets_and_uavs> g_original_om_set_render_targets_and_uavs;
+ContextMethodRoutes<om_set_render_targets_and_uavs_fn, &hooked_om_set_render_targets_and_uavs,
+    k_idx_om_set_render_targets_and_uavs> g_original_om_set_render_targets_and_uavs;
 void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_x, UINT group_y, UINT group_z);
-ComMethodRoutes<dispatch_fn, &hooked_dispatch, k_idx_dispatch, true> g_original_dispatch;
+ContextMethodRoutes<dispatch_fn, &hooked_dispatch, k_idx_dispatch, true> g_original_dispatch;
 void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT index_count, UINT start_index_location, INT base_vertex_location);
-ComMethodRoutes<draw_indexed_fn, &hooked_draw_indexed, k_idx_draw_indexed, true> g_original_draw_indexed;
+ContextMethodRoutes<draw_indexed_fn, &hooked_draw_indexed, k_idx_draw_indexed, true> g_original_draw_indexed;
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT vertex_count, UINT start_vertex_location);
-ComMethodRoutes<draw_fn, &hooked_draw, k_idx_draw, true> g_original_draw;
+ContextMethodRoutes<draw_fn, &hooked_draw, k_idx_draw, true> g_original_draw;
 BOOL STDMETHODCALLTYPE hooked_set_multithread_protected(ID3D11Multithread *protection, BOOL enable);
 constexpr std::size_t k_idx_set_multithread_protected = 5;
 ComMethodRoutes<set_multithread_protected_fn, &hooked_set_multithread_protected, k_idx_set_multithread_protected, true>
     g_original_set_multithread_protected;
 bool install_context_hooks(ID3D11DeviceContext *context);
+void STDMETHODCALLTYPE hooked_flush(ID3D11DeviceContext *context);
+ContextMethodRoutes<flush_fn, &hooked_flush, k_idx_flush, true> g_original_flush;
 
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped);
-ComMethodRoutes<map_fn, &hooked_map, k_idx_map> g_original_map;
+ContextMethodRoutes<map_fn, &hooked_map, k_idx_map> g_original_map;
 void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource);
-ComMethodRoutes<unmap_fn, &hooked_unmap, k_idx_unmap> g_original_unmap;
+ContextMethodRoutes<unmap_fn, &hooked_unmap, k_idx_unmap> g_original_unmap;
 void STDMETHODCALLTYPE hooked_rs_set_viewports(ID3D11DeviceContext *context, UINT count, const D3D11_VIEWPORT *viewports);
-ComMethodRoutes<rs_set_viewports_fn, &hooked_rs_set_viewports, k_idx_rs_set_viewports> g_original_rs_set_viewports;
+ContextMethodRoutes<rs_set_viewports_fn, &hooked_rs_set_viewports, k_idx_rs_set_viewports> g_original_rs_set_viewports;
 void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, UINT dst_x, UINT dst_y, UINT dst_z, ID3D11Resource *src, UINT src_subresource, const D3D11_BOX *src_box);
-ComMethodRoutes<copy_subresource_region_fn, &hooked_copy_subresource_region, k_idx_copy_subresource_region> g_original_copy_subresource_region;
+ContextMethodRoutes<copy_subresource_region_fn, &hooked_copy_subresource_region,
+    k_idx_copy_subresource_region> g_original_copy_subresource_region;
 void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11Resource *dst, ID3D11Resource *src);
-ComMethodRoutes<copy_resource_fn, &hooked_copy_resource, k_idx_copy_resource> g_original_copy_resource;
+ContextMethodRoutes<copy_resource_fn, &hooked_copy_resource, k_idx_copy_resource> g_original_copy_resource;
 void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, const D3D11_BOX *dst_box, const void *src_data, UINT src_row_pitch, UINT src_depth_pitch);
-ComMethodRoutes<update_subresource_fn, &hooked_update_subresource, k_idx_update_subresource> g_original_update_subresource;
+ContextMethodRoutes<update_subresource_fn, &hooked_update_subresource,
+    k_idx_update_subresource> g_original_update_subresource;
 void STDMETHODCALLTYPE hooked_cs_set_constant_buffers(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11Buffer *const *buffers);
-ComMethodRoutes<cs_set_constant_buffers_fn, &hooked_cs_set_constant_buffers, k_idx_cs_set_constant_buffers> g_original_cs_set_constant_buffers;
+ContextMethodRoutes<cs_set_constant_buffers_fn, &hooked_cs_set_constant_buffers,
+    k_idx_cs_set_constant_buffers> g_original_cs_set_constant_buffers;
 void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11RenderTargetView *rtv, const FLOAT color[4]);
-ComMethodRoutes<clear_rtv_fn, &hooked_clear_rtv, k_idx_clear_rtv> g_original_clear_rtv;
+ContextMethodRoutes<clear_rtv_fn, &hooked_clear_rtv, k_idx_clear_rtv> g_original_clear_rtv;
 void STDMETHODCALLTYPE hooked_clear_dsv(ID3D11DeviceContext *context, ID3D11DepthStencilView *dsv, UINT flags, FLOAT depth, UINT8 stencil);
-ComMethodRoutes<clear_dsv_fn, &hooked_clear_dsv, k_idx_clear_dsv> g_original_clear_dsv;
+ContextMethodRoutes<clear_dsv_fn, &hooked_clear_dsv, k_idx_clear_dsv> g_original_clear_dsv;
 HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer);
 ComMethodRoutes<create_buffer_fn, &hooked_create_buffer, k_idx_device_create_buffer> g_original_create_buffer;
 HRESULT STDMETHODCALLTYPE hooked_create_texture_2d(ID3D11Device *device, const D3D11_TEXTURE2D_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Texture2D **texture);
@@ -2081,10 +2120,55 @@ bool color_source_trace_pending() noexcept
 {
     return g_config.fsr2_trace_color_producers &&
         (!g_fsr2_color_producers_dumped.load(std::memory_order_relaxed) ||
-         !g_fsr2_motion_producers_dumped.load(std::memory_order_relaxed));
+         !g_fsr2_motion_producers_dumped.load(std::memory_order_relaxed)
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+         || !g_before_sr_producer_dumped.load(std::memory_order_relaxed)
+#endif
+        );
 }
 
-void record_color_source_call(
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+bool before_sr_producer_observation_pending() noexcept
+{
+    return g_config.fsr2_trace_color_producers &&
+        !g_before_sr_producer_dumped.load(std::memory_order_relaxed);
+}
+
+template <class Observe>
+void observe_before_sr_producer(ID3D11DeviceContext *context, Observe &&observe)
+{
+    if (!context || !before_sr_producer_observation_pending()) return;
+    std::unique_lock capture_lock(g_before_sr_producer_mutex, std::try_to_lock);
+    if (!capture_lock.owns_lock())
+    {
+        // 2026-11-16：不等锁，但漏掉的覆盖事件也不能被当作“最新 writer 未变”。
+        g_before_sr_producer_observation_gap.store(true, std::memory_order_relaxed);
+        return;
+    }
+    auto &capture = before_sr_producer_capture();
+    if (g_before_sr_producer_observation_gap.exchange(false, std::memory_order_relaxed)) capture.observe_gap();
+    const ContextPolicyBypass bypass(context);
+    observe(capture);
+}
+
+void note_before_sr_producer_return(ID3D11DeviceContext *context, std::uint64_t sequence)
+{
+    if (!sequence) return;
+    observe_before_sr_producer(context, [&](auto &capture) { capture.observe_return(*context, sequence); });
+}
+
+void note_before_sr_producer_overwrite(ID3D11DeviceContext *context, ID3D11Resource *destination,
+    neo::diagnostics::ProducerWrite operation)
+{
+    if (!destination) return;
+    observe_before_sr_producer(context, [&](auto &capture)
+    {
+        capture.observe_overwrite(*context, destination, operation);
+    });
+}
+#endif
+
+std::uint64_t record_color_source_call(
     ID3D11DeviceContext *context,
     const char *stage,
     std::uint32_t call_x,
@@ -2092,7 +2176,7 @@ void record_color_source_call(
     std::uint32_t call_z)
 {
     if (!color_source_trace_pending() || stage == nullptr)
-        return;
+        return 0;
 
     DispatchState snapshot {};
     {
@@ -2102,6 +2186,18 @@ void record_color_source_call(
 
     ColorSourceWrite write;
     write.sequence = g_color_source_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::uint64_t producer_sequence = 0;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    observe_before_sr_producer(context, [&](auto &capture)
+    {
+        if (capture.record_writer(*context, write.sequence, std::strcmp(stage, "dispatch") == 0))
+        {
+            producer_sequence = write.sequence;
+            LOG_DEBUG(blog::cat::probe, "before_sr_producer_snapshot_recorded sequence=" +
+                std::to_string(write.sequence));
+        }
+    });
+#endif
     write.stage = stage;
     write.context = reinterpret_cast<std::uint64_t>(context);
     write.call_x = call_x;
@@ -2160,7 +2256,7 @@ void record_color_source_call(
     }
 
     if (outputs.empty())
-        return;
+        return producer_sequence;
 
     std::lock_guard lock(g_color_source_mutex);
     for (const ResourceInfo &output : outputs)
@@ -2171,6 +2267,7 @@ void record_color_source_call(
         while (history.size() > 1024)
             history.pop_front();
     }
+    return producer_sequence;
 }
 
 void record_color_source_copy(ID3D11DeviceContext *context, const ResourceInfo &destination,
@@ -2326,10 +2423,99 @@ void dump_source_history(ID3D11DeviceContext *context, const ResourceInfo &targe
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info);
 bool read_resource_info_from_resource(ID3D11Resource *resource, const wchar_t *kind, ResourceInfo &out_info);
 
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+void maybe_capture_unknown_motion_consumer(ID3D11DeviceContext &context, const ffx12::FrameInput &input,
+    std::span<ID3D11ShaderResourceView *const> inputs, const TargetUpscalerDrawInfo &slots,
+    std::uint64_t instance, std::uint64_t frame, std::uint64_t generation)
+{
+    if (!g_config.fsr2_trace_color_producers || g_before_sr_consumer_dumped.load(std::memory_order_relaxed)) return;
+    std::unique_lock lock(g_before_sr_producer_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    auto &capture = before_sr_consumer_capture();
+    using neo::diagnostics::CaptureState;
+    const ContextPolicyBypass bypass(&context);
+    if (capture.state() == CaptureState::idle)
+    {
+        D3D11_SHADER_RESOURCE_VIEW_DESC motion {};
+        if (!input.motion_source_view || !input.output_target) return;
+        input.motion_source_view->GetDesc(&motion);
+        if (motion.Format == DXGI_FORMAT_R10G10B10A2_UNORM) return;
+        // 2026-11-16：冻结被拒候选当前的消费绑定，不能把绑定采集宣称为 FSR 身份或编码认证。
+        std::ostringstream identity;
+        identity << "before_sr_consumer_bindings pid=" << GetCurrentProcessId() << " identity={\"instance\":"
+            << instance << ",\"frame\":" << frame << ",\"generation\":" << generation
+            << ",\"context\":" << reinterpret_cast<std::uintptr_t>(&context)
+            << ",\"classification\":\"candidate-only\",\"motion_encoding\":\"unknown\",\"slots\":["
+            << slots.color_srv_slot << ',' << slots.depth_srv_slot << ',' << slots.motion_srv_slot << ','
+            << slots.output_rtv_slot << "],\"srvs\":[";
+        for (std::size_t n = 0; n < inputs.size(); ++n)
+        {
+            if (n) identity << ',';
+            ResourceInfo info {};
+            read_resource_info(inputs[n], L"consumer_input", info);
+            D3D11_SHADER_RESOURCE_VIEW_DESC view {};
+            if (inputs[n]) inputs[n]->GetDesc(&view);
+            identity << "{\"slot\":" << n << ",\"resource\":" << info.resource_key
+                << ",\"width\":" << info.width << ",\"height\":" << info.height
+                << ",\"format\":" << static_cast<unsigned>(info.format)
+                << ",\"view_format\":" << static_cast<unsigned>(view.Format)
+                << ",\"dimension\":" << view.ViewDimension << ",\"mip\":" << view.Texture2D.MostDetailedMip
+                << ",\"mip_levels\":" << view.Texture2D.MipLevels << '}';
+        }
+        identity << "]} capture=";
+        g_before_sr_consumer_identity = identity.str();
+        if (!capture.arm(context, *input.output_target) ||
+            !capture.record_writer(context, generation ? generation : 1, false))
+        {
+            LOG_INFO(blog::cat::probe, g_before_sr_consumer_identity + "{\"capture_failed\":true}");
+            g_before_sr_consumer_dumped.store(true, std::memory_order_relaxed);
+            return;
+        }
+    }
+    capture.poll(context);
+    if (capture.state() == CaptureState::ready || capture.state() == CaptureState::failed)
+    {
+        std::ostringstream receipt;
+        receipt << g_before_sr_consumer_identity;
+        capture.write_json(receipt);
+        // 仍使用异步日志；只记录一次，EVENT/DO_NOT_WAIT 口径沿用现有有界采集类。
+        LOG_INFO(blog::cat::probe, receipt.str());
+        g_before_sr_consumer_dumped.store(true, std::memory_order_relaxed);
+    }
+}
+#endif
+
 void maybe_dump_sdk_input_chains(ID3D11DeviceContext *context, const ffx12::FrameInput &input,
     std::uint64_t instance, std::uint64_t render_frame)
 {
-    if (!color_source_trace_pending() || (GetAsyncKeyState(VK_F6) & 0x8000) == 0) return;
+    if (!color_source_trace_pending()) return;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    std::unique_lock capture_lock(g_before_sr_producer_mutex, std::try_to_lock);
+    if (capture_lock.owns_lock() && context && input.color &&
+        !g_before_sr_producer_dumped.load(std::memory_order_relaxed))
+    {
+        auto &capture = before_sr_producer_capture();
+        const ContextPolicyBypass bypass(context);
+        if (capture.state() == neo::diagnostics::CaptureState::idle && capture.arm(*context, *input.color))
+            LOG_DEBUG(blog::cat::probe, "before_sr_producer_snapshot_armed");
+        if (g_before_sr_producer_observation_gap.exchange(false, std::memory_order_relaxed)) capture.observe_gap();
+        capture.observe_sdk(*context, *input.color, instance, render_frame);
+        capture.poll(*context);
+        // 2026-11-16：其他实例可促成快照退休，但不能抢走尚未锁存目标SDK身份的唯一回执。
+        // 失败终态仍报告失败；ready仅在目标消费已记录后报告，避免sdk_observed=false被当作完成。
+        if (capture.reportable())
+        {
+            std::ostringstream json;
+            json << "before_sr_producer_bindings pid=" << GetCurrentProcessId()
+                << " polled_instance=" << instance << " polled_sdk_frame=" << render_frame << " capture=";
+            capture.write_json(json);
+            // 沿用现有异步日志writer，不在渲染线程新建文件或写大块JSON到磁盘。
+            LOG_INFO(blog::cat::probe, json.str());
+            g_before_sr_producer_dumped.store(true, std::memory_order_relaxed);
+        }
+    }
+#endif
+    if ((GetAsyncKeyState(VK_F6) & 0x8000) == 0) return;
 
     // 2026-11-15：只在 SDK 调用点取证；扫描命中的 draw 未必是实际派发选中的那一路视图。
     ResourceInfo color {}, view {}, motion {};
@@ -7184,7 +7370,7 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
 #endif
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-    record_color_source_call(context, "dispatch", group_x, group_y, group_z);
+    const auto producer_sequence = record_color_source_call(context, "dispatch", group_x, group_y, group_z);
 #endif
 
     if (g_config.log_all_dispatch)
@@ -7211,6 +7397,9 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
     record_similarity_dispatch(group_x, group_y, group_z);
 #endif
     g_original_dispatch(context, group_x, group_y, group_z);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    note_before_sr_producer_return(context, producer_sequence);
+#endif
 }
 
 // 接管路径指纹缓存（正缓存）：缓存"识别成功"的资源特征指纹 → 布局。
@@ -9622,13 +9811,20 @@ void probe_native_params_once(
 }
 #endif // !DX11FSRBRIDGE_RELEASE_RUNTIME
 
-bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
+enum class UpscaleDrawResult
+{
+    original,
+    written,
+    blocked
+};
+
+UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
     const std::optional<TargetUpscalerDrawInfo> &inspected_draw_info,
     std::optional<neo::graphics::FrameBindings> &bindings)
 {
     const std::uint32_t translation_mode = g_config.fsr2_translation_mode;
     if (translation_mode == 0 || context == nullptr)
-        return false;
+        return UpscaleDrawResult::original;
 
     // 旧翻译层上下文重置（upscaler_stall 恢复）已移除——新架构仅 ffx12 链路。
 
@@ -9637,7 +9833,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
         if (!g_fsr2_dx11on12_block_logged.load(std::memory_order_relaxed) &&
             !g_fsr2_dx11on12_block_logged.exchange(true, std::memory_order_relaxed))
             LOG_WARN(blog::cat::upscale, "fsr2_translation_blocked unsafe_dx11_on12_backend=1 fallback=original_draw");
-        return false;
+        return UpscaleDrawResult::original;
     }
     if (g_fsr2_dx11on12_block_logged.load(std::memory_order_relaxed))
         g_fsr2_dx11on12_block_logged.store(false, std::memory_order_relaxed);
@@ -9645,13 +9841,13 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
     // 调度器已经读取本次 draw 的唯一候选；不回退重查，避免按需路径重复读 D3D 状态。
     const std::optional<TargetUpscalerDrawInfo> &draw_info = inspected_draw_info;
     if (!draw_info)
-        return false;
+        return UpscaleDrawResult::original;
     // 2026-11-16（同尺寸入口）：旧 DLL 的 1:1 提供方对照只有原生像素，没有 NGX 派发。
     // 完整签名仍须通过；同尺寸应交给后端原尺寸路径，游戏恢复尚待用户实测。
     if (draw_info->render_width > draw_info->output_width ||
         draw_info->render_height > draw_info->output_height)
     {
-        return false;
+        return UpscaleDrawResult::original;
     }
 
     const std::uint64_t candidate_index =
@@ -9669,9 +9865,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
     // ---- Phase 2: 调用点驱动的 FSR2 2.3.4 后端（不经 OptiScaler、不经 cb0 jitter） ----
     // il2cpp 必须激活（RVA 特征识别对齐后——国际服通过 Ffx12Il2CppRvaAutoScan 自动定位）
     //
-    // 修复①(b)：本 draw 是"认得出是累积 draw、却认不出属于哪个实例"的那一类，且在
-    // P1 多实例局面下 ⇒ 由函数末的收尾 gate 放行游戏原生（而不是吞掉它）。为什么需要
-    // 一个外层变量：收尾 gate 在下面这个大 if 之外（见 try_fsr2_translation_draw 末尾）。
+    // 多实例裁决可能要求未知归属的累积 Draw 放行，收尾时不能再被显式阻断策略覆盖。
     bool release_untagged_accumulate = false;
     if (g_config.ffx12 && il2cpp_callsite::active())
     {
@@ -9736,6 +9930,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
             std::uint64_t acc_pass_refuse = 0;          // ② 多义拒绝 ⇒ 放行原生
             std::uint64_t acc_pass_native_window = 0;   // ② 交棒后的纯原生窗口
             std::uint64_t acc_pass_strict = 0;          // ② E2 严格匹配
+            std::uint64_t acc_pass_unwritten = 0;       // ② 没有可交付的新输出 ⇒ 放行原生
             std::uint64_t acc_fail_closed = 0;          // ③ 被 fail-closed 吞掉（既不派发也不放行）
             std::uint64_t acc_dispatch_failed = 0;      // ⑤ 其它：派发失败（fail-open）
             std::uint64_t acc_texture_missing = 0;      // ⑤ 其它：纹理取不到
@@ -9934,8 +10129,8 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     st->acc_log_tick = dest_now;
                     const std::uint64_t acc_sum = st->acc_dispatch + st->acc_dispatch_repair +
                         st->acc_dispatch_reuse + st->acc_pass_not_taker + st->acc_pass_refuse +
-                        st->acc_pass_native_window + st->acc_pass_strict + st->acc_fail_closed +
-                        st->acc_dispatch_failed;
+                        st->acc_pass_native_window + st->acc_pass_strict + st->acc_pass_unwritten +
+                        st->acc_fail_closed + st->acc_dispatch_failed;
                     // ⚠️ `acc_texture_missing` **刻意不进这个和**：它是 fail_closed 的**子原因标签**
                     // （同一个 draw 既算 fail_closed 又打标签）⇒ 计入会让 `dest_gap` 恒无意义。
                     // "两路同键"直接指认：找出另一个实例，它的**上次派发**用的是同一组
@@ -10003,6 +10198,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                         " pass_refuse=" + std::to_string(st->acc_pass_refuse) +
                         " pass_native=" + std::to_string(st->acc_pass_native_window) +
                         " pass_strict=" + std::to_string(st->acc_pass_strict) +
+                        " pass_unwritten=" + std::to_string(st->acc_pass_unwritten) +
                         // ③ fail-closed 吞掉（**此前完全不可见**的那一类）
                         " fail_closed=" + std::to_string(st->acc_fail_closed) +
                         // ⑤ 其它
@@ -10340,7 +10536,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                             st->native_until_tick > p1_now ? st->native_until_tick - p1_now : 0) +
                         " frame=" + std::to_string(call_params.frame_index));
                 }
-                return false;
+                return UpscaleDrawResult::original;
             }
         }
 
@@ -10374,14 +10570,12 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     " frame=" + std::to_string(call_params.frame_index) +
                     " action=passthrough_native");
             }
-            return false;
+            return UpscaleDrawResult::original;
         }
 
         // ---- 修复①(b)：认得出、却认不出归属的累积 draw —— 状态必须可见 + P1 多实例下放行原生 ----
-        // 这类 draw 会走到函数末的 fail-closed 收尾（`return true`）⇒ **既不派发也不放行**
-        // ⇒ 那一路输出永远没人产出 ⇒ 视图冻在最后一帧。这就是"没有一步恢复它的原生路径"
-        // 的代码位置：`放行` 只在"匹配到了、且不是接管者"时才发生（上面的 passthrough
-        // 分支），**匹配不到**时是吞掉。
+        // 旧收尾无条件阻断这类 Draw，可能使该路无人产出；现在默认放行原生。
+        // 用户显式 FailClosed 时仍保留下面的多实例放行裁决，避免误吞其他场景。
         // ⚠️ 可达性（上一轮实机 `ffx12_untagged_release=0` 引出的疑问 ⇒ 这里是代码级答案）：
         //   最典型的触发者就是"**被交棒释放的老实例**的同代第二次累积 draw"：
         //     ① 它这一代的第一次 draw 已被 passthrough 分支放行，**token 被消费掉**；
@@ -10462,9 +10656,9 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
             }
         }
 
-        // 该路径保持 direct-only：失败也不能让原生 FSR2 覆盖输出。不过不能保留
-        // 旧 token/旧 canonical output，否则下一 draw 会重试同一历史或复制陈旧帧。
-        auto invalidate_direct_attempt = [&](const char *reason)
+        // 失败后必须终结旧 token/旧输出，否则成对 Draw 会重试旧历史或复制陈旧帧。
+        // 2026-11-16（失败恢复实测）：放行原生与实际写回必须分别回报，避免空帧武装 PRE skip。
+        auto invalidate_direct_attempt = [&](const char *reason, std::uint64_t failure_count)
         {
             if (st == nullptr || call_gen == 0)
                 return;
@@ -10472,12 +10666,15 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
             // 失败后只留输出归属，不保留能被成对 Draw 交付的旧纹理。
             st->output_history.invalidate_frame();
             const bool consumed = il2cpp_callsite::consume_render_token_for(match_inst, call_gen);
-            LOG_INFO(blog::cat::upscale, "ffx12_result rc=" + std::string(reason) +
-                " gen=" + std::to_string(call_gen) +
-                " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
-                " frame=" + std::to_string(call_params.frame_index) +
-                " token_consumed=" + std::to_string(consumed ? 1 : 0) +
-                " action=invalidate_reset");
+            // 2026-11-16：现场连续 2535 次失败；复用调用方累计计数，格式化同样置于次数闸门内。
+            if (failure_count <= 8 || failure_count % 256 == 0)
+                LOG_INFO(blog::cat::upscale, "ffx12_result rc=" + std::string(reason) +
+                    " count_total=" + std::to_string(failure_count) +
+                    " gen=" + std::to_string(call_gen) +
+                    " inst=" + hex64(match_inst & 0xFFFFFFFFull) +
+                    " frame=" + std::to_string(call_params.frame_index) +
+                    " token_consumed=" + std::to_string(consumed ? 1 : 0) +
+                    " action=invalidate_reset");
         };
 
         // 4) 每实例 gate：只允许新 Render generation 推进 temporal history。
@@ -10557,9 +10754,8 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
         // （采样来源 `claim_color_ptr` 已在第 1b 步读到，这里只做判定，不再重复读 SRV。）
         // 判据口径：认领者上一次**成功派发**时用的 color（`acc_in_color`）== 本 draw 现场
         //   在 color_srv_slot 上取到的 color 指针 ⇒ 这是同一路视图的帧。
-        //   ⚠️ 只比 color、**刻意不比 depth**：派发时记录的 depth 是"DSV 覆盖后"的那张
-        //   （见上方 ffx12_depth_dsv 分支），而这里现场只能拿到 SRV 槽位上的那张 ——
-        //   两者在实机上并不总是同一张 ⇒ 比 depth 会假阴性。color 没有这个覆盖问题。
+        // 2026-11-16：沿用这里既有的 color 归属检查；后续派发直接使用同 Draw 的 depth SRV。
+        // 资源身份关联本身不认证运动编码、相机或颜色传递函数，后端仍分别验证准入。
         const bool claim_input_owned = st != nullptr && match_path == 2 &&
             !output_belongs_to_instance && st->acc_in_color != 0 &&
             st->acc_in_color == claim_color_ptr;
@@ -10631,7 +10827,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     " frame=" + std::to_string(call_params.frame_index) +
                     " action=passthrough_native");
             }
-            return false;
+            return UpscaleDrawResult::original;
         }
         // ---- P2 实验开关 E2：严格匹配（Ffx12SingleInstanceStrictMatch=1，**默认关**）----
         // 与上面 D5 同判据，但**真的不接管**这一 draw：消费 token 后放行游戏原生
@@ -10660,7 +10856,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     " frame=" + std::to_string(call_params.frame_index) +
                     " action=passthrough_native");
             }
-            return false;
+            return UpscaleDrawResult::original;
         }
         const bool sdk234_output_duplicate = st != nullptr && call_gen == 0 &&
             output_associated_inst == match_inst && output_belongs_to_instance &&
@@ -10719,7 +10915,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     }
                     g_sdk234_output_ptr = reinterpret_cast<std::uint64_t>(sdk234_out_res);
                     g_sdk234_output_tick.store(GetTickCount64(), std::memory_order_relaxed);
-                    return true;
+                    return UpscaleDrawResult::written;
                 }
             }
             if (!sdk234_output_duplicate && color_tex && depth_tex && motion_tex && output_tex)
@@ -10749,7 +10945,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                         }
                         g_sdk234_output_ptr = reinterpret_cast<std::uint64_t>(sdk234_out_res);
                         g_sdk234_output_tick.store(GetTickCount64(), std::memory_order_relaxed);
-                        return true;
+                        return UpscaleDrawResult::written;
                     }
                 }
                 // 2026-08-24：切断原生 FSR2，全部实例接管，只允许 FSR2.3.4 SDK。
@@ -10769,23 +10965,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     }
                 }
                 {
-                // 原生累积 Draw 的深度 SRV 可能为空数据；保持优先使用当前 DSV 的策略。
-                const auto scene_depth = frame.scene_depth();
-                if (scene_depth && scene_depth.Get() != depth_tex)
-                {
-                    D3D11_TEXTURE2D_DESC details {};
-                    scene_depth->GetDesc(&details);
-                    if (details.Format != DXGI_FORMAT_UNKNOWN)
-                    {
-                        depth_tex = scene_depth.Get();
-                        static std::atomic_uint64_t dsv_switch_log { 0 };
-                        const auto count = dsv_switch_log.fetch_add(1, std::memory_order_relaxed) + 1;
-                        if (count <= 4 || count % 256 == 0)
-                            LOG_DEBUG(blog::cat::upscale, "ffx12_depth_dsv switch fmt=" +
-                                std::to_string(static_cast<std::uint32_t>(details.Format)) +
-                                " size=" + std::to_string(details.Width) + "x" + std::to_string(details.Height));
-                    }
-                }
+                // 2026-11-16：同尺寸 DSV 不能证明同相机/同帧输入；只交付当前 FSR 实际消费的深度。
                 ffx12::FrameInput sdk_in {};
                 sdk_in.color = color_tex;
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
@@ -10793,6 +10973,11 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                 const auto color_inputs = frame.inputs();
                 if (draw_info->color_srv_slot < color_inputs.size())
                     sdk_in.color_source_view = color_inputs[draw_info->color_srv_slot];
+                // 2026-11-16：识别层已持有当前绑定的实际视图，后端不得固定重建另一种 guide 格式。
+                if (draw_info->depth_srv_slot < color_inputs.size())
+                    sdk_in.depth_source_view = color_inputs[draw_info->depth_srv_slot];
+                if (draw_info->motion_srv_slot < color_inputs.size())
+                    sdk_in.motion_source_view = color_inputs[draw_info->motion_srv_slot];
 #endif
                 sdk_in.depth = depth_tex;
                 sdk_in.motion = motion_tex;
@@ -11196,6 +11381,10 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
                 maybe_dump_sdk_input_chains(context, sdk_in, call_params.instance, call_params.frame_index);
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                maybe_capture_unknown_motion_consumer(*context, sdk_in, frame.inputs(), *draw_info,
+                    call_params.instance, call_params.frame_index, call_gen);
+#endif
 #endif
                 const auto delivery = ffx12::dispatch(sdk_in, context, call_params.instance);
                 if (delivery != ffx12::DispatchResult::failed)
@@ -11516,7 +11705,7 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                     }
 #endif // DX11FSRBRIDGE_ENABLE_DIAGNOSTICS（ffx12_output_learn —— 只喂日志）
                     st->output_history.publish(*output_tex, call_gen, draw_out_ptr);
-                    return true;
+                    return UpscaleDrawResult::written;
                 }
                 else
                 {
@@ -11539,25 +11728,21 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                             " ffx_rc=" + std::to_string(ffx12::last_ffx_dispatch_return_code()) +
                             " sdk_msgs=" + (msgs.empty() ? std::string("none") : narrow(msgs)));
                     }
-                    invalidate_direct_attempt("DISPATCH_FAILED");
-                    // 【本批新增 · 问题 A】⑤ 其它：派发失败 —— 默认 **fail-open 交回原生**
-                    // （下面 return false）；`Ffx12FailClosed=1` 时改为 fail-closed 吞掉 ⇒ 计入
-                    // fail_closed 桶。两者互斥，保证"每 draw 只落一个桶"（对账行不会重复计数）。
-                    // ⚠️ 门控的只是两侧的**计数**；`Ffx12FailClosed` 的分支与 return 值（功能）
-                    //   逐字不变。
+                    invalidate_direct_attempt("DISPATCH_FAILED", fc);
+                    // 派发失败默认交回原生；显式 FailClosed 只阻断，不能回报成功写回。
                     if (g_config.ffx12_fail_closed)
                     {
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                         ++st->acc_fail_closed;
 #endif
-                        return true;
+                        return UpscaleDrawResult::blocked;
                     }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                     ++st->acc_dispatch_failed;
 #endif
                     // 旧翻译层已停用——sdk234 未接管时直接放行
                     // （新架构仅 ffx12 一条链路；OptiScaler 后续以 ffx12 为基底重新接入）。
-                    return false;
+                    return UpscaleDrawResult::original;
                 }
                 }
             }
@@ -11577,62 +11762,35 @@ bool try_fsr2_translation_draw(ID3D11DeviceContext *context,
                         " output=" + std::to_string(output_tex ? 1 : 0) +
                             " frame=" + std::to_string(call_params.frame_index));
                 }
-                // 【仅诊断 · 问题 A】⑤ 子原因标签（**不单独占桶**）：最终去向由函数末的
-                // fail-closed 记账，这里只标"吞掉的原因是纹理没取全"（对账行的 tex_missing=）。
+                // 纹理缺失只记子原因；函数末按实际放行/阻断结果记入互斥桶。
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                 ++st->acc_texture_missing;
 #endif
-                invalidate_direct_attempt("RESOURCES_INVALID");
+                invalidate_direct_attempt("RESOURCES_INVALID", nc);
             }
-            // 失败由 invalidate_direct_attempt 终结旧 token；函数末的 direct-only gate
-            // 继续截断原生 accumulate draw，等待下一枚有效 token 以 reset 重建历史。
+            // 失败已终结旧 token；下一枚有效 token 会 reset。当前无输出时按显式配置放行或阻断。
         }
-        // 【本批新增 · 问题 A】③ 位置就在这里定案：能走到本行的、且 `st != nullptr` 的 draw，
-        // 只剩最后那条 fail-closed 出口（`return true` ⇒ 既不派发、也不放行）——
-        // 上面所有"派发/放行"的分支都已经 return。这正是此前**完全不可见**的那一类
-        // （`ffx12_skip` 在"最近 50ms 派发过"时被刻意抑制 ⇒ 典型形态一条都打不出来）。
-        // 判据等价性：`release_untagged_accumulate` 只可能由 `match_inst == 0`（即 st == nullptr）
-        // 的分支置位 ⇒ 本行不可能把它误记成 fail-closed。
+        // 2026-11-16（失败恢复四步对照）：无 token 且旧输出已失效时，原出口仍吞 Draw，
+        // 两个目标均保持空值。只有用户显式要求 FailClosed 才阻断，且不能把阻断当成功写回。
+        bool block_without_output = g_config.ffx12_fail_closed && !release_untagged_accumulate;
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        block_without_output = block_without_output && !ngx::should_release_all();
+#endif
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         if (st != nullptr)
-            ++st->acc_fail_closed;
+        {
+            if (block_without_output) ++st->acc_fail_closed;
+            else ++st->acc_pass_unwritten;
+        }
 #endif
         // 诊断：sdk234 未接管原因（低频，只读，已抽为独立函数）
         log_sdk234_skip_reason(st, match_inst, draw_out_ptr, sdk234_now,
             st != nullptr ? st->timeline.last_write_tick() : 0,
             draw_info->render_width, draw_info->render_height);
+        return block_without_output ? UpscaleDrawResult::blocked : UpscaleDrawResult::original;
     }
 
-    // Once a target FSR2 accumulate draw is identified, keep the native path
-    // blocked.  Pending Render tokens above make the update decision from the
-    // actual Render event rather than a stale output association.
-    //
-    // 修复①(b)：P1 单实例接管 + 本进程存在第二个实例时，这条 fail-closed 会连**我们没在
-    // 接管的那一路**的累积 draw 一起吞掉（既不派发、也不放行）⇒ 那一路的输出永远没人
-    // 产出 ⇒ 视图冻在最后一帧（实机定案："没有任何一步恢复它的原生路径"）。此时放行：
-    // 同一互锁（见 fsr2_family_should_skip_draw）已关闭"跳过预处理 pass"，游戏原生
-    // FSR2 的输入是完整的 ⇒ 放行产出的是正确原生帧。单实例/全量接管（Ffx12SingleInstance=0）
-    // 判据都不成立 ⇒ 原有语义（切断原生 FSR2）逐字保留。
-    if (g_config.ffx12 && il2cpp_callsite::active())
-    {
-#if defined(DX11FSRBRIDGE_ENABLE_NGX)
-        // ★ T-6 第一道 fail-open gate（SDS §3.3.3 / D9）：NGX 全局放手时放行累积 draw，
-        //   否则原生 FSR2 的输入缺失 ⇒ 画面冻在最后一帧（2026-09-28 实机冻屏回归的机理）。
-        //   should_release_all() 只读一个 std::atomic<bool>，不碰容器、不取锁。
-        if (release_untagged_accumulate || ngx::should_release_all())
-            return false;
-#else
-        if (release_untagged_accumulate)
-            return false;
-#endif
-        return true;
-    }
-
-    // 旧翻译层执行段已删除（2026-09-19）：
-    // 它位于 11117 的 `return true` 之后，**不可达** —— 条件为真时已在此返回，
-    // 为假则直接落到下方 return false。原注释称"文本保留供参考"，但该段自 74bed58
-    // 起就在 git 历史中，保留在源文件里只会让这个 1793 行的函数更难读。
-    return false; // 旧翻译层停用后直接放行（新架构仅 ffx12 链路）
+    return UpscaleDrawResult::original;
 }
 #endif
 
@@ -12038,13 +12196,13 @@ bool fsr2_family_skip_gate(ID3D11DeviceContext *context, UINT count, bool indexe
 #endif
 }
 
-// 把"本帧翻译层是否处理了该 draw"回报给合成族状态机，并输出前若干次诊断。
+// 把"本帧是否实际写回该 draw"回报给合成族状态机；仅阻断不能武装后续 PRE skip。
 // 注：原先只有 draw_indexed 路径写这条日志，draw 路径漏了 → 已统一。
 // ⚠️ 2026-11-14（专项审查：早退是否该跳过记账）：target_draw_info == nullptr 时直接
 //   return、不做 notify_accumulate_result。这是**漏做而非多做**：后果是 skip 许可不武装，
 //   少一次优化机会，不产生错误输出；且 nullptr 本身说明这一帧没有可用的 draw 信息，
 //   此时记账也无从记起。故保持现状，不改代码。
-void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_info)
+void note_family_notify(bool written, const TargetUpscalerDrawInfo *target_draw_info)
 {
 #if defined(DX11FSRBRIDGE_ENABLE_FSR2_TRANSLATION_EXPERIMENTAL)
     if (!g_config.fsr2_family_skip || target_draw_info == nullptr)
@@ -12052,15 +12210,15 @@ void note_family_notify(bool handled, const TargetUpscalerDrawInfo *target_draw_
     static std::atomic_uint64_t family_notify_count { 0 };
     const std::uint64_t notify_seq = family_notify_count.fetch_add(1, std::memory_order_relaxed);
     if (notify_seq < 16)
-        LOG_DEBUG(blog::cat::upscale, "fsr2_family_notify handled=" + std::to_string(handled ? 1 : 0) +
+        LOG_DEBUG(blog::cat::upscale, "fsr2_family_notify written=" + std::to_string(written ? 1 : 0) +
             " render=" + std::to_string(target_draw_info->render_width) + "x" +
             std::to_string(target_draw_info->render_height) +
             (il2cpp_callsite::active()
                 ? " il2cpp_render_calls=" + std::to_string(il2cpp_callsite::render_call_count())
                 : std::string()));
-    fsr2_family_takeover::notify_accumulate_result(handled, GetTickCount64());
+    fsr2_family_takeover::notify_accumulate_result(written, GetTickCount64());
 #else
-    (void)handled;
+    (void)written;
     (void)target_draw_info;
 #endif
 }
@@ -12142,12 +12300,12 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
         maybe_dump_color_candidate_inputs(context, element_count);
         maybe_dump_same_frame_fsr2_inputs(context, element_count);
 #endif
-        const bool handled = try_fsr2_translation_draw(context, target, bindings);
-        note_family_notify(handled, target ? &*target : nullptr);
+        const auto result = try_fsr2_translation_draw(context, target, bindings);
+        note_family_notify(result == UpscaleDrawResult::written, target ? &*target : nullptr);
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         finish_fsr2_transient_capture_fallback();
 #endif
-        return handled;
+        return result != UpscaleDrawResult::original;
 #else
         return false;
 #endif
@@ -12166,10 +12324,23 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
     bool final_scene_snapshot_boundary = false;
     std::uint64_t final_scene_snapshot_frame = 0;
 #endif
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    // 2026-11-16（execute_draw 的 UD/UHD/UHSD 路线）：业务分支内的原 Draw 也必须成对记录。
+    // before/after 仅包最终回退，故观测放在真实 next 调用；替换成功而未执行原 Draw 时不发事件。
+    const auto observed_draw = [&]
+    {
+        const auto sequence = record_color_source_call(context, entry_name, element_count, 0, 0);
+        draw();
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        note_before_sr_producer_return(context, sequence);
+#endif
+    };
+    neo::graphics::execute_draw(observed_draw, upscale, tone_map, spatial, [&]
+#else
     neo::graphics::execute_draw(draw, upscale, tone_map, spatial, [&]
+#endif
     {
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-        record_color_source_call(context, entry_name, element_count, 0, 0);
         if (g_config.enable_similarity_probe || (g_config.trace_pixel_shader_draws &&
             g_current_ps_hash.load(std::memory_order_relaxed) == g_config.trace_pixel_shader_hash))
             record_similarity_draw(entry_name, element_count);
@@ -12204,18 +12375,14 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT count, UIN
         [&] { g_original_draw(context, count, start); });
 }
 
+void STDMETHODCALLTYPE hooked_flush(ID3D11DeviceContext *context)
+{
+    g_original_flush(context);
+}
+
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)
 {
     const HRESULT hr = g_original_map(context, resource, subresource, map_type, map_flags, mapped);
-    // WARP 的阻塞读回也会恢复运行时槽。普通写 Map 和 Draw 不执行这条检查。
-    if ((map_type == D3D11_MAP_READ || map_type == D3D11_MAP_READ_WRITE) && context &&
-        (!g_original_draw.bound_on(context) || !g_original_draw_indexed.bound_on(context)))
-    {
-        const bool installed = install_context_hooks(context);
-        static std::atomic_uint32_t receipts { 0 };
-        if (receipts.fetch_add(1, std::memory_order_relaxed) < 8)
-            LOG_INFO(blog::cat::hook, "read_map_context_reinstalled patch_ok=" + std::to_string(installed));
-    }
     if (SUCCEEDED(hr) && resource != nullptr && mapped != nullptr && mapped->pData != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
@@ -12291,6 +12458,9 @@ void STDMETHODCALLTYPE hooked_rs_set_viewports(ID3D11DeviceContext *context, UIN
 
 void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11Resource *dst, ID3D11Resource *src)
 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    note_before_sr_producer_overwrite(context, dst, neo::diagnostics::ProducerWrite::copy_resource);
+#endif
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // Release 只为 sdk234 输出链追踪 CopyResource。未命中时不查询资源描述，保持原样透传。
     const std::uint64_t sdk_output_fast = g_sdk234_output_ptr;
@@ -12360,6 +12530,9 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
 
 void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, UINT dst_x, UINT dst_y, UINT dst_z, ID3D11Resource *src, UINT src_subresource, const D3D11_BOX *src_box)
 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    note_before_sr_producer_overwrite(context, dst, neo::diagnostics::ProducerWrite::copy_subresource);
+#endif
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // Release：全部内省消费点默认关闭时直接透传（同 copy_resource 快路径模式）。
     if (!g_config.log_resource_ops && !g_config.hdr_composite_probe && !g_config.fsr2_trace_color_producers)
@@ -12384,6 +12557,9 @@ void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *conte
 
 void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, const D3D11_BOX *dst_box, const void *src_data, UINT src_row_pitch, UINT src_depth_pitch)
 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    note_before_sr_producer_overwrite(context, dst, neo::diagnostics::ProducerWrite::update_subresource);
+#endif
     if (dst != nullptr && src_data != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(dst);
@@ -12412,6 +12588,14 @@ void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, I
 
 void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11RenderTargetView *rtv, const FLOAT color[4])
 {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    if (rtv && before_sr_producer_observation_pending())
+    {
+        Microsoft::WRL::ComPtr<ID3D11Resource> destination;
+        rtv->GetResource(destination.GetAddressOf());
+        note_before_sr_producer_overwrite(context, destination.Get(), neo::diagnostics::ProducerWrite::clear_target);
+    }
+#endif
     if (g_config.dx11_on12_swapchain)
     {
         ResourceInfo info {};
@@ -12456,13 +12640,19 @@ std::span<const com_vtable::MethodPatch> context_patch_plan()
         const auto plan = neo::graphics::context_observation(release,
             g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state,
             g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm, g_config.dx11_on12_swapchain);
+        // 2026-11-16：清理和区域复制在硬件/WARP均会还原 Draw 槽，
+        // 命令返回观察必须覆盖发布版，不能只在诊断构型恢复入口。
         std::vector<com_vtable::MethodPatch> patches {
             route_slot(g_original_draw_indexed),
             route_slot(g_original_draw),
             route_slot(g_original_map),
             route_slot(g_original_unmap),
+            route_slot(g_original_flush),
             route_slot(g_original_copy_resource),
+            route_slot(g_original_copy_subresource_region),
             route_slot(g_original_update_subresource),
+            route_slot(g_original_clear_rtv),
+            route_slot(g_original_clear_dsv),
         };
         if (plan.mirror_state)
         {
@@ -12486,9 +12676,6 @@ std::span<const com_vtable::MethodPatch> context_patch_plan()
             route_slot(g_original_cs_set_shader),
             route_slot(g_original_cs_set_constant_buffers),
             route_slot(g_original_dispatch),
-            route_slot(g_original_copy_subresource_region),
-            route_slot(g_original_clear_rtv),
-            route_slot(g_original_clear_dsv),
         });
 #endif
         return patches;
@@ -12500,6 +12687,25 @@ bool install_context_hooks(ID3D11DeviceContext *context)
 {
     return context && neo::graphics::bind_execution_dispatch(context, context_patch_plan(),
         route_slot(g_original_set_multithread_protected));
+}
+
+void rebind_context_dispatch(ID3D11DeviceContext *context)
+{
+    // 2026-11-16：真实 WARP 回归在读回前检出15处丢钩；单次 Flush 重装
+    // 又被下一笔 Draw 覆盖。只在真实槽失配时重用装配，保留原表的所有私有入口。
+    const bool installed = install_context_hooks(context);
+    static std::atomic_uint32_t receipts { 0 };
+    if (receipts.fetch_add(1, std::memory_order_relaxed) < 16)
+        LOG_INFO(blog::cat::hook, "context_routes_reinstalled patch_ok=" + std::to_string(installed));
+}
+
+__forceinline void repair_context_dispatch(ID3D11DeviceContext *context)
+{
+    if (!context || (g_original_draw.bound_on(context) && g_original_draw_indexed.bound_on(context)))
+        return;
+    // 2026-11-16：零退化门禁仍有+1.52%；常态判据与装配/日志分开，
+    // 保留相同恢复时机，让正常调用无需进入大恢复函数。收益以新对照为准。
+    rebind_context_dispatch(context);
 }
 
 BOOL STDMETHODCALLTYPE hooked_set_multithread_protected(ID3D11Multithread *protection, BOOL enable)
@@ -12665,6 +12871,11 @@ HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const
         }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         dump_pixel_shader_bytecode(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        if (g_config.fsr2_trace_color_producers && bytecode_length <= neo::diagnostics::BeforeSrProducerCapture::max_shader_bytes)
+            neo::diagnostics::BeforeSrProducerCapture::remember_shader(**pixel_shader, shader_bytecode,
+                static_cast<unsigned>(bytecode_length));
+#endif
 #endif
     }
     return hr;
@@ -12686,6 +12897,11 @@ HRESULT STDMETHODCALLTYPE hooked_create_vertex_shader(ID3D11Device *device, cons
         }
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         dump_vertex_shader_bytecode(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        if (g_config.fsr2_trace_color_producers && bytecode_length <= neo::diagnostics::BeforeSrProducerCapture::max_shader_bytes)
+            neo::diagnostics::BeforeSrProducerCapture::remember_shader(**vertex_shader, shader_bytecode,
+                static_cast<unsigned>(bytecode_length));
+#endif
 #endif
     }
     return hr;
@@ -12700,6 +12916,11 @@ HRESULT STDMETHODCALLTYPE hooked_create_compute_shader(ID3D11Device *device, con
     const HRESULT hr = g_original_create_compute_shader(device, shader_bytecode, bytecode_length, class_linkage, compute_shader);
     if (SUCCEEDED(hr) && compute_shader != nullptr && *compute_shader != nullptr)
     {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS) && !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+        if (g_config.fsr2_trace_color_producers && bytecode_length <= neo::diagnostics::BeforeSrProducerCapture::max_shader_bytes)
+            neo::diagnostics::BeforeSrProducerCapture::remember_shader(**compute_shader, shader_bytecode,
+                static_cast<unsigned>(bytecode_length));
+#endif
         const auto key = reinterpret_cast<std::uint64_t>(*compute_shader);
         ShaderInfo info = reflect_compute_shader(bytecode_hash, shader_bytecode, static_cast<std::size_t>(bytecode_length));
         {

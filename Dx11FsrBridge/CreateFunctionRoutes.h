@@ -9,11 +9,12 @@
 
 // 2026-11-14：Rocket 与系统 D3D11 可以同名共存；实测单个 original 会把第二个
 // provider 的调用转给第一个。按真实 callable 绑定入口，嵌套时只恢复当前线程上下文。
-template <typename Function, Function Observe, std::size_t Capacity = 16>
+template <typename Function, Function Observe, std::size_t Capacity = 16, auto InvokeWithOriginal = nullptr>
 class CreateFunctionRoutes;
 
-template <typename Result, typename... Args, Result(WINAPI *Observe)(Args...), std::size_t Capacity>
-class CreateFunctionRoutes<Result(WINAPI *)(Args...), Observe, Capacity>
+template <typename Result, typename... Args, Result(WINAPI *Observe)(Args...), std::size_t Capacity,
+    auto InvokeWithOriginal>
+class CreateFunctionRoutes<Result(WINAPI *)(Args...), Observe, Capacity, InvokeWithOriginal>
 {
     using Function = Result(WINAPI *)(Args...);
     inline static std::array<std::atomic<Function>, Capacity> originals_ {};
@@ -38,8 +39,18 @@ class CreateFunctionRoutes<Result(WINAPI *)(Args...), Observe, Capacity>
     template <std::size_t Index>
     static Result WINAPI invoke(Args... args)
     {
-        CallScope scope(originals_[Index].load(std::memory_order_acquire));
-        return Observe(args...);
+        const Function original = originals_[Index].load(std::memory_order_acquire);
+        // 2026-11-16：COM路由已有对象Frame链，original直接传入，避免重复维护TLS。
+        // 创建/IAT路线仍使用CallScope；CPU收益须通过同配置严格门禁，实机未验证。
+        if constexpr (InvokeWithOriginal != nullptr)
+        {
+            return InvokeWithOriginal(original, args...);
+        }
+        else
+        {
+            CallScope scope(original);
+            return Observe(args...);
+        }
     }
 
     template <std::size_t... Indices>
@@ -54,6 +65,15 @@ public:
     static Function original()
     {
         return current_;
+    }
+
+    // 2026-11-16：调用完成后的入口检查只需确认归属，不应为此再读取 original。
+    static bool owns(Function entry)
+    {
+        for (Function candidate : entries_)
+            if (entry == candidate)
+                return true;
+        return false;
     }
 
     static Function target(Function entry)
@@ -71,9 +91,8 @@ public:
         if (target == nullptr)
             return nullptr;
         // IAT 重扫可能看到已安装入口；不能再把自己的入口当作新的 original。
-        for (Function entry : entries_)
-            if (target == entry)
-                return entry;
+        if (owns(target))
+            return target;
 
         std::lock_guard lock(install_mutex_);
         for (std::size_t i = 0; i < Capacity; ++i)

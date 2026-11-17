@@ -24,7 +24,6 @@ public:
     std::span<ID3D11ShaderResourceView *const> inputs() noexcept;
     Resource target_resource(UINT slot) const noexcept;
     Resource input_resource(UINT slot) noexcept;
-    Texture scene_depth() const noexcept;
     static Texture texture_2d(const Resource &resource) noexcept;
 
 private:

@@ -38,6 +38,7 @@
 //   本阶段仍不出图：dispatch() 里的 TODO(T-5) 一字未动。
 
 // ---- ① 标准库 ----
+#include <algorithm>
 #include <atomic>         // std::atomic（g_release_all / g_logged_config / g_ngx_log_count）
 #include <cstdarg>        // va_list / va_start / va_end（log_ngx_* 的 varargs）
 #include <cstdint>        // std::uint8_t（DLSS 版本资源的读缓冲）
@@ -60,6 +61,7 @@
 #include "Ffx12Backend.h" // ffx12::FrameInput / ffx12::backend()
 #include "Ffx12ShaderSource.h" // g_depth_extract_hlsl / g_motion_decode_d11_hlsl
 #include "NgxBackend.h"
+#include "Il2CppCallSiteHook.h"
 #include "ngx/FeatureHandle.h"
 #include "ngx/ProviderDiscovery.h"
 #include "ngx/FrameResources.h"
@@ -223,7 +225,10 @@ struct NgxInstance
     neo::ngx::BeforeSrAo ao;
     neo::ngx::FeatureHandle feature;
     int feature_preset = 0;
+    int feature_quality = 0;
+    unsigned feature_flags = 0;
     unsigned feature_flags_bits = 0;
+    std::uint64_t last_use = 0;
     bool first = true; // 新 feature / 跨 key 复用必须 Reset；只有成功提交才清。
 
     bool feature_create_failed = false;
@@ -249,6 +254,7 @@ struct NgxInstance
         ao = {};
         pool = {};
         key = 0;
+        last_use = 0;
         clear_create_failure();
         eval_fail_streak = 0;
     }
@@ -290,7 +296,12 @@ bool g_shader_object_failed = false;      // CreateComputeShader 设备对象失
 
 // ---- 实例表 ----
 // 外部 provider 的 ReleaseFeature 可能等待 GPU；只在显式转场调用，不能在 DLL 静态析构中调用。
-NgxInstance &g_inst = *new NgxInstance {};
+// 2026-11-16（四路场景回归）：全量接管不能共用一个 feature，否则 B 会重置 A 的历史。
+// 容量直接跟随 Render 捕获端；只有新 key 占满槽时才淘汰 LRU，不以停滞推定实例销毁。
+using InstanceCache = std::array<NgxInstance, il2cpp_callsite::k_render_instance_capacity>;
+InstanceCache &g_instances = *new InstanceCache {};
+NgxInstance *g_parameter_owner = nullptr;
+std::uint64_t g_instance_sequence = 0;
 
 // ★ v8 补（MAJOR-1）：上一次的 instance_key，**仅用于 ngx_inst switch from=… 日志**。
 std::uint64_t g_prev_key = 0;
@@ -426,7 +437,7 @@ bool retire_feature(NgxInstance &inst)
         inst.first = true;
         return true;
     }
-    // 只有一个实例。拒绝退休时保留整份所有权，进程剩余时间让原生路径接管。
+    // 拒绝退休时保留该实例整份所有权，进程剩余时间让原生路径接管。
     if (!g_release_all.exchange(true, std::memory_order_relaxed))
         log_ngx_error(L"ngx_core release_all reason=retirement_refused inst=0x%llX rc=0x%X",
             static_cast<unsigned long long>(inst.key), rc);
@@ -474,6 +485,8 @@ namespace log_throttle_slot
 //   格式：X(枚举子名, 槽号)。槽号是**手写常量**、只用来标识身份，不是任何哈希的结果。
 #define LOG_SLOT_LIST(X) \
     X(PoolTexFail,       14) \
+    X(GuideBindFail,     21) \
+    X(MotionEncodingUnknown, 22) \
     X(ColorSrvFail,       3) \
     X(UavFail,           20) \
     X(CbFail,             5) \
@@ -1177,7 +1190,7 @@ static void log_config_snapshot()
     //   （ffx12_hdr=0 明明是 SDR，hdr_flag 却是 1）。这是“制造证据”，比不打印更糟。
     //
     // ensure_init 的首次配置快照可能没有活池；这不是当前输入的 HDR 判定。
-    //   g_inst.pool.shape.color_format 仍是初值 DXGI_FORMAT_UNKNOWN(0) —— 这是**正常且应如实体现**的：
+    //   尚无本次 Draw 的输入格式，DXGI_FORMAT_UNKNOWN(0) 是**正常且应如实体现**的：
     //   此时没有输入纹理，resolve_is_hdr 走 format 回退并把 src 置为 “unknown”
     //   （而不是伪装成已知值）。真正的决策取证行是 build_create_flags 里的
     //   ngx_hdr_decision（M1 修好后在默认 NgxLogLevel=1 下可见）。
@@ -1185,10 +1198,8 @@ static void log_config_snapshot()
     // ★ 字段名不得删改：§7.1-8 的 grep 判据依赖 hdr_flag= / src=ngx_hdr( / ffx12_hdr=。
     //   src_ngx_hdr(%d) 里的数字现在就是同一个 is_hdr（旧字段名的语义被修正为“实际决策”）。
     {
-        // color_fmt：key_valid 为假时它必然是 UNKNOWN，显式取出来而不是硬写常量，
-        // 这样万一将来快照点后移，也不会静默打印过期值。
-        const DXGI_FORMAT snap_fmt = g_inst.pool.ready() ? g_inst.pool.shape.color_format
-                                                      : DXGI_FORMAT_UNKNOWN;
+        // 初始化快照不属于任何视图，不能借用缓存中另一路的颜色格式。
+        const DXGI_FORMAT snap_fmt = DXGI_FORMAT_UNKNOWN;
         const char *snap_src = "?";
         const bool snap_hdr = resolve_is_hdr(snap_fmt, &snap_src);
         log_ngx_error(L"ngx_core hdr_flag=%d src=ngx_hdr(%d) ffx12_hdr=%d src_kind=%hs color_fmt=%d",
@@ -2259,6 +2270,8 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
 {
     // 签名由 SDS 3.8.1 写死，但本函数不读 in（资源全在 inst 里）=> 显式标注避免 C4100。
     static_cast<void>(in);
+    // 2026-11-16：失败的 Create 也会写共享参数袋；下一路必须重新绑定自己的静态参数。
+    g_parameter_owner = nullptr;
 
     // 出参初值 = "NGX 没有被调用"。下面**只有**在 g_provider.create 真正返回之后才覆盖它
     //   ⇒ no_params / null_resource 两条早退路径自动保持哨兵值，不需要各自再写一遍
@@ -2463,6 +2476,9 @@ static bool create_feature(NgxInstance &inst, const ffx12::FrameInput &in,
     // 偏离 3b：3.12.1 注 5 要求成功时写 feature_preset，而 3.8.1 的代码块漏了。
     //   该字段只用于日志与 Q18 对账，不参与重建判据。
     inst.feature_preset = g_render_preset;
+    inst.feature_quality = perf_quality;
+    inst.feature_flags = flags;
+    g_parameter_owner = &inst;
 
     // ---- T-8 M4-a：记录本次 CreateFeature 实际使用的 CreateFlags 可变输入快照 ----
     // ★ 写入点唯一：只有这里（create_feature 成功之后）。dispatch 第 5 步只**比较**，不改写。
@@ -2532,12 +2548,26 @@ static void log_ngx_inst_reuse(std::uint64_t from, std::uint64_t to)
 
 // 五张纹理的 desc 差异全部用这张表表达，不要每个字段手抄一遍
 // 尺寸/格式属于资源池，创建标志属于 feature；只改变 HDR 等标志不重建引导纹理。
-static bool ensure_instance(std::uint64_t key, ID3D11Device &device, const neo::ngx::FrameShape &shape)
+static NgxInstance *ensure_instance(std::uint64_t key, ID3D11Device &device, const neo::ngx::FrameShape &shape)
 {
-    auto &inst = g_inst;
+    NgxInstance *selected = nullptr;
+    for (auto &candidate : g_instances)
+    {
+        if (candidate.pool.ready() && candidate.key == key)
+        {
+            selected = &candidate;
+            break;
+        }
+        if (!candidate.pool.ready() && !selected) selected = &candidate;
+    }
+    if (!selected)
+        selected = &*std::min_element(g_instances.begin(), g_instances.end(),
+            [](const auto &left, const auto &right) { return left.last_use < right.last_use; });
+    auto &inst = *selected;
+    inst.last_use = ++g_instance_sequence;
     const bool same_shape = inst.pool.ready() && inst.pool.shape == shape;
     const bool same_key = inst.pool.ready() && inst.key == key;
-    if (same_key && same_shape) return true;
+    if (same_key && same_shape) return selected;
 
     if (cross_key_reuse() && same_shape && inst.feature &&
         flags_input_bits(shape.color_format) == inst.feature_flags_bits)
@@ -2545,19 +2575,21 @@ static bool ensure_instance(std::uint64_t key, ID3D11Device &device, const neo::
         log_ngx_inst_reuse(inst.key, key);
         inst.key = g_prev_key = key;
         inst.first = true;
-        return true;
+        inst.clear_create_failure();
+        inst.eval_fail_streak = 0;
+        return selected;
     }
 
     const std::uint64_t start = same_key ? 0 : qpc_us();
     // F6 的退休入口仍可以看到旧 feature 的设备与资源；先释句柄，再交出旧池。
-    if (!retire_feature(inst)) return false;
+    if (!retire_feature(inst)) return nullptr;
     if (auto built = inst.pool.rebuild(device, shape); FAILED(built.hr))
     {
         log_ngx_error_throttled<log_throttle_slot::Slot::PoolTexFail>(
             L"ngx_inst pool fail inst=0x%llX stage=%hs hr=0x%08X",
             static_cast<unsigned long long>(key), built.step, static_cast<unsigned>(built.hr));
         inst.clear_pool();
-        return false;
+        return nullptr;
     }
     inst.ao = {};
     if (same_key)
@@ -2571,7 +2603,7 @@ static bool ensure_instance(std::uint64_t key, ID3D11Device &device, const neo::
         log_ngx_inst_switch(g_prev_key, key, qpc_us() - start);
     }
     inst.key = g_prev_key = key;
-    return true;
+    return selected;
 }
 
 static bool ensure_shaders()
@@ -2806,8 +2838,10 @@ static bool g_diag_first_eval_done = false;
 // ============================================================================
 bool shutdown_all()
 {
-    if (!retire_feature(g_inst)) return false;
-    g_inst.clear_pool();
+    for (auto &inst : g_instances)
+        if (!retire_feature(inst)) return false;
+    for (auto &inst : g_instances) inst.clear_pool();
+    g_parameter_owner = nullptr;
     g_depth_cs.Reset();
     g_motion_cs.Reset();
     g_shaders_ready = false;
@@ -3054,12 +3088,46 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     ctx->GetDevice(dev.GetAddressOf());
     if (!dev) return ffx12::DispatchResult::failed;
     const std::uint64_t frame_count = ++g_ngx_frame_count;
-    if (g_device && dev.Get() != g_device.Get() && !shutdown_all()) return ffx12::DispatchResult::failed;
-    if (should_release_all() || !ensure_init(dev.Get()) || !ensure_instance(instance_key, *dev.Get(), *shape))
+    // 2026-11-16（失败输入与有效帧交替）：先准备临时 guide，不能让失败候选先退休有效 feature。
+    // 同一路复制已验证视图以保留缓存；只有全部准入通过后才更新实例池与 provider。
+    neo::ngx::FrameGuides prepared;
+    if (g_device.Get() == dev.Get())
+        for (const auto &candidate : g_instances)
+            if (candidate.pool.ready() && candidate.key == instance_key)
+            {
+                prepared = candidate.pool.guides;
+                break;
+            }
+    if (!prepared.bind(*dev.Get(), in, *shape))
+    {
+        // 2026-11-16：现场只有 DISPATCH_FAILED；失败阶段及输入描述能区分 SRV 拒绝与 Evaluate 失败。
+        D3D11_TEXTURE2D_DESC depth {}, motion {};
+        if (in.depth) in.depth->GetDesc(&depth);
+        if (in.motion) in.motion->GetDesc(&motion);
+        log_ngx_error_throttled<log_throttle_slot::Slot::GuideBindFail>(
+            L"ngx_core dispatch fail stage=bind_guides inst=0x%llX depth=%ux%u/%u bind=0x%X "
+            L"motion=%ux%u/%u bind=0x%X",
+            static_cast<unsigned long long>(instance_key), depth.Width, depth.Height,
+            static_cast<unsigned>(depth.Format), depth.BindFlags, motion.Width, motion.Height,
+            static_cast<unsigned>(motion.Format), motion.BindFlags);
         return ffx12::DispatchResult::failed;
-
-    auto &inst = g_inst;
-    if (!inst.pool.bind_guides(*dev.Get(), in)) return ffx12::DispatchResult::failed;
+    }
+    if (!prepared.known_motion_encoding())
+    {
+        // 2026-11-16：实际 typed view 只证明读法，未认证的格式不能套用既有 10bit 平方解码。
+        log_ngx_error_throttled<log_throttle_slot::Slot::MotionEncodingUnknown>(
+            L"ngx_core dispatch fail stage=motion_encoding_unknown inst=0x%llX view_format=%u "
+            L"action=passthrough_native provider_state=unchanged",
+            static_cast<unsigned long long>(instance_key), static_cast<unsigned>(prepared.motion.format()));
+        return ffx12::DispatchResult::failed;
+    }
+    if (g_device && dev.Get() != g_device.Get() && !shutdown_all()) return ffx12::DispatchResult::failed;
+    if (should_release_all() || !ensure_init(dev.Get()))
+        return ffx12::DispatchResult::failed;
+    auto *selected = ensure_instance(instance_key, *dev.Get(), *shape);
+    if (!selected) return ffx12::DispatchResult::failed;
+    auto &inst = *selected;
+    inst.pool.guides = std::move(prepared);
     if (inst.feature && flags_input_bits(cdesc.Format) != inst.feature_flags_bits && !retire_feature(inst))
         return ffx12::DispatchResult::failed;
 
@@ -3190,7 +3258,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     const auto before_sr_input = [&](bool ao_applied = false) noexcept -> neo::ngx::BeforeSrInput
     {
         using namespace neo::interop;
-        // AO 不是直接复制；不把游戏原始 SRV 当成它的来源视图公布。
+        // 2026-11-16：Copy 继承原来源；AO 必须公布实际写回资源的 UNORM 视图。
         return { {
             .frame = frame_count, .instance = instance_key, .context = ctx,
             .color = inst.pool.color.Get(), .depth = inst.pool.depth.Get(), .motion = inst.pool.motion.Get(),
@@ -3202,7 +3270,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
                 (reset_val ? k_before_sr_reset : 0u),
             .jitter_x = in.jitter_x, .jitter_y = in.jitter_y,
             .motion_scale_x = in.motion_scale_x, .motion_scale_y = in.motion_scale_y,
-        }, ao_applied ? nullptr : in.color, ao_applied ? nullptr : in.color_source_view };
+        }, ao_applied ? inst.ao.color_output() : neo::ngx::BeforeSrColorSource { in.color, in.color_source_view } };
     };
     ComPtr<ID3D11Texture2D> filtered_color;
     bool ao_applied = false;
@@ -3218,6 +3286,16 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     }
 
     // 1-4：四个纹理（资源本体，**不是视图**）
+    // 2026-11-16：参数袋由 provider 共用；换回已有 feature 时恢复它自己的创建参数。
+    // 同一路连续帧不重复设置，避免从另一路遗留 OutWidth/档位/标志。
+    if (g_parameter_owner != &inst)
+    {
+        g_params->Set(NVSDK_NGX_Parameter_OutWidth, inst.pool.shape.output_width);
+        g_params->Set(NVSDK_NGX_Parameter_OutHeight, inst.pool.shape.output_height);
+        g_params->Set(NVSDK_NGX_Parameter_PerfQualityValue, inst.feature_quality);
+        g_params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, inst.feature_flags);
+        g_parameter_owner = &inst;
+    }
     set_tex(g_params, NVSDK_NGX_Parameter_Color, filtered_color ? filtered_color.Get() : inst.pool.color.Get());
     set_tex(g_params, NVSDK_NGX_Parameter_Depth,         inst.pool.depth.Get());
     set_tex(g_params, NVSDK_NGX_Parameter_MotionVectors, inst.pool.motion.Get());

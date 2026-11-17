@@ -5,11 +5,18 @@
 
 namespace neo::ngx
 {
+struct BeforeSrColorSource
+{
+    ID3D11Texture2D *texture = nullptr;
+    ID3D11ShaderResourceView *view = nullptr;
+    interop::ColorTransfer transfer = interop::ColorTransfer::unknown;
+};
+
 struct BeforeSrInput
 {
     interop::BeforeSrFrameV1 frame;
-    ID3D11Texture2D *source_color = nullptr; // CopyResource 的游戏源纹理，不是 NGX 的副本。
-    ID3D11ShaderResourceView *source_view = nullptr; // 借用同次 Draw 的实际 SRV。
+    // 2026-11-16：原值 Copy 继承来源，AO 描述自己的输出；typed view 不认证像素编码。
+    BeforeSrColorSource producer;
 };
 
 class BeforeSrQueryScope
