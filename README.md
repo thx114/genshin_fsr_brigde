@@ -216,6 +216,8 @@ ngx_core create_feature ok=1 preset=0 rc=0x1
 
 **参数语义**：通用段的键（`TransparentJitter`、`Ffx12DepthInverted`、`Ffx12JitterMode`、`Ffx12JitterDelay`、`Fsr2MotionVectorsJittered`）两条后端都生效；FFX 专用段的键（`Ffx12NonLinear`、`Ffx12Hdr`、`Ffx12FovScale`、`Ffx12CameraNear` 等）**只对 FFX 生效**，NGX 走自己的 `Ngx*` 段（`NgxHdr`、`NgxRenderPreset`、`NgxCrossKeyReuse`、`NgxLogLevel` 等）。
 
+**NGX 深度系数**：`[Dx11FsrBridge] NgxDepthScale=1.0` 仅缩放送入 NGX 的深度。合法范围为 `(0,64]`；非法值回退 `1.0`，并在配置快照记录 `depth_scale_invalid`。修改后需重启游戏；非默认值的画面效果需实机 A/B 验证。
+
 **多场景**：`Ffx12SingleInstance=0`（默认）让两个后端接管各路场景。NGX 按实例保留独立 feature、资源池和时域历史，缓存容量与 Render 捕获端一致；`NgxCrossKeyReuse` 仅控制缓存满后新实例接收旧槽的方式，重分配时会 Reset。没有可交付输出时默认放行原生绘制；诊断构建可用 `Ffx12FailClosed=1` 显式阻断，发布构建不读取此诊断键。四路交错、四个 Render 同时挂起及尺寸切换由宿主回归覆盖，游戏与 ReShade 的画面仍需实机验收。
 
 > [!WARNING]

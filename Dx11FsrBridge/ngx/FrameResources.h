@@ -15,6 +15,7 @@ struct FrameShape
     DXGI_FORMAT color_format = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT output_format = DXGI_FORMAT_UNKNOWN;
     bool reactive_mask = false;
+    float depth_scale = 1.0f;
     bool operator==(const FrameShape &) const = default;
 };
 
@@ -50,7 +51,7 @@ struct FrameResources
     FrameShape shape {};
     Microsoft::WRL::ComPtr<ID3D11Texture2D> color, depth, motion, reactive, output;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> depth_uav, motion_uav, reactive_uav;
-    Microsoft::WRL::ComPtr<ID3D11Buffer> constants;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> constants, depth_constants;
     FrameGuides guides;
 
     struct BuildResult

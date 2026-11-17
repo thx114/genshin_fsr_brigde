@@ -6,6 +6,8 @@
 #include <d3d11shader.h>
 
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 struct NVSDK_NGX_Handle { unsigned id; }; // 独立测试只用不透明指针身份。
 
@@ -249,6 +251,59 @@ int main()
     const bool restored_bindings = bound_depth == scene_dsv && bound_uav == scene_uav;
     CHECK(restored_bindings);
     context->ClearState();
+
+    // 2026-11-17：执行生产深度/运动 shader 并独立读回；只检查 CB 内容不能证明绑定正确。
+    std::vector<float> depths(frame.render_w * frame.render_h, 0.5f);
+    std::vector<unsigned> motions(depths.size(), 768u | (256u << 10));
+    context->UpdateSubresource(depth.Get(), 0, nullptr, depths.data(), frame.render_w * sizeof(float), 0);
+    context->UpdateSubresource(mv.Get(), 0, nullptr, motions.data(), frame.render_w * sizeof(unsigned), 0);
+    ComPtr<ID3D11ComputeShader> depth_shader, motion_shader;
+    const D3D_SHADER_MACRO no_mask[] { { "FFX12_NO_REACTIVE", "1" }, { nullptr, nullptr } };
+    for (bool motion_pass : {false, true})
+    {
+        const char *source = motion_pass ? ffx12::g_motion_decode_d11_hlsl : ffx12::g_depth_extract_hlsl;
+        ComPtr<ID3DBlob> code;
+        CHECK(SUCCEEDED(D3DCompile(source, std::strlen(source), nullptr, no_mask, nullptr,
+            "main", "cs_5_0", 0, 0, &code, nullptr)));
+        CHECK(SUCCEEDED(device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+            motion_pass ? motion_shader.GetAddressOf() : depth_shader.GetAddressOf())));
+    }
+    frame.depth = depth.Get();
+    frame.motion = mv.Get();
+    frame.depth_from_dsv = false;
+    unsigned baseline_motion = 0;
+    for (float scale : {1.0f, 0.25f, 2.0f, 64.0f})
+    {
+        auto scaled = *shape;
+        scaled.depth_scale = scale;
+        CHECK(SUCCEEDED(pool.rebuild(*device.Get(), scaled).hr));
+        CHECK((pool.depth_constants == pool.constants) == (scale == 1.0f));
+        CHECK(pool.bind_guides(*device.Get(), frame));
+        pool.record_inputs(*context.Get(), frame, depth_shader.Get(), motion_shader.Get());
+        float actual_depth = 0.f;
+        unsigned actual_motion = 0;
+        for (bool motion_pass : {false, true})
+        {
+            auto sample_desc = desc(1, 1, motion_pass ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT);
+            sample_desc.Usage = D3D11_USAGE_STAGING;
+            sample_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sample_desc.BindFlags = 0;
+            ComPtr<ID3D11Texture2D> sample;
+            CHECK(SUCCEEDED(device->CreateTexture2D(&sample_desc, nullptr, &sample)));
+            const D3D11_BOX box {0, 0, 0, 1, 1, 1};
+            context->CopySubresourceRegion(sample.Get(), 0, 0, 0, 0,
+                motion_pass ? pool.motion.Get() : pool.depth.Get(), 0, &box);
+            D3D11_MAPPED_SUBRESOURCE mapped {};
+            CHECK(SUCCEEDED(context->Map(sample.Get(), 0, D3D11_MAP_READ, 0, &mapped)));
+            if (motion_pass) std::memcpy(&actual_motion, mapped.pData, sizeof(actual_motion));
+            else std::memcpy(&actual_depth, mapped.pData, sizeof(actual_depth));
+            context->Unmap(sample.Get(), 0);
+        }
+        if (scale == 1.0f) baseline_motion = actual_motion;
+        std::printf("GPU depth scale=%.2f depth=%.3f motion=0x%08X baseline=0x%08X\n",
+            scale, actual_depth, actual_motion, baseline_motion);
+        CHECK(actual_depth == 0.5f * scale && baseline_motion != 0 && actual_motion == baseline_motion);
+    }
 
     auto resized = *shape;
     resized.output_width *= 2;

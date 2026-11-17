@@ -197,7 +197,8 @@ FrameResources::BuildResult FrameResources::rebuild(ID3D11Device &device, const 
         }
     }
 
-    // NGX 现有深度 scale 和运动方向都是 1；两个 shader 在 b0.x 共用这个不变值。
+    // 2026-11-17（上游深度缩放）：两个 shader 都读 b0.x，motion 必须保持 1，不能跟随 depth。
+    // 默认值复用 immutable CB；非默认只在建池时额外分配，不逐帧 Map。
     const float identity[4] { 1.0f, 0.0f, 0.0f, 0.0f };
     D3D11_SUBRESOURCE_DATA initial { identity, 0, 0 };
     D3D11_BUFFER_DESC cb {};
@@ -206,6 +207,15 @@ FrameResources::BuildResult FrameResources::rebuild(ID3D11Device &device, const 
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (const HRESULT hr = device.CreateBuffer(&cb, &initial, pool.constants.GetAddressOf()); FAILED(hr))
         return { hr, "constants" };
+    pool.depth_constants = pool.constants;
+    if (next.depth_scale != 1.0f)
+    {
+        const float depth_values[4] { next.depth_scale, 0.0f, 0.0f, 0.0f };
+        initial.pSysMem = depth_values;
+        pool.depth_constants.Reset();
+        if (const HRESULT hr = device.CreateBuffer(&cb, &initial, pool.depth_constants.GetAddressOf()); FAILED(hr))
+            return { hr, "depth_constants" };
+    }
     pool.shape = next;
     *this = std::move(pool);
     return { S_OK, nullptr };
@@ -229,7 +239,7 @@ void FrameResources::record_inputs(ID3D11DeviceContext &context, const ffx12::Fr
     context.CopyResource(color.Get(), input.color);
     const UINT groups_x = (shape.render_width + 7u) / 8u;
     const UINT groups_y = (shape.render_height + 7u) / 8u;
-    ID3D11Buffer *cb[] { constants.Get() };
+    ID3D11Buffer *cb[] { depth_constants.Get() };
     context.CSSetConstantBuffers(0, 1, cb);
     ID3D11ShaderResourceView *srvs[] { guides.depth.get() };
     ID3D11UnorderedAccessView *uavs[] { depth_uav.Get(), nullptr };
@@ -238,6 +248,11 @@ void FrameResources::record_inputs(ID3D11DeviceContext &context, const ffx12::Fr
     context.CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
     context.Dispatch(groups_x, groups_y, 1);
 
+    if (depth_constants != constants)
+    {
+        cb[0] = constants.Get();
+        context.CSSetConstantBuffers(0, 1, cb);
+    }
     srvs[0] = guides.motion.get();
     uavs[0] = motion_uav.Get();
     uavs[1] = reactive_uav.Get();

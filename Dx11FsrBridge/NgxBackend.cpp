@@ -359,6 +359,7 @@ int                       g_hdr_mode      = 0;         // 0=auto 1=force-on 2=fo
 int                       g_render_preset = 0;          // P-11：默认 0 = 不设 preset，跟随 NGX 自身规则
 bool                      g_dt_enabled    = true;
 bool                      g_use_reactive  = false;
+float                     g_depth_scale   = 1.0f;
 int                       g_log_level     = 1;
 bool                      g_passthrough   = false;
 bool                      g_diagnostic_pixel_readback = false;
@@ -400,6 +401,7 @@ std::uint64_t g_ngx_passthrough_count = 0;
 // backend_invalid 由 Dx11FsrBridge.cpp 的 load_config 缓存到 pending_warnings，
 // 因为 Native 回退时不会进入 ngx::ensure_init()。
 enum NgxConfigWarn : unsigned {
+    kWarnDepthScaleInvalid = 1u << 3, // NgxDepthScale 非法值 → 回退 1
     kWarnAppIdZero      = 1u << 0,   // NgxApplicationId=0 → 强制 1337
     kWarnPresetInvalid  = 1u << 1,   // NgxRenderPreset 越界 → 回退 0
     // 2026-11-10（B154）：NgxProvider 不是 auto/nvidia/external ⇒ 回退 auto。
@@ -812,14 +814,14 @@ std::string flags_to_string(unsigned int flags)
     return out;
 }
 
-// §3.13 末：配置位 → 位名。**三位**（appid_zero / preset_invalid / provider_invalid；
-// 第三位是 2026-11-10 的 B154 加的：NgxProvider 非法值）。
+// 2026-11-17：配置位包含 appid_zero / preset_invalid / provider_invalid / depth_scale_invalid。
 // backend_invalid 不在此位图（它走 pending_warnings，因为 Native 回退后 ensure_init 不可达）。
 // bits == 0 返回空串（调用方只在 g_config_warn != 0 时调，见 §3.13.2 第 2 条）。
 std::string warn_to_string(unsigned int bits)
 {
     struct BitName { unsigned int bit; const char *name; };
     const BitName names[] = {
+        { kWarnDepthScaleInvalid, "depth_scale_invalid" },
         { kWarnAppIdZero,      "appid_zero" },
         { kWarnPresetInvalid,  "preset_invalid" },
         { kWarnProviderInvalid, "provider_invalid" },
@@ -1215,9 +1217,9 @@ static void log_config_snapshot()
                   g_feature_dir_storage.size(),
                   g_feature_dir_storage.empty() ? L"(none)" : g_feature_dir_storage.front().c_str());
 
-    // 第 5 行：FrameTimeDelta 与 reactive。
-    log_ngx_error(L"ngx_core dt_flag=%d reactive=%d",
-                  g_dt_enabled ? 1 : 0, g_use_reactive ? 1 : 0);
+    // 第 5 行：FrameTimeDelta、reactive 与实际深度系数。
+    log_ngx_error(L"ngx_core dt_flag=%d reactive=%d depth_scale=%.6g",
+                  g_dt_enabled ? 1 : 0, g_use_reactive ? 1 : 0, g_depth_scale);
 
     // 2026-11-10（B154）：provider 来源（NgxProvider）。与成功时的 "provider resolved=" 分开命名：
     //   这一行说"配置要什么"，那一行说"实际用了谁" —— 两行一起才能区分"配置没生效"与"来源没找到"。
@@ -2960,6 +2962,14 @@ void set_frame_time_delta(bool on)
     g_dt_enabled = on;
 }
 
+void set_depth_scale(float value)
+{
+    // 2026-11-17（上游 77486cb）：配置早于 logger；只记位，首次配置快照再输出非法值告警。
+    const bool valid = value > 0.0f && value <= 64.0f;
+    g_depth_scale = valid ? value : 1.0f;
+    if (!valid) g_config_warn |= kWarnDepthScaleInvalid;
+}
+
 void set_use_reactive_mask(bool on)
 {
     g_use_reactive = on;
@@ -3097,6 +3107,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     auto shape = neo::ngx::copy_shape(in, cdesc, odesc);
     if (!shape) return ffx12::DispatchResult::failed;
     shape->reactive_mask = g_use_reactive;
+    shape->depth_scale = g_depth_scale;
 
     ComPtr<ID3D11Device> dev;
     ctx->GetDevice(dev.GetAddressOf());

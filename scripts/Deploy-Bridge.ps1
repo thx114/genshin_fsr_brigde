@@ -127,6 +127,7 @@ $configValues = [ordered]@{
     'NgxRenderPreset'           = '0'   # 0 = 六个 preset 参数都不设（跟随 NGX 自身规则）；5..15 可显式指定
     'NgxSetFrameTimeDelta'      = '1'
     'NgxUseReactiveMask'        = '0'
+    'NgxDepthScale'             = '1.0' # 2026-11-17：仅缩放 NGX 深度，(0,64]；实际取值需游戏 A/B 验证
     'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
     'NgxDiagnosticPixelReadback' = '0'   # 2026-11-16：同步像素抽检仅显式诊断开启，默认不等待 GPU
     'NgxPassthrough'            = '0'

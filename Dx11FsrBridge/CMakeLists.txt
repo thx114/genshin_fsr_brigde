@@ -508,6 +508,11 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         DX11FSRBRIDGE_TEST_DIAGNOSTICS=$<BOOL:${DX11FSRBRIDGE_DIAGNOSTICS_ON}>)
     target_link_libraries(ProviderFrameHost PRIVATE d3d11 d3dcompiler)
     if(DX11FSRBRIDGE_ENABLE_NGX)
+        foreach(scale IN ITEMS default quarter double max zero negative over nan inf garbage empty)
+            add_test(NAME NgxDepthScale-${scale} COMMAND ProviderFrameHost "ngx-depth-scale-${scale}"
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+            set_tests_properties(NgxDepthScale-${scale} PROPERTIES TIMEOUT 45)
+        endforeach()
         foreach(boundary IN ITEMS init create eval release)
             add_test(NAME NgxProviderFault-${boundary} COMMAND ProviderFrameHost "ngx-fault-${boundary}"
                 "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")

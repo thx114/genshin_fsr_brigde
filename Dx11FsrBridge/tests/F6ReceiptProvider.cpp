@@ -93,6 +93,8 @@ unsigned g_params_issued = 0;
 unsigned g_ao_frames = 0;
 bool g_ao_fixture = false;
 bool g_scene_depth_fixture = false;
+float g_scene_depth_expected = 0.5f;
+extern "C" __declspec(dllexport) void ConfigureDepthExpected(float value) { g_scene_depth_expected = value; }
 #if !defined(BEFORE_SR_LEGACY_FIXTURE)
 unsigned g_eval = 0;
 unsigned g_receipt_display_width = 1024, g_receipt_display_height = 1024;
@@ -238,8 +240,9 @@ static bool scene_depth_matches(ID3D11DeviceContext *context, const NVSDK_NGX_Pa
     float value = 0.f;
     std::memcpy(&value, mapped.pData, sizeof(value));
     context->Unmap(sample.Get(), 0);
-    std::printf("scene depth source: actual=%.3f expected_fsr=0.500 unrelated_dsv=0.250\n", value);
-    return value == 0.5f;
+    std::printf("scene depth source: actual=%.3f expected_fsr=%.3f unrelated_dsv=0.250\n",
+        value, g_scene_depth_expected);
+    return value == g_scene_depth_expected;
 }
 
 static NVSDK_NGX_Result copy_eval_color(ID3D11DeviceContext *context, const NVSDK_NGX_Handle *handle,

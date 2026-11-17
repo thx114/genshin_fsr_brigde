@@ -399,6 +399,17 @@ ConfigLoad read_config(const std::filesystem::path &module_dir)
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxUseReactiveMask", 0, config_path.c_str());
     ngx::set_use_reactive_mask(ngx_react != 0);
 
+    // 2026-11-17（上游深度系数）：启动读取同样覆盖 RELEASE；尾随垃圾不能冒充有效数值。
+    {
+        wchar_t buffer[64] {};
+        const DWORD count = GetPrivateProfileStringW(L"Dx11FsrBridge", L"NgxDepthScale", L"1.0",
+            buffer, static_cast<DWORD>(std::size(buffer)), config_path.c_str());
+        wchar_t *end = nullptr;
+        const float value = std::wcstof(buffer, &end);
+        while (*end && std::iswspace(*end)) ++end;
+        ngx::set_depth_scale(end != buffer && !*end && count < std::size(buffer) - 1 ? value : 0.0f);
+    }
+
     // ---- 键 8：NgxLogLevel（默认 1；0=全关 1=error 2=info 3=debug）----
     const int ngx_lv =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxLogLevel", 1, config_path.c_str());

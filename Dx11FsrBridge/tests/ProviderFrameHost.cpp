@@ -642,7 +642,23 @@ int wmain(int argc, wchar_t **argv)
     const bool test_ao = ao_fixture || f6_ao || nvidia_ao;
     const bool delayed_input = mode == L"ngx-input-map-delayed";
     const bool input_map = mode == L"ngx-input-map-current" || delayed_input;
-    const bool scene_depth = mode == L"ngx-scene-depth";
+    struct DepthScaleCase { const wchar_t *mode; const char *value; float expected; bool invalid; };
+    const DepthScaleCase scale_cases[] {
+        {L"ngx-depth-scale-default", nullptr, 1.f, false},
+        {L"ngx-depth-scale-quarter", "0.25", 0.25f, false},
+        {L"ngx-depth-scale-double", "2.0", 2.f, false},
+        {L"ngx-depth-scale-max", "64", 64.f, false},
+        {L"ngx-depth-scale-zero", "0", 1.f, true},
+        {L"ngx-depth-scale-negative", "-1", 1.f, true},
+        {L"ngx-depth-scale-over", "65", 1.f, true},
+        {L"ngx-depth-scale-nan", "nan", 1.f, true},
+        {L"ngx-depth-scale-inf", "inf", 1.f, true},
+        {L"ngx-depth-scale-garbage", "2x", 1.f, true},
+        {L"ngx-depth-scale-empty", "", 1.f, true},
+    };
+    const DepthScaleCase *depth_test = nullptr;
+    for (const auto &test : scale_cases) if (mode == test.mode) depth_test = &test;
+    const bool scene_depth = mode == L"ngx-scene-depth" || depth_test;
     const bool multi_cold = mode == L"ngx-multi-scene-cold-forward" || mode == L"ngx-multi-scene-cold-reverse";
     const bool multi_half = mode == L"ngx-multi-scene-half-forward" || mode == L"ngx-multi-scene-half-reverse";
     const bool multi_scene = mode == L"ngx-multi-scene" || multi_cold || multi_half;
@@ -714,6 +730,7 @@ int wmain(int argc, wchar_t **argv)
             << (nvidia ? "nvidia" : "external") << '\n';
         if (pixel_readback_on || mode == L"ngx-pixel-readback-off")
             config << "NgxDiagnosticPixelReadback=" << pixel_readback_on << '\n';
+        if (depth_test && depth_test->value) config << "NgxDepthScale=" << depth_test->value << '\n';
         if (prewarm) config << "NgxPrewarmAtSwapchain=1\n";
         if (failure_recovery) config << "Fsr2FamilySkip=1\n";
         if (test_ao)
@@ -826,7 +843,32 @@ int wmain(int argc, wchar_t **argv)
         return draw_capture(device.Get(), context.Get(), entry, frame, observations.get());
     };
     if (scene_depth)
-        return run_scene_depth(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+    {
+        if (depth_test)
+        {
+            const auto expected = reinterpret_cast<void (*)(float)>(
+                GetProcAddress(provider_module, "ConfigureDepthExpected"));
+            if (!expected) return 3;
+            expected(0.5f * depth_test->expected);
+        }
+        if (!run_scene_depth(*device.Get(), *context.Get(), provider_module, observations.get())) return 1;
+        if (depth_test)
+        {
+            bool found_snapshot = false, warned = false;
+            for (unsigned attempt = 0; attempt < 100 && !found_snapshot; ++attempt)
+            {
+                std::ifstream file(root / L"Dx11FsrBridge.log", std::ios::binary);
+                const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                found_snapshot = text.find("depth_scale=") != std::string::npos;
+                warned = text.find("depth_scale_invalid") != std::string::npos;
+                if (!found_snapshot) Sleep(10);
+            }
+            std::printf("Depth config: value=%s expected=%.3f snapshot=%d invalid_warning=%d\n",
+                depth_test->value ? depth_test->value : "(absent)", depth_test->expected, found_snapshot, warned);
+            if (!found_snapshot || warned != depth_test->invalid) return 1;
+        }
+        return 0;
+    }
     if (provider_fault)
     {
         const auto configure = reinterpret_cast<void (*)(unsigned)>(

@@ -223,6 +223,8 @@ The NVIDIA DLSS debug overlay (something like `DLSS V310.9.16 (default) DX11 cha
 
 **Parameter semantics**: the keys in the common section (`TransparentJitter`, `Ffx12DepthInverted`, `Ffx12JitterMode`, `Ffx12JitterDelay`, `Fsr2MotionVectorsJittered`) apply to both backends; the FFX-only keys (`Ffx12NonLinear`, `Ffx12Hdr`, `Ffx12FovScale`, `Ffx12CameraNear`, …) apply to **FFX only** — NGX reads its own `Ngx*` keys (`NgxHdr`, `NgxRenderPreset`, `NgxCrossKeyReuse`, `NgxLogLevel`, …).
 
+**NGX depth scale:** `[Dx11FsrBridge] NgxDepthScale=1.0` scales depth supplied to NGX. Values must be in `(0,64]`; invalid values fall back to `1.0` with `depth_scale_invalid` in the configuration snapshot. Restart the game after editing. Visual effects of non-default values require in-game A/B validation.
+
 **Multiple scenes:** `Ffx12SingleInstance=0` (default) lets both backends take over each scene. NGX retains a separate feature, resource pool and temporal history per cached instance; its capacity follows Render capture. `NgxCrossKeyReuse` only controls how a new instance receives a slot when the cache is full, with Reset on reassignment. Draws without deliverable output use the native path by default. Diagnostic builds can explicitly block them with `Ffx12FailClosed=1`; release builds do not read this diagnostic key. Host regressions cover four interleaved scenes, four pending Render calls and resizing. In-game visuals with ReShade still require validation.
 
 > [!WARNING]

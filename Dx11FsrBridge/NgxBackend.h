@@ -47,6 +47,7 @@ void set_swapchain_format(DXGI_FORMAT f);    // 由 install_swapchain_hooks() �
 DXGI_FORMAT swapchain_format();
 void set_render_preset(int v);                              // NgxRenderPreset，默认 0（跟随 NGX）
 void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDelta，默认 true
+void set_depth_scale(float value);                         // NgxDepthScale，默认 1.0，非法值回退并记位
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
