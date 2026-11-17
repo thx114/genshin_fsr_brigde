@@ -66,6 +66,7 @@
 #include "ngx/ProviderDiscovery.h"
 #include "ngx/FrameResources.h"
 #include "ngx/BeforeSr.h"
+#include "ngx/Hudless.h"
 #include "ngx/BeforeSrAo.h"
 #include "ComMethodRoutes.h"
 // A 阶段重构（2026-11-10）：NGX 参数映射的**纯计算层**（零 D3D / 零 NGX / 零全局）。
@@ -3354,6 +3355,16 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
         {
             const auto input = before_sr_input(ao_applied);
             const neo::ngx::BeforeSrQueryScope scope(input);
+            const neo::interop::HudlessRequestV1 hudless_request {
+                .request_id = request, .frame = frame_count, .instance = instance_key, .context = ctx,
+                .color = input.frame.color, .depth = input.frame.depth, .motion = input.frame.motion,
+                .output = inst.pool.output.Get(), .game_output = in.output_target,
+                .render_width = shape->render_width, .render_height = shape->render_height,
+                .display_width = shape->output_width, .display_height = shape->output_height,
+                .output_format = shape->output_format,
+            };
+            const neo::ngx::HudlessParameterScope hudless(*g_params,
+                neo::ngx::record_hudless(hudless_request, *dev.Get()));
             rr = g_provider.evaluate_f6(ctx, inst.feature.get(), g_params, nullptr, request, &receipt);
         }
         f6_output = neo::ngx::f6_output_status(receipt, request, inst.feature.get(), ctx, inst.pool.output.Get());

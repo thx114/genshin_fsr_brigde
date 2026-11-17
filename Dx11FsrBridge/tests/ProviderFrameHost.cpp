@@ -9,6 +9,7 @@
 #include "../game/AnchorPatterns.h"
 #include "../ngx/F6EvalReceiptV1.h"
 #include "../interop/BeforeSrV1.h"
+#include "HudlessFixture.h"
 #include "../ComMethodRoutes.h"
 #include "../NgxBackend.h"
 #include "../Il2CppCallSiteHook.h"
@@ -611,6 +612,7 @@ int wmain(int argc, wchar_t **argv)
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const std::wstring_view mode = argc > 1 ? argv[1] : L"";
     const bool prewarm_retry = mode == L"ngx-prewarm-retry";
+    const bool hudless = mode == L"ngx-hudless";
     const bool prewarm = mode == L"ngx-prewarm" || prewarm_retry;
     const bool check_prewarm = prewarm || mode == L"ngx-prewarm-off";
     const bool receipt = check_prewarm || mode == L"ngx-receipt" || mode == L"ngx-receipt-dlaa";
@@ -650,7 +652,7 @@ int wmain(int argc, wchar_t **argv)
     const bool pixel_readback_legacy = mode == L"ngx-pixel-readback-legacy";
     const bool pixel_readback = pixel_readback_on || pixel_readback_legacy ||
         mode == L"ngx-pixel-readback-default" || mode == L"ngx-pixel-readback-off";
-    const bool fixture = receipt || before_sr || input_map || ao_fixture ||
+    const bool fixture = hudless || receipt || before_sr || input_map || ao_fixture ||
         scene_depth || multi_scene || failure_recovery || producer_capture || history || guide_views || candidate_admission ||
         pixel_readback;
     const wchar_t *fixture_name = multi_scene ? L"NgxMultiSceneProvider.dll" :
@@ -733,7 +735,7 @@ int wmain(int argc, wchar_t **argv)
         provider_module = LoadLibraryW(provider.c_str());
         if (!provider_module || !GetProcAddress(provider_module, "NVSDK_NGX_D3D11_Init_Ext")) return 3;
         const bool has_receipt = GetProcAddress(provider_module, neo::ngx::k_f6_evaluate_v1) != nullptr;
-        const bool expect_receipt = receipt || input_map || real_receipt || ao_v1 || multi_scene;
+        const bool expect_receipt = hudless || receipt || input_map || real_receipt || ao_v1 || multi_scene;
         std::fprintf(observations.get(), "provider export: v1=%d expected=%d\n", has_receipt, expect_receipt);
         if (has_receipt != expect_receipt) return 3;
         if (receipt && same_size)
@@ -1119,6 +1121,10 @@ int wmain(int argc, wchar_t **argv)
         std::fputc('\n', observations.get());
         return neutral && contact && external_recorder_excluded ? 0 : 1;
     }
+    if (hudless)
+        return hudless_fixture::run(bridge_module, provider_module, *context.Get(),
+            [&](const CaptureFrame &frame) { return capture(CaptureEntry::draw, frame); },
+            [](unsigned size, bool expected) { return square_frame(size, expected, 192, 704, 352); }, exact_read);
     if (before_sr)
     {
         constexpr auto srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;

@@ -174,7 +174,7 @@ if(DX11FSRBRIDGE_ENABLE_NGX)
             DEPENDS "${FSRBRIDGE_AO_SOURCE}" VERBATIM)
         add_custom_target(BeforeSrAoBytecode DEPENDS "${FSRBRIDGE_AO_BYTECODE}")
         add_dependencies(Dx11FsrBridge BeforeSrAoBytecode)
-        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp ngx/BeforeSr.cpp ngx/BeforeSrAo.cpp
+        target_sources(Dx11FsrBridge PRIVATE NgxBackend.cpp ngx/BeforeSr.cpp ngx/BeforeSrAo.cpp ngx/Hudless.cpp
             ngx/FrameResources.cpp ngx/ProviderDiscovery.cpp)
         target_include_directories(Dx11FsrBridge PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx")
@@ -531,6 +531,9 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         endif()
         add_test(NAME F6EvalReceiptIntegration COMMAND ProviderFrameHost ngx-receipt
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        add_test(NAME HudlessIntegration COMMAND ProviderFrameHost ngx-hudless
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        set_tests_properties(HudlessIntegration PROPERTIES TIMEOUT 60)
         foreach(mode IN ITEMS ngx-prewarm ngx-prewarm-off ngx-prewarm-retry)
             add_test(NAME Provider-${mode} COMMAND ProviderFrameHost ${mode}
                 "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")

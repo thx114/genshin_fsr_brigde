@@ -4,6 +4,31 @@
 解析导出，不依赖 DLL 文件名。旧版桥和不带 NGX 的构建没有这些导出；找不到即沿用原路径。
 接口不加载 ReShade/F6，也不改 INI、NGX 创建选项或输出回执。
 
+## HUDless 边界
+
+桥通过 [HudlessV1.h](HudlessV1.h) 提供显式 HUDless 来源接口，尚无已认证的游戏最终无 HUD 图像来源。
+下述 `BeforeSrFrameV1.color`
+是 render-size 的超分输入，不证明没有 HUD，也不代表最终曝光、后处理或 NR 后的颜色。
+普通超分输出同样不能仅凭调用时机或尺寸被声明为 HUDless。
+
+外部 NGX 消费者若支持显式 `Opti.Hudless`，提供方须先证明该资源与本次成功求值属于同帧、
+同相机，具有最终输出尺寸，并与实际 Present 颜色的数值域、曝光、后处理及行向相匹配。
+无候选时清空参数；消费者必须持有资源至实际复制结束，并使用生产队列的真实同步。
+NR 已修改最终颜色或修改结果不确定时，不得复用 NR 前的候选。
+
+使用实际桥模块解析 `Dx11FsrBridge_RegisterHudlessV1` / `Dx11FsrBridge_UnregisterHudlessV1`，
+注册一个同步 `RecordHudlessV1` 提供方。仅 NGX 开启的构建有这两个导出；接口只在 F6 V1 求值路径调用。
+回调取得本次 request/frame/instance、immediate context、只读输入、待写输出身份和最终尺寸/格式。
+返回 `S_OK` 时，回填三个身份，并转交一份独立纹理的 COM 引用，设置 `k_hudless_final_present_color`；
+此标志是提供方对同相机、无 HUD、最终颜色/曝光/后处理匹配的声明，桥的结构检查不证明画面内容。
+需要翻转行向时加 `k_hudless_flip`。输入、桥输出及游戏目标的别名、跨设备、格式或完整布局失配均拒绝。
+
+桥只在当前 Evaluate 范围以 typed `ID3D11Resource *` 设置 `Opti.Hudless`，并设置 unsigned `Opti.Hudless.Flip`，
+返回时先清空指针和 Flip，再释放自己的引用，失败/无输出回执同样清理。没有有效来源时传空且正常 SR 继续。
+消费者须在 Evaluate 内取得自己的 COM 引用，负责实际 Present 复制和读退休同步；提供方复用输出时须遵守该同步。
+回调在当前 context 排入工作并恢复状态，不允许等待、阻塞 I/O 或重入桥调度。注销返回 `ERROR_BUSY` 时
+在回调之外重试；成功注销前不能卸载实现模块。接口不自动注册游戏捕获器，也不把普通 SR 或 backbuffer 候选认证为来源。
+
 ## 直连 NGX：在 Evaluate 前记录效果
 
 1. `Dx11FsrBridge_RegisterBeforeSrV1` 注册一个记录者。桥从本次超分 Draw 选中输入后，先复制场景颜色、提取深度、解包运动矢量，再在**同一个 D3D11 immediate context** 调用记录者，最后才执行 NGX Evaluate。

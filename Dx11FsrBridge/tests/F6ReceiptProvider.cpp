@@ -60,6 +60,10 @@ private:
 };
 
 Parameters g_main, g_query;
+bool g_hudless_fixture = false;
+ID3D11Resource *g_hudless_expected = nullptr;
+unsigned g_hudless_flip = 0, g_hudless_result = 0;
+Microsoft::WRL::ComPtr<ID3D11Texture2D> g_hudless_held;
 struct FixtureFeature
 {
     NVSDK_NGX_Handle handle {};
@@ -95,6 +99,26 @@ InputMapState g_input_map;
 }
 
 #define EXPORT extern "C" __declspec(dllexport) NVSDK_NGX_Result NVSDK_CONV
+
+extern "C" __declspec(dllexport) void ConfigureHudlessFixture(ID3D11Resource *expected,
+    unsigned flip, unsigned result) noexcept
+{
+    g_hudless_fixture = true;
+    g_hudless_expected = expected;
+    g_hudless_flip = flip;
+    g_hudless_result = result;
+    g_hudless_held.Reset();
+}
+extern "C" __declspec(dllexport) ID3D11Texture2D *HudlessFixtureHeld() noexcept { return g_hudless_held.Get(); }
+extern "C" __declspec(dllexport) bool HudlessFixtureClosed() noexcept
+{
+    ID3D11Resource *color = g_hudless_expected;
+    unsigned flip = 9;
+    const bool closed = g_main.Get("Opti.Hudless", &color) == NVSDK_NGX_Result_Success && !color &&
+        g_main.Get("Opti.Hudless.Flip", &flip) == NVSDK_NGX_Result_Success && flip == 0;
+    g_hudless_held.Reset();
+    return closed;
+}
 
 static std::atomic_uint g_init_calls {};
 static std::atomic_bool g_refuse_first_init {};
@@ -411,6 +435,28 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
         return NVSDK_NGX_Result_Fail;
     if (input_map_ordinal != 0)
         return evaluate_input_map(*context, handle, *p, request, *receipt, input_map_ordinal);
+    if (g_hudless_fixture)
+    {
+        ID3D11Resource *color = nullptr, *output = nullptr;
+        unsigned flip = 9;
+        if (p->Get("Opti.Hudless", &color) != NVSDK_NGX_Result_Success || color != g_hudless_expected ||
+            p->Get("Opti.Hudless.Flip", &flip) != NVSDK_NGX_Result_Success || flip != g_hudless_flip ||
+            p->Get(NVSDK_NGX_Parameter_Output, &output) != NVSDK_NGX_Result_Success || !output ||
+            (color && FAILED(color->QueryInterface(IID_PPV_ARGS(&g_hudless_held)))))
+            return NVSDK_NGX_Result_Fail;
+        receipt->request_id = request;
+        receipt->context = reinterpret_cast<std::uintptr_t>(context);
+        receipt->handle = reinterpret_cast<std::uintptr_t>(handle);
+        receipt->output = reinterpret_cast<std::uintptr_t>(output);
+        receipt->status = g_hudless_result == 2 ? F6OutputStatus::no_output : F6OutputStatus::current_output_ordered;
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        context->GetDevice(&device);
+        Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> uav;
+        if (FAILED(device->CreateUnorderedAccessView(output, nullptr, &uav))) return NVSDK_NGX_Result_Fail;
+        constexpr float pixel[] {192.f / 1023.f, 704.f / 1023.f, 352.f / 1023.f, 1.f};
+        context->ClearUnorderedAccessViewFloat(uav.Get(), pixel);
+        return g_hudless_result == 1 ? NVSDK_NGX_Result_Fail : NVSDK_NGX_Result_Success;
+    }
     if (g_ao_fixture)
     {
         using namespace neo::interop;
