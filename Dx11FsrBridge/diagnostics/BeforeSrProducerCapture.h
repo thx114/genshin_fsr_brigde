@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../runtime/ProducerTransferEvidence.h"
 #include <d3d11_1.h>
 #include <wrl/client.h>
 #include <array>
@@ -52,12 +53,13 @@ public:
     static HRESULT remember_shader(ID3D11DeviceChild &shader, const void *data, unsigned size);
     bool arm(ID3D11DeviceContext &context, ID3D11Resource &color);
     bool record_writer(ID3D11DeviceContext &context, std::uint64_t sequence, bool compute);
-    void observe_return(ID3D11DeviceContext &context, std::uint64_t sequence);
+    void observe_return(ID3D11DeviceContext &context, std::uint64_t sequence,
+        const producer::DrawEvidence *evidence = nullptr);
     void observe_overwrite(ID3D11DeviceContext &context, ID3D11Resource *destination, ProducerWrite operation);
     void observe_gap();
     CaptureState poll(ID3D11DeviceContext &context);
     void observe_sdk(ID3D11DeviceContext &context, ID3D11Resource &color,
-        std::uint64_t instance, std::uint64_t frame);
+        std::uint64_t instance, std::uint64_t frame, const producer::ConsumeEvidence *evidence = nullptr);
     void write_json(std::ostream &out) const;
 
     CaptureState state() const { return state_; }
@@ -108,6 +110,9 @@ private:
         bool observed = false, writer_matches = false, original_returned = false;
         std::uint64_t latest_writer = 0, instance = 0, frame = 0;
     } consumption_;
+    producer::DrawEvidence runtime_draw_ {};
+    producer::ConsumeEvidence runtime_consume_ {};
+    bool runtime_draw_observed_ = false, runtime_consume_observed_ = false;
     bool original_returned_ = false, supported_events_complete_ = true;
     unsigned overwrite_count_ = 0;
     ProducerWrite last_overwrite_ = ProducerWrite::copy_resource;

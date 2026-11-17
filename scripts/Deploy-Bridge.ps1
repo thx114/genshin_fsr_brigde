@@ -65,8 +65,8 @@ $routes = @()
 #      而后端写错是**静默**的（回落到 native 只是性能/画质变化，不会崩、不会报错）。
 #      缺键时走代码内建缺省——与发布模板同为 auto（load_config 的 lpDefault=L"auto"），
 #      所以不写这个键也天然安全，用户手改的值也就保得住。
-#    · Ffx12SingleInstance —— 发布模板缺省 0=全部接管（FFX 后端多机位/分屏场景的正确值），
-#      NGX 后端在代码里无视该键、一律按 1 处理。本脚本每次部署都跑，写死任一个值都会盖掉
+#    · Ffx12SingleInstance —— 发布模板缺省 0=全部接管，两个后端均支持多机位/分屏场景。
+#      本脚本每次部署都跑，写死任一个值都会盖掉
 #      用户的手改；缺键时走代码内建缺省（同为 0，load_config 的 lpDefault=0），故不写也安全。
 $configValues = [ordered]@{
     # ---- 1. 核心功能 / Core features ----
@@ -128,11 +128,12 @@ $configValues = [ordered]@{
     'NgxSetFrameTimeDelta'      = '1'
     'NgxUseReactiveMask'        = '0'
     'NgxLogLevel'               = '1'   # 0=全关 1=error（默认，取证行已可见）2=info 3=debug
+    'NgxDiagnosticPixelReadback' = '0'   # 2026-11-16：同步像素抽检仅显式诊断开启，默认不等待 GPU
     'NgxPassthrough'            = '0'
     'NgxProvider'               = 'auto' # NGX 实现来源：auto（默认）/ nvidia / external（非 N 卡经 OptiScaler）
     'NgxPrewarmAtSwapchain'     = '0'   # 单变量实测首帧与交换链创建耗时。
     'NgxBeforeSrAo'             = '0'   # 原生超分前 AO；只有测试配置主动打开。
-    'NgxCrossKeyReuse'          = '1'   # 1 = key 变化但尺寸/格式全等时复用实例（消除角色界面切换 ~500ms 卡顿）；0 = 每次切换都销毁重建
+    'NgxCrossKeyReuse'          = '1'   # 1 = 缓存满时允许将同尺寸/格式的 LRU 槽重置后交给新 key；0 = 先退休再创建
     # ---- 日志（[Log] 段）/ Logging ----
     # 必须在这里写：Add-LogSection 只在**没有** [Log] 段时才补整段，
     # 而已部署的 ini 都已有 [Log] 段 → 段内的新键永远不会被补上（实测 queue_capacity 缺失）。

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <limits>
 #include <string>
 #include <thread>
 
@@ -526,13 +527,31 @@ void check_writer_events(Device &d, Device &other)
     check(returned.record_writer(*d.context.Get(), 71, false), "capture returned command");
     check(description(returned).find("\"original_call_returned\":false") != std::string::npos,
         "pre-Draw snapshot does not claim original return");
-    returned.observe_return(*other.context.Get(), 71); returned.observe_return(*d.context.Get(), 72);
+    neo::producer::DrawEvidence draw_evidence;
+    draw_evidence.context = reinterpret_cast<std::uintptr_t>(d.context.Get());
+    draw_evidence.target_resource = reinterpret_cast<std::uintptr_t>(color.Get());
+    draw_evidence.reason = neo::producer::DrawReason::certified;
+    draw_evidence.controls.values[0] = std::numeric_limits<float>::quiet_NaN();
+    returned.observe_return(*other.context.Get(), 71, &draw_evidence);
+    returned.observe_return(*d.context.Get(), 72, &draw_evidence);
+    check(description(returned).find("\"runtime_transfer_attempt\":{\"observed\":false") != std::string::npos,
+        "wrong sequence and context cannot attach runtime evidence");
     check(description(returned).find("\"original_call_returned\":false") != std::string::npos,
         "wrong context or command sequence cannot complete original call");
     d.context->Draw(3, 0);
-    returned.observe_return(*d.context.Get(), 71);
+    returned.observe_return(*d.context.Get(), 71, &draw_evidence);
+    draw_evidence.reason = neo::producer::DrawReason::disabled; // 锁存的是POD副本，不借用栈。
     returned.observe_overwrite(*d.context.Get(), unrelated.Get(), ProducerWrite::clear_target);
-    returned.observe_sdk(*d.context.Get(), *color.Get(), 17, 1);
+    neo::producer::ConsumeEvidence consume_evidence;
+    consume_evidence.context = reinterpret_cast<std::uintptr_t>(d.context.Get());
+    consume_evidence.source_resource = reinterpret_cast<std::uintptr_t>(color.Get());
+    consume_evidence.reason = neo::producer::ConsumeReason::accepted;
+    consume_evidence.transfer = neo::interop::ColorTransfer::srgb;
+    returned.observe_sdk(*other.context.Get(), *color.Get(), 99, 99, &consume_evidence);
+    returned.observe_sdk(*d.context.Get(), *unrelated.Get(), 99, 99, &consume_evidence);
+    returned.observe_sdk(*d.context.Get(), *color.Get(), 17, 1, &consume_evidence);
+    consume_evidence.reason = neo::producer::ConsumeReason::uncertified;
+    returned.observe_sdk(*d.context.Get(), *color.Get(), 99, 99, &consume_evidence);
     returned.observe_overwrite(*d.context.Get(), color.Get(), ProducerWrite::update_subresource);
     finish(returned, d);
     check(description(returned).find("\"original_call_returned\":true") != std::string::npos,
@@ -541,6 +560,32 @@ void check_writer_events(Device &d, Device &other)
         "unrelated resource and post-consumption write preserve original receipt");
     check(description(returned).find("\"writer_execution\":\"not-proven\"") != std::string::npos,
         "CPU return is not GPU execution evidence");
+    check(description(returned).find("\"same_captured_resource\":true,\"reason\":\"certified\"") != std::string::npos &&
+        description(returned).find("\"runtime_transfer_consumption\":{\"observed\":true,\"reason\":\"accepted\"") !=
+            std::string::npos, "runtime begin and single SDK decisions are copied once for same resource");
+    check(description(returned).find("\"values\":[null,") != std::string::npos,
+        "nonfinite CPU mirror is valid JSON null rather than nan");
+    ComPtr<ID3D11RenderTargetView> rtv0;
+    D3D11_RENDER_TARGET_VIEW_DESC second_target_desc {};
+    target->GetDesc(&second_target_desc);
+    ok(d.device->CreateRenderTargetView(unrelated.Get(), &second_target_desc, rtv0.GetAddressOf()), "different RTV0");
+    ID3D11RenderTargetView *targets[] {rtv0.Get(), target.Get()};
+    d.context->OMSetRenderTargets(2, targets, nullptr);
+    BeforeSrProducerCapture second_slot;
+    check(second_slot.arm(*d.context.Get(), *color.Get()) &&
+        second_slot.record_writer(*d.context.Get(), 72, false), "actual color captured from RTV1");
+    draw_evidence.reason = neo::producer::DrawReason::certified;
+    draw_evidence.target_resource = reinterpret_cast<std::uintptr_t>(unrelated.Get());
+    d.context->Draw(3, 0);
+    second_slot.observe_return(*d.context.Get(), 72, &draw_evidence);
+    consume_evidence.reason = neo::producer::ConsumeReason::uncertified;
+    consume_evidence.transfer = neo::interop::ColorTransfer::unknown;
+    second_slot.observe_sdk(*d.context.Get(), *color.Get(), 17, 2, &consume_evidence);
+    finish(second_slot, d);
+    check(description(second_slot).find("\"same_captured_resource\":false") != std::string::npos &&
+        description(second_slot).find("\"slot\":1}") != std::string::npos,
+        "RTV0 evidence cannot certify a different captured RTV1");
+    d.context->OMSetRenderTargets(1, target.GetAddressOf(), nullptr);
     BeforeSrProducerCapture missed;
     check(missed.arm(*d.context.Get(), *color.Get()), "arm observation-gap snapshot");
     check(missed.record_writer(*d.context.Get(), 73, false), "capture observation-gap snapshot");

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cmath>
 #include <iomanip>
 
 namespace neo::diagnostics
@@ -32,6 +33,89 @@ void descriptor_words(std::ostream &out, const Description &desc)
         out << words[i];
     }
     out << ']';
+}
+
+const char *json_bool(bool value) { return value ? "true" : "false"; }
+void json_float(std::ostream &out, float value)
+{
+    if (std::isfinite(value)) out << value;
+    else out << "null";
+}
+void write_draw_evidence(std::ostream &out, const producer::DrawEvidence &value, bool observed,
+    std::uintptr_t captured_resource)
+{
+    out << "{\"observed\":" << json_bool(observed)
+        << ",\"scope\":\"rtv0\",\"same_captured_resource\":"
+        << json_bool(observed && value.target_resource && value.target_resource == captured_resource)
+        << ",\"reason\":\"" << producer::reason_name(value.reason) << "\",\"checked\":" << value.checked
+        << ",\"passed\":" << value.passed << ",\"context\":" << value.context
+        << ",\"target_resource\":" << value.target_resource << ",\"target_format\":" << value.target_format
+        << ",\"target_width\":" << value.target_width << ",\"target_height\":" << value.target_height
+        << ",\"elements\":" << value.elements << ",\"indexed\":" << json_bool(value.indexed)
+        << ",\"start\":" << value.start << ",\"base\":" << value.base
+        << ",\"owner\":" << value.owner << ",\"begin_epoch\":" << value.begin_epoch
+        << ",\"return_epoch\":" << value.return_epoch << ",\"serial_begin\":" << value.serial_begin
+        << ",\"serial_return\":" << value.serial_return << ",\"controls\":{\"resource\":"
+        << value.controls.resource << ",\"first\":" << value.controls.first << ",\"count\":" << value.controls.count
+        << ",\"shadow_present\":" << json_bool(value.controls.shadow_present)
+        << ",\"mapped\":" << json_bool(value.controls.mapped) << ",\"known\":" << value.controls.known
+        << ",\"epoch\":" << value.controls.epoch << ",\"version_begin\":" << value.controls.version_begin
+        << ",\"version_return\":" << value.controls.version_return << ",\"values\":[";
+    for (unsigned i = 0; i < value.controls.values.size(); ++i)
+        { if (i) out << ','; json_float(out, value.controls.values[i]); }
+    out << "]},\"ia\":{\"vertex_shader\":" << value.vertex_shader << ",\"layout\":" << value.layout
+        << ",\"layout_observed\":" << json_bool(value.layout_observed)
+        << ",\"layout_reason\":" << static_cast<unsigned>(value.layout_metadata.reason)
+        << ",\"layout_count\":" << value.layout_metadata.count
+        << ",\"layout_inspected\":" << value.layout_metadata.inspected
+        << ",\"layout_rejected_element\":" << value.layout_metadata.rejected_element
+        << ",\"layout_elements\":[";
+    for (unsigned i = 0; i < value.layout_metadata.count && i < value.layout_metadata.elements.size(); ++i)
+    {
+        const auto &item = value.layout_metadata.elements[i];
+        if (i) out << ',';
+        out << "{\"position0\":" << json_bool(item.position0) << ",\"semantic_index\":" << item.semantic_index
+            << ",\"slot\":" << item.slot << ",\"offset\":" << item.offset << ",\"format\":" << item.format
+            << ",\"classification\":" << item.classification << ",\"step\":" << item.step << '}';
+    }
+    out << "],\"topology\":" << value.topology << ",\"position_slot\":" << value.position_slot
+        << ",\"position_offset\":" << value.position_offset << ",\"position_bytes\":" << value.position_bytes
+        << ",\"vertex_stride\":" << value.vertex_stride << ",\"vertex_offset\":" << value.vertex_offset
+        << ",\"index_format\":" << value.index_format << ",\"index_offset\":" << value.index_offset
+        << ",\"buffers\":[";
+    for (unsigned i = 0; i < value.buffers.size(); ++i)
+    {
+        const auto &item = value.buffers[i];
+        if (i) out << ',';
+        out << "{\"resource\":" << item.resource << ",\"desc_observed\":" << json_bool(item.desc_observed)
+            << ",\"desc_words\":";
+        descriptor_words(out, item.desc);
+        out << ",\"shadow_present\":" << json_bool(item.shadow_present) << ",\"mapped\":" << json_bool(item.mapped)
+            << ",\"immutable\":" << json_bool(item.immutable) << ",\"epoch\":" << item.epoch
+            << ",\"version_begin\":" << item.version_begin << ",\"version_return\":" << item.version_return
+            << ",\"read_offset\":" << item.read_offset << ",\"read_bytes\":" << item.read_bytes
+            << ",\"reads_checked\":" << item.reads_checked << ",\"reads_passed\":" << item.reads_passed << '}';
+    }
+    out << "],\"indices\":[";
+    for (unsigned i = 0; i < value.indices.size(); ++i) { if (i) out << ','; out << value.indices[i]; }
+    out << "],\"points\":[";
+    for (unsigned i = 0; i < value.points.size(); ++i)
+        { if (i) out << ','; out << '['; json_float(out, value.points[i][0]); out << ',';
+          json_float(out, value.points[i][1]); out << ']'; }
+    out << "],\"covered_corners\":" << value.corners << "}}";
+}
+void write_consume_evidence(std::ostream &out, const producer::ConsumeEvidence &value, bool observed)
+{
+    out << "{\"observed\":" << json_bool(observed) << ",\"reason\":\""
+        << producer::reason_name(value.reason) << "\",\"transfer\":" << static_cast<unsigned>(value.transfer)
+        << ",\"context\":" << value.context << ",\"source_resource\":" << value.source_resource
+        << ",\"execution_present\":" << json_bool(value.execution_present)
+        << ",\"contents_present\":" << json_bool(value.contents_present) << ",\"owner\":" << value.owner
+        << ",\"certificate_owner\":" << value.certificate_owner << ",\"current_epoch\":" << value.current_epoch
+        << ",\"certificate_epoch\":" << value.certificate_epoch << ",\"serial\":" << value.serial
+        << ",\"was_srgb\":" << json_bool(value.was_srgb) << ",\"owner_matches\":" << json_bool(value.owner_matches)
+        << ",\"epoch_matches\":" << json_bool(value.epoch_matches)
+        << ",\"certificate_cleared\":" << json_bool(value.certificate_cleared) << '}';
 }
 }
 
@@ -403,11 +487,16 @@ bool BeforeSrProducerCapture::record_writer(ID3D11DeviceContext &context, std::u
     return true;
 }
 
-void BeforeSrProducerCapture::observe_return(ID3D11DeviceContext &context, std::uint64_t sequence)
+void BeforeSrProducerCapture::observe_return(ID3D11DeviceContext &context, std::uint64_t sequence,
+    const producer::DrawEvidence *evidence)
 {
     // 2026-11-16：只认刚捕获的实际命令返回，不把下一笔 Draw 或另一 context 当作此笔执行。
     if (&context == context_.Get() && sequence && sequence == sequence_ && !consumption_.observed)
+    {
         original_returned_ = true;
+        if (!runtime_draw_observed_ && evidence && evidence->context == reinterpret_cast<std::uintptr_t>(&context))
+        { runtime_draw_ = *evidence; runtime_draw_observed_ = true; }
+    }
 }
 
 void BeforeSrProducerCapture::observe_overwrite(ID3D11DeviceContext &context,
@@ -465,7 +554,7 @@ CaptureState BeforeSrProducerCapture::poll(ID3D11DeviceContext &context)
 }
 
 void BeforeSrProducerCapture::observe_sdk(ID3D11DeviceContext &context, ID3D11Resource &color,
-    std::uint64_t instance, std::uint64_t frame)
+    std::uint64_t instance, std::uint64_t frame, const producer::ConsumeEvidence *evidence)
 {
     if (consumption_.observed || !sequence_ || state_ == CaptureState::armed ||
         &context != context_.Get() || &color != color_.Get()) return;
@@ -474,6 +563,9 @@ void BeforeSrProducerCapture::observe_sdk(ID3D11DeviceContext &context, ID3D11Re
     // 这里只固定来源关系，不把 SDK/CPU 事件当作 GPU 快照退休。
     consumption_ = {true, sequence_ == latest_sequence_ && !overwrite_count_ && supported_events_complete_,
         original_returned_, latest_sequence_, instance, frame};
+    if (evidence && evidence->context == reinterpret_cast<std::uintptr_t>(&context) &&
+        evidence->source_resource == reinterpret_cast<std::uintptr_t>(&color))
+    { runtime_consume_ = *evidence; runtime_consume_observed_ = true; }
 }
 
 void BeforeSrProducerCapture::write_json(std::ostream &out) const
@@ -493,7 +585,11 @@ void BeforeSrProducerCapture::write_json(std::ostream &out) const
         << ",\"overwrite_count_window\":" << overwrite_count_
         << ",\"last_overwrite\":" << (overwrite_count_ ? static_cast<unsigned>(last_overwrite_) : UINT_MAX)
         << ",\"last_overwrite_context\":" << last_overwrite_context_
-        << ",\"transfer\":\"unknown\",\"writer_execution\":\"not-proven\",\"compute\":" << compute_
+        << ",\"runtime_transfer_attempt\":";
+    write_draw_evidence(out, runtime_draw_, runtime_draw_observed_, reinterpret_cast<std::uintptr_t>(color_.Get()));
+    out << ",\"runtime_transfer_consumption\":";
+    write_consume_evidence(out, runtime_consume_, runtime_consume_observed_);
+    out << ",\"transfer\":\"unknown\",\"writer_execution\":\"not-proven\",\"compute\":" << compute_
         << ",\"output\":{\"kind\":\"" << (unordered_output_ ? "uav" : "rtv")
         << "\",\"format\":" << view_format_ << ",\"dimension\":" << view_dimension_
         << ",\"mip\":" << mip_ << ",\"first_slice\":" << first_slice_ << ",\"slices\":" << slices_

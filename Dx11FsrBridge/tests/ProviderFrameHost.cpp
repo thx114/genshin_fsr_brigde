@@ -3,6 +3,7 @@
 #include <dxgi1_2.h>
 
 #include "create-routing/DrawCapture.h"
+#include "TestImport.h"
 #include "NgxInputMapFixture.h"
 #include "NgxMultiSceneFixture.h"
 #include "../game/AnchorPatterns.h"
@@ -20,6 +21,22 @@
 
 namespace
 {
+std::atomic_bool g_history_key_down = false;
+std::atomic_uint g_history_key_queries = 0;
+std::atomic_uint64_t g_history_tick_offset = 0;
+ULONGLONG WINAPI history_tick() { return GetTickCount64() + g_history_tick_offset.load(); }
+std::string hex_value(std::uint64_t value)
+{
+    char text[32] {};
+    std::snprintf(text, sizeof(text), "0x%llX", static_cast<unsigned long long>(value));
+    return text;
+}
+SHORT WINAPI history_key(int key)
+{
+    if (key != VK_F6) return 0;
+    ++g_history_key_queries;
+    return g_history_key_down.load() ? static_cast<SHORT>(0x8000) : 0;
+}
 constexpr std::size_t k_render_offset = 0x70;
 constexpr auto build_fixture_methods()
 {
@@ -545,6 +562,9 @@ int wmain(int argc, wchar_t **argv)
     const bool receipt = check_prewarm || mode == L"ngx-receipt" || mode == L"ngx-receipt-dlaa";
     const bool same_size = mode == L"ngx-receipt-dlaa" || mode == L"ngx-v1-dlaa" ||
         mode == L"ngx-nvidia-dlaa";
+    const bool history_bench = mode == L"ngx-history-bench";
+    const bool history = history_bench || mode == L"ngx-history-window" || mode == L"ngx-history-file-failure";
+    const bool history_file_failure = mode == L"ngx-history-file-failure";
     const bool producer_overwrite = mode == L"ngx-producer-overwrite";
     const bool producer_other_sdk = mode == L"ngx-producer-other-sdk";
     const bool producer_om_uav = mode == L"ngx-producer-om-uav";
@@ -557,7 +577,7 @@ int wmain(int argc, wchar_t **argv)
     const bool ao_v1 = mode == L"ngx-ao-v1";
     const bool f6_ao = mode == L"ngx-v1-ao-on" || mode == L"ngx-v1-ao-off";
     const bool nvidia_ao = mode == L"ngx-nvidia-ao-on" || mode == L"ngx-nvidia-ao-off";
-    const bool present_before_draw = producer_capture || mode == L"ngx-v1-present" || mode == L"ngx-nvidia-present";
+    const bool present_before_draw = producer_capture || history || mode == L"ngx-v1-present" || mode == L"ngx-nvidia-present";
     const bool nvidia = nvidia_ao || mode == L"ngx-nvidia-present" || mode == L"ngx-nvidia-dlaa";
     const bool ao_enabled = mode == L"ngx-ao" || ao_v1 || mode.ends_with(L"-ao-on");
     const bool ao_fixture = mode == L"ngx-ao" || mode == L"ngx-ao-off" || ao_v1;
@@ -575,10 +595,10 @@ int wmain(int argc, wchar_t **argv)
     const bool pixel_readback = pixel_readback_on || pixel_readback_legacy ||
         mode == L"ngx-pixel-readback-default" || mode == L"ngx-pixel-readback-off";
     const bool fixture = receipt || before_sr || input_map || ao_fixture ||
-        scene_depth || multi_scene || failure_recovery || producer_capture || guide_views || candidate_admission ||
+        scene_depth || multi_scene || failure_recovery || producer_capture || history || guide_views || candidate_admission ||
         pixel_readback;
     const wchar_t *fixture_name = multi_scene ? L"NgxMultiSceneProvider.dll" :
-        before_sr || producer_capture || scene_depth || failure_recovery || guide_views || candidate_admission ||
+        before_sr || producer_capture || history || scene_depth || failure_recovery || guide_views || candidate_admission ||
             pixel_readback ||
             (ao_fixture && !ao_v1) ? L"BeforeSrProvider.dll" :
         L"F6ReceiptProvider.dll";
@@ -629,7 +649,7 @@ int wmain(int argc, wchar_t **argv)
     if (generic_admission) config << "Fsr2FastStateTracking=0\n";
     if (ngx)
     {
-        if (producer_capture || guide_views) config << "Fsr2TraceColorProducers=1\nFsr2FamilySkip=0\n";
+        if (producer_capture || history || guide_views) config << "Fsr2TraceColorProducers=1\nFsr2FamilySkip=0\n";
         config << "Ffx12Backend=ngx\nNgxHdr=0\nNgxLogLevel=3\nNgxProvider="
             << (nvidia ? "nvidia" : "external") << '\n';
         if (pixel_readback_on || mode == L"ngx-pixel-readback-off")
@@ -681,6 +701,9 @@ int wmain(int argc, wchar_t **argv)
     }
     const HMODULE bridge_module = LoadLibraryW(bridge.c_str());
     if (!bridge_module) return 3;
+    if (history && (!neo::tests::replace_import(bridge_module, "USER32.dll", "GetAsyncKeyState",
+        reinterpret_cast<FARPROC>(&history_key)) || !neo::tests::replace_import(bridge_module, "KERNEL32.dll",
+            "GetTickCount64", reinterpret_cast<FARPROC>(&history_tick)))) return 3;
     const auto subscribe = reinterpret_cast<RegisterBeforeSrV1>(GetProcAddress(bridge_module, k_register_before_sr_v1));
     g_unregister = reinterpret_cast<UnregisterBeforeSrV1>(GetProcAddress(bridge_module, k_unregister_before_sr_v1));
     const auto query = reinterpret_cast<QueryBeforeSrFrameV1>(GetProcAddress(bridge_module, k_query_before_sr_frame_v1));
@@ -713,8 +736,8 @@ int wmain(int argc, wchar_t **argv)
         window.handle = CreateWindowExW(0, L"STATIC", L"Neo provider Present fixture", WS_POPUP,
             0, 0, 2560, 1600, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
         DXGI_SWAP_CHAIN_DESC1 desc {};
-        desc.Width = producer_capture ? 1024 : 2560;
-        desc.Height = producer_capture ? 1024 : 1600;
+        desc.Width = producer_capture || history ? 1024 : 2560;
+        desc.Height = producer_capture || history ? 1024 : 1600;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
         desc.SampleDesc.Count = 1;
         desc.BufferCount = 1;
@@ -749,6 +772,183 @@ int wmain(int argc, wchar_t **argv)
     if (pixel_readback)
         return run_pixel_readback(*device.Get(), *context.Get(), provider_module, observations.get(),
             pixel_readback_legacy || (pixel_readback_on && DX11FSRBRIDGE_TEST_DIAGNOSTICS)) ? 0 : 1;
+    if (history)
+    {
+        RenderFixture target, other;
+        const CaptureExtent render {512, 512}, display {1024, 1024};
+        std::array<CaptureTextures, 6> textures;
+        const auto run = [&](RenderFixture &instance, CaptureTextures &retained, CaptureEntry entry, bool producer = false)
+        {
+            CaptureFrame frame {render, display, [&] { instance.publish(render, display, 0.f, 0.f); }, true};
+            frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+            frame.exact_provider_pixel = frame.alternate_scene_pixel;
+            frame.producer_roundtrip = producer;
+            frame.retained_textures = &retained;
+            if (!producer) frame.color_producer = [&](ID3D11DeviceContext &commands, ID3D11Texture2D &color)
+            {
+                std::vector<std::uint32_t> pixels(render.width * render.height, frame.alternate_scene_pixel);
+                // 夹具沿用已有 CopyResource 观测，不为测试扩张生产 writer 种类。
+                for (auto *destination : {&color, retained.textures[3].Get()})
+                {
+                    D3D11_TEXTURE2D_DESC desc {};
+                    destination->GetDesc(&desc);
+                    desc.BindFlags = 0;
+                    const D3D11_SUBRESOURCE_DATA data {pixels.data(), render.width * 4, 0};
+                    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+                    if (FAILED(device->CreateTexture2D(&desc, &data, &source))) return false;
+                    commands.CopyResource(destination, source.Get());
+                    std::fill(pixels.begin(), pixels.end(), 0);
+                }
+                return true;
+            };
+            return capture(entry, frame);
+        };
+        const auto color_file = root / L"Dx11FsrBridge.color_chain.json";
+        const auto motion_file = root / L"Dx11FsrBridge.motion_chain.json";
+        const auto read = [](const std::filesystem::path &file)
+        {
+            std::ifstream in(file);
+            return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        };
+        const auto wait_for_log = [&](const char *text)
+        {
+            // 异步日志 flush 是夹具条件；等待指定完成行，不把固定 100ms 当写盘完成。
+            for (unsigned attempt = 0; attempt < 100; ++attempt)
+            {
+                auto contents = read(root / L"Dx11FsrBridge.log");
+                if (contents.find(text) != std::string::npos) return contents;
+                Sleep(20);
+            }
+            return std::string {};
+        };
+        if (!run(target, textures[0], CaptureEntry::draw, true) || !run(target, textures[0], CaptureEntry::indexed, true)) return 1;
+        if (g_history_key_queries == 0 || std::filesystem::exists(color_file) || std::filesystem::exists(motion_file)) return 1;
+        if (history_bench)
+        {
+            // 在真实 producer 完成后绑定两张输出、七个 SRV 与两个 stage 的 CB；仅测零图元原 Draw。
+            if (wait_for_log("before_sr_producer_bindings").empty()) return 1;
+            Microsoft::WRL::ComPtr<ID3D11RenderTargetView> outputs[2];
+            ID3D11RenderTargetView *raw[2] {};
+            for (unsigned i = 0; i < 2; ++i)
+            {
+                if (FAILED(device->CreateRenderTargetView(textures[0].textures[7 + i].Get(), nullptr, &outputs[i]))) return 1;
+                raw[i] = outputs[i].Get();
+            }
+            context->OMSetRenderTargets(2, raw, nullptr);
+            Microsoft::WRL::ComPtr<ID3D11Buffer> cb;
+            context->PSGetConstantBuffers(0, 1, &cb);
+            if (!cb) return 1;
+            context->VSSetConstantBuffers(0, 1, cb.GetAddressOf());
+            ID3D11ShaderResourceView *bound[7] {};
+            context->PSGetShaderResources(0, 7, bound);
+            bool bound_ok = true;
+            for (auto *view : bound) { bound_ok &= view != nullptr; if (view) view->Release(); }
+            const auto owned = [&](unsigned slot)
+            {
+                const auto entry = (*reinterpret_cast<void ***>(context.Get()))[slot];
+                HMODULE owner = nullptr;
+                return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(entry), &owner) && owner == bridge_module;
+            };
+            const auto hooks_owned = [&] { return owned(12) && owned(13); };
+            if (!bound_ok || !hooks_owned()) return 1;
+            LARGE_INTEGER frequency {};
+            if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0) return 1;
+            constexpr unsigned rounds = 7, iterations = 20000;
+            std::array<std::array<double, rounds>, 2> samples {};
+            const auto invoke = [&](unsigned kind)
+            {
+                if (kind) context->DrawIndexed(0, 0, 0);
+                else context->Draw(0, 0);
+            };
+            for (unsigned i = 0; i < 2000; ++i) invoke(i % 2);
+            if (!hooks_owned()) return 1;
+            context->Flush();
+            for (unsigned round = 0; round < rounds; ++round)
+                for (unsigned step = 0; step < 2; ++step)
+                {
+                    const auto kind = (step + round) % 2;
+                    if (!hooks_owned()) return 1;
+                    LARGE_INTEGER first {}, last {};
+                    QueryPerformanceCounter(&first);
+                    for (unsigned i = 0; i < iterations; ++i) invoke(kind);
+                    QueryPerformanceCounter(&last);
+                    samples[kind][round] = double(last.QuadPart - first.QuadPart) * 1.e9 /
+                        (double(frequency.QuadPart) * iterations);
+                    if (!hooks_owned()) return 1;
+                    context->Flush();
+                    if (!hooks_owned()) return 1;
+                }
+            std::fprintf(observations.get(), "{\"benchmark\":\"trace1-history-idle\",\"rtvs\":2,\"srvs\":7,\"ps_cb\":true,\"vs_cb\":true,"
+                "\"producer_completed\":true,\"hooks_owned\":true,\"iterations\":%u,\"samples_ns\":[", iterations);
+            for (unsigned kind = 0; kind < 2; ++kind)
+            {
+                std::fprintf(observations.get(), "%s[", kind ? "," : "");
+                for (unsigned i = 0; i < rounds; ++i) std::fprintf(observations.get(), "%s%.6f", i ? "," : "", samples[kind][i]);
+                std::fputs("]", observations.get());
+            }
+            std::fputs("]}\n", observations.get());
+            return 0;
+        }
+
+        g_history_key_down = true;
+        if (!run(target, textures[1], CaptureEntry::draw)) return 1;
+        const auto request = target.frame;
+        if (std::filesystem::exists(color_file) || std::filesystem::exists(motion_file)) return 1;
+        g_history_key_down = false;
+        if (!run(other, textures[2], CaptureEntry::draw) || std::filesystem::exists(color_file)) return 1;
+        if (history_file_failure && !std::filesystem::create_directory(color_file)) return 1;
+        if (!run(target, textures[3], CaptureEntry::indexed)) return 1;
+        const auto captured = target.frame;
+        const std::string color = history_file_failure ? std::string {} : read(color_file);
+        const std::string motion = read(motion_file);
+        const auto identity = [&](const std::string &json)
+        {
+            return json.find("\"requested_frame\":" + std::to_string(request) + ',') != std::string::npos &&
+                json.find("\"captured_frame\":" + std::to_string(captured) + ',') != std::string::npos &&
+                json.find("\"instance\":\"" + hex_value(target.key()) + "\"") != std::string::npos &&
+                json.find("\"window_truncated\":false") != std::string::npos &&
+                json.find("\"writes\":[{") != std::string::npos;
+        };
+        bool good = (history_file_failure || (identity(color) && color.find("\"target_resource\":\"" +
+            hex_value(reinterpret_cast<std::uint64_t>(textures[3].textures[0].Get())) + "\"") != std::string::npos)) &&
+            identity(motion) && motion.find("\"target_resource\":\"" +
+                hex_value(reinterpret_cast<std::uint64_t>(textures[3].textures[3].Get())) + "\"") != std::string::npos &&
+            textures[1].textures[0].Get() != textures[3].textures[0].Get();
+        std::fprintf(observations.get(), "history identities: good=%d motion=%d target=%llX stored=%u/%u instance=%llX double_buffer=%d\n",
+            good, identity(motion), reinterpret_cast<unsigned long long>(textures[3].textures[3].Get()), request, captured,
+            static_cast<unsigned long long>(target.key()), textures[1].textures[0].Get() != textures[3].textures[0].Get());
+        // 持键与冻结后 Draw 不得覆盖刚导出的窗口；下一次松开再按才开启新窗口。
+        for (unsigned i = 0; i < 4096; ++i) context->Draw(0, 0);
+        if (!run(target, textures[4], CaptureEntry::draw)) return 1;
+        std::fprintf(observations.get(), "history unchanged: motion=%d color=%d\n", read(motion_file) == motion, history_file_failure || read(color_file) == color);
+        good = good && read(motion_file) == motion && (history_file_failure || read(color_file) == color);
+        if (!history_file_failure)
+        {
+            g_history_key_down = true;
+            if (!run(target, textures[4], CaptureEntry::draw) || read(color_file) != color) return 1;
+            if (!run(target, textures[5], CaptureEntry::indexed)) return 1;
+            const auto second = read(color_file);
+            good = good && second != color && second.find("\"request_id\":2,") != std::string::npos;
+            g_history_key_down = false;
+            if (!run(target, textures[4], CaptureEntry::draw)) return 1;
+            g_history_key_down = true;
+            if (!run(target, textures[4], CaptureEntry::draw)) return 1;
+            g_history_tick_offset = 2001;
+            // 不再进入 SDK，只有真实 Present 必须取消窗口；持键也不能重新 arm。
+            if (FAILED(presentation->Present(0, 0)) || read(color_file) != second) return 1;
+            if (!run(target, textures[5], CaptureEntry::draw) || read(color_file) != second) return 1;
+            g_history_key_down = false;
+            if (!run(target, textures[4], CaptureEntry::draw)) return 1;
+            g_history_key_down = true;
+            if (!run(target, textures[4], CaptureEntry::draw) || !run(target, textures[5], CaptureEntry::indexed)) return 1;
+            good = good && read(color_file).find("\"request_id\":4,") != std::string::npos;
+        }
+        std::printf("History fixture root: %ls\n", root.c_str());
+        std::fprintf(observations.get(), "source history: checks=%d key_queries=%u request=%u captured=%u file_failure=%d\n",
+            good, g_history_key_queries.load(), request, captured, history_file_failure);
+        return good ? 0 : 1;
+    }
     if (producer_capture)
     {
         RenderFixture target_instance, other_instance;
@@ -795,6 +995,10 @@ int wmain(int argc, wchar_t **argv)
             receipt.find("\"transfer\":\"unknown\"") != std::string::npos &&
             receipt.find("\"writer_execution\":\"not-proven\"") != std::string::npos &&
             receipt.find("\"original_call_returned\":true") != std::string::npos &&
+            receipt.find("\"runtime_transfer_attempt\":{\"observed\":true") != std::string::npos &&
+            receipt.find("\"same_captured_resource\":true,\"reason\":\"pixel_program\"") != std::string::npos &&
+            receipt.find("\"runtime_transfer_consumption\":{\"observed\":true,\"reason\":\"uncertified\"") !=
+                std::string::npos &&
             (producer_write_operation < 0 ||
                 (receipt.find("\"overwrite_count_window\":1") != std::string::npos &&
                     receipt.find("\"last_overwrite\":" + std::to_string(producer_write_operation) + ',') !=

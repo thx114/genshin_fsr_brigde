@@ -19,6 +19,7 @@
 #include "runtime/DrawSequence.h"
 #include "runtime/FrameBindings.h"
 #include "runtime/ProducerTransfer.h"
+#include "diagnostics/SourceHistorySession.h"
 #include "runtime/JitterReadback.h"
 #include "runtime/OutputHistory.h"
 #include "runtime/CandidateSignature.h"
@@ -650,6 +651,8 @@ DispatchState g_state;
 std::mutex g_color_source_mutex;
 std::unordered_map<std::uint64_t, std::deque<ColorSourceWrite>> g_color_source_writes;
 std::atomic_uint64_t g_color_source_sequence = 0;
+neo::diagnostics::SourceHistorySession g_color_source_session;
+ID3D11DeviceContext *g_color_source_context = nullptr;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS) && !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
 // 诊断只有一次有界快照。未确认 GPU 退休时保留实际对象，进程退出前不清理未知工作。
 auto &before_sr_producer_capture()
@@ -2120,8 +2123,7 @@ bool is_color_source_trace_surface(
 bool color_source_trace_pending() noexcept
 {
     return g_config.fsr2_trace_color_producers &&
-        (!g_fsr2_color_producers_dumped.load(std::memory_order_relaxed) ||
-         !g_fsr2_motion_producers_dumped.load(std::memory_order_relaxed)
+        (g_color_source_session.collecting()
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
          || !g_before_sr_producer_dumped.load(std::memory_order_relaxed)
 #endif
@@ -2152,10 +2154,11 @@ void observe_before_sr_producer(ID3D11DeviceContext *context, Observe &&observe)
     observe(capture);
 }
 
-void note_before_sr_producer_return(ID3D11DeviceContext *context, std::uint64_t sequence)
+void note_before_sr_producer_return(ID3D11DeviceContext *context, std::uint64_t sequence,
+    const neo::producer::DrawEvidence *evidence = nullptr)
 {
     if (!sequence) return;
-    observe_before_sr_producer(context, [&](auto &capture) { capture.observe_return(*context, sequence); });
+    observe_before_sr_producer(context, [&](auto &capture) { capture.observe_return(*context, sequence, evidence); });
 }
 
 void note_before_sr_producer_overwrite(ID3D11DeviceContext *context, ID3D11Resource *destination,
@@ -2169,6 +2172,50 @@ void note_before_sr_producer_overwrite(ID3D11DeviceContext *context, ID3D11Resou
 }
 #endif
 
+// 诊断只持有一个 context 身份；锁内摘出，锁外释放，避免驱动销毁工作占住 history 锁。
+struct SourceHistoryCleanup
+{
+    ID3D11DeviceContext *context = nullptr;
+    void clear_locked()
+    {
+        g_color_source_writes.clear();
+        context = std::exchange(g_color_source_context, nullptr);
+    }
+    ~SourceHistoryCleanup() { if (context) context->Release(); }
+};
+
+void maintain_color_source_history()
+{
+    if (!g_color_source_session.collecting()) return;
+    SourceHistoryCleanup cleanup;
+    bool expired = false;
+    {
+        std::lock_guard lock(g_color_source_mutex);
+        expired = g_color_source_session.expire(GetTickCount64());
+        if (expired) cleanup.clear_locked();
+    }
+    if (expired) LOG_INFO(blog::cat::probe, "source_history_window expired at Present; candidates discarded");
+}
+
+// 2026-11-17：仅统计诊断元数据，不持有/读回 GPU 资源；总预算由同一 session 管理。
+void retain_color_source_write(ColorSourceWrite write, std::uint64_t generation)
+{
+    SourceHistoryCleanup cleanup;
+    std::lock_guard lock(g_color_source_mutex);
+    const auto key = write.output.resource_key;
+    const bool is_new = g_color_source_writes.find(key) == g_color_source_writes.end();
+    const std::size_t bytes = sizeof(ColorSourceWrite) + write.stage.capacity() +
+        write.inputs.capacity() * sizeof(ResourceInfo) +
+        (write.constant_buffers.capacity() + write.vertex_constant_buffers.capacity()) * sizeof(BufferInfo);
+    if (!g_color_source_session.reserve_write(generation, is_new, bytes))
+    {
+        if (g_color_source_session.phase() == neo::diagnostics::SourceHistorySession::Phase::failed &&
+            generation == g_color_source_session.generation()) cleanup.clear_locked();
+        return;
+    }
+    g_color_source_writes[key].push_back(std::move(write));
+}
+
 std::uint64_t record_color_source_call(
     ID3D11DeviceContext *context,
     const char *stage,
@@ -2176,97 +2223,72 @@ std::uint64_t record_color_source_call(
     std::uint32_t call_y,
     std::uint32_t call_z)
 {
-    if (!color_source_trace_pending() || stage == nullptr)
-        return 0;
-
-    DispatchState snapshot {};
-    {
-        std::lock_guard lock(g_state_mutex);
-        snapshot = g_state;
-    }
-
-    ColorSourceWrite write;
-    write.sequence = g_color_source_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!color_source_trace_pending() || stage == nullptr) return 0;
+    const auto sequence = g_color_source_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     std::uint64_t producer_sequence = 0;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     observe_before_sr_producer(context, [&](auto &capture)
     {
-        if (capture.record_writer(*context, write.sequence, std::strcmp(stage, "dispatch") == 0))
+        if (capture.record_writer(*context, sequence, std::strcmp(stage, "dispatch") == 0))
         {
-            producer_sequence = write.sequence;
-            LOG_DEBUG(blog::cat::probe, "before_sr_producer_snapshot_recorded sequence=" +
-                std::to_string(write.sequence));
+            producer_sequence = sequence;
+            LOG_DEBUG(blog::cat::probe, "before_sr_producer_snapshot_recorded sequence=" + std::to_string(sequence));
         }
     });
 #endif
+    // 自动 producer 与按键历史独立；等待用户请求时不复制镜像状态或构造绑定 vectors。
+    if (!g_color_source_session.collecting()) return producer_sequence;
+    std::uint64_t generation = 0;
+    SourceHistoryCleanup cleanup;
+    {
+        std::lock_guard lock(g_color_source_mutex);
+        if (!g_color_source_session.observe_call(generation))
+        {
+            if (g_color_source_session.phase() == neo::diagnostics::SourceHistorySession::Phase::failed) cleanup.clear_locked();
+            return producer_sequence;
+        }
+    }
+    ColorSourceWrite write;
+    std::vector<ResourceInfo> outputs;
+    const bool compute = std::strcmp(stage, "dispatch") == 0;
+    {
+        std::lock_guard lock(g_state_mutex);
+        // 两种数组长度不同，分别筛选；没有可追踪输出时不复制输入或 CB。
+        const auto collect = [&](const auto &views)
+        {
+            for (const auto &view : views)
+                if (is_color_source_trace_surface(view, g_state.backbuffer_width, g_state.backbuffer_height))
+                    outputs.push_back(view);
+        };
+        if (compute) collect(g_state.cs_uavs);
+        else collect(g_state.rtvs);
+        if (outputs.empty()) return producer_sequence;
+        write.viewport_width = g_state.viewport_width;
+        write.viewport_height = g_state.viewport_height;
+        write.shader_hash = compute ? g_state.current_cs_hash : g_state.current_ps_hash;
+        write.shader_size = compute ? g_state.current_cs_size : g_state.current_ps_size;
+        write.vertex_shader_hash = compute ? 0 : g_state.current_vs_hash;
+        write.vertex_shader_size = compute ? 0 : g_state.current_vs_size;
+        const auto &inputs = compute ? g_state.cs_srvs : g_state.ps_srvs;
+        for (std::size_t slot = 0; slot < inputs.size() && slot < 32; ++slot)
+            if (inputs[slot].resource_key) write.inputs.push_back(inputs[slot]);
+        const auto &buffers = compute ? g_state.cs_cbs : g_state.ps_cbs;
+        for (const auto &buffer : buffers)
+            if (buffer.resource_key) write.constant_buffers.push_back(buffer);
+        if (!compute)
+            for (const auto &buffer : g_state.vs_cbs)
+                if (buffer.resource_key) write.vertex_constant_buffers.push_back(buffer);
+    }
+    write.sequence = sequence;
     write.stage = stage;
     write.context = reinterpret_cast<std::uint64_t>(context);
     write.call_x = call_x;
     write.call_y = call_y;
     write.call_z = call_z;
-    write.viewport_width = snapshot.viewport_width;
-    write.viewport_height = snapshot.viewport_height;
-
-    std::vector<ResourceInfo> outputs;
-    if (write.stage == "dispatch")
+    for (const auto &output : outputs)
     {
-        write.shader_hash = snapshot.current_cs_hash;
-        write.shader_size = snapshot.current_cs_size;
-        for (std::size_t slot = 0; slot < snapshot.cs_srvs.size() && slot < 32; ++slot)
-        {
-            if (snapshot.cs_srvs[slot].resource_key != 0)
-                write.inputs.push_back(snapshot.cs_srvs[slot]);
-        }
-        for (const ResourceInfo &uav : snapshot.cs_uavs)
-        {
-            if (is_color_source_trace_surface(uav, snapshot.backbuffer_width, snapshot.backbuffer_height))
-                outputs.push_back(uav);
-        }
-        for (const BufferInfo &buffer : snapshot.cs_cbs)
-        {
-            if (buffer.resource_key != 0)
-                write.constant_buffers.push_back(buffer);
-        }
-    }
-    else
-    {
-        write.shader_hash = snapshot.current_ps_hash;
-        write.shader_size = snapshot.current_ps_size;
-        write.vertex_shader_hash = snapshot.current_vs_hash;
-        write.vertex_shader_size = snapshot.current_vs_size;
-        for (std::size_t slot = 0; slot < snapshot.ps_srvs.size() && slot < 32; ++slot)
-        {
-            if (snapshot.ps_srvs[slot].resource_key != 0)
-                write.inputs.push_back(snapshot.ps_srvs[slot]);
-        }
-        for (const ResourceInfo &rtv : snapshot.rtvs)
-        {
-            if (is_color_source_trace_surface(rtv, snapshot.backbuffer_width, snapshot.backbuffer_height))
-                outputs.push_back(rtv);
-        }
-        for (const BufferInfo &buffer : snapshot.ps_cbs)
-        {
-            if (buffer.resource_key != 0)
-                write.constant_buffers.push_back(buffer);
-        }
-        for (const BufferInfo &buffer : snapshot.vs_cbs)
-        {
-            if (buffer.resource_key != 0)
-                write.vertex_constant_buffers.push_back(buffer);
-        }
-    }
-
-    if (outputs.empty())
-        return producer_sequence;
-
-    std::lock_guard lock(g_color_source_mutex);
-    for (const ResourceInfo &output : outputs)
-    {
-        auto &history = g_color_source_writes[output.resource_key];
         write.output = output;
-        history.push_back(write);
-        while (history.size() > 1024)
-            history.pop_front();
+        retain_color_source_write(write, generation);
     }
     return producer_sequence;
 }
@@ -2274,33 +2296,28 @@ std::uint64_t record_color_source_call(
 void record_color_source_copy(ID3D11DeviceContext *context, const ResourceInfo &destination,
     const ResourceInfo &source, const char *stage)
 {
-    if (!color_source_trace_pending())
-        return;
-    std::uint32_t output_width = 0;
-    std::uint32_t output_height = 0;
+    if (!g_config.fsr2_trace_color_producers || !g_color_source_session.collecting()) return;
+    std::uint64_t generation = 0;
+    SourceHistoryCleanup cleanup;
+    {
+        std::lock_guard lock(g_color_source_mutex);
+        if (!g_color_source_session.observe_call(generation))
+        {
+            if (g_color_source_session.phase() == neo::diagnostics::SourceHistorySession::Phase::failed) cleanup.clear_locked();
+            return;
+        }
+    }
     {
         std::lock_guard lock(g_state_mutex);
-        output_width = g_state.backbuffer_width;
-        output_height = g_state.backbuffer_height;
+        if (!is_color_source_trace_surface(destination, g_state.backbuffer_width, g_state.backbuffer_height)) return;
     }
-    if (!is_color_source_trace_surface(destination, output_width, output_height))
-    {
-        return;
-    }
-
     ColorSourceWrite write;
     write.sequence = g_color_source_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
     write.context = reinterpret_cast<std::uint64_t>(context);
     write.output = destination;
     write.stage = stage != nullptr ? stage : "copy";
-    if (source.resource_key != 0)
-        write.inputs.push_back(source);
-
-    std::lock_guard lock(g_color_source_mutex);
-    auto &history = g_color_source_writes[destination.resource_key];
-    history.push_back(std::move(write));
-    while (history.size() > 1024)
-        history.pop_front();
+    if (source.resource_key) write.inputs.push_back(source);
+    retain_color_source_write(std::move(write), generation);
 }
 
 void write_color_source_record_json(std::ofstream &out, const ColorSourceWrite &write)
@@ -2354,14 +2371,12 @@ void write_color_source_record_json(std::ofstream &out, const ColorSourceWrite &
     out << "]}";
 }
 
-void dump_source_history(ID3D11DeviceContext *context, const ResourceInfo &target,
+bool dump_source_history(ID3D11DeviceContext *context, const ResourceInfo &target,
     std::uint64_t instance, std::uint64_t render_frame, const wchar_t *file_stem, const char *log_label,
     std::atomic_bool &dumped)
 {
-    if (target.resource_key == 0 || dumped.exchange(true, std::memory_order_relaxed))
-    {
-        return;
-    }
+    if (target.resource_key == 0) return false;
+    if (dumped.load(std::memory_order_relaxed)) return true;
 
     std::deque<ColorSourceWrite> target_writes;
     std::unordered_map<std::uint64_t, ColorSourceWrite> related_writes;
@@ -2386,7 +2401,7 @@ void dump_source_history(ID3D11DeviceContext *context, const ResourceInfo &targe
     if (!out)
     {
         LOG_DEBUG(blog::cat::upscale, std::string("fsr2_") + log_label + "_dump_failed open=0");
-        return;
+        return false;
     }
 
     out << "{\"observation\":\"sdk_input_write_candidates\",\"pid\":" << GetCurrentProcessId()
@@ -2396,6 +2411,17 @@ void dump_source_history(ID3D11DeviceContext *context, const ResourceInfo &targe
         << ",\"target_width\":" << target.width << ",\"target_height\":" << target.height
         << ",\"target_format\":" << static_cast<std::uint32_t>(target.format)
         << ",\"target_view_format\":" << static_cast<std::uint32_t>(target.view_format)
+        << ",\"binding_authority\":\"candidate-only\""
+        << ",\"request_id\":" << g_color_source_session.generation()
+        << ",\"requested_frame\":" << g_color_source_session.requested_frame()
+        << ",\"captured_frame\":" << g_color_source_session.captured_frame()
+        << ",\"window_truncated\":" << (g_color_source_session.truncated() ? "true" : "false")
+        << ",\"window_reason\":\"" << g_color_source_session.reason() << "\""
+        << ",\"window_calls\":" << g_color_source_session.calls()
+        << ",\"retained_writes\":" << g_color_source_session.writes()
+        << ",\"retained_resources\":" << g_color_source_session.resources()
+        << ",\"accounted_payload_bytes\":" << g_color_source_session.bytes()
+        << ",\"target_writes_observed\":" << (!target_writes.empty() ? "true" : "false")
         << ",\"writes\":[";
     for (std::size_t index = 0; index < target_writes.size(); ++index)
     {
@@ -2416,9 +2442,13 @@ void dump_source_history(ID3D11DeviceContext *context, const ResourceInfo &targe
     // 2026-11-15：旧实现按历史指针 Map/读 CB，既可能阻塞共享队列，也不是写入时的常量值。
     // 本文件只给写入候选；验证 shader 分支/实际覆盖像素需用同帧捕获，不混用来路不明的 CB 值。
     out << "]}";
+    out.close();
+    if (!out) return false;
+    dumped.store(true, std::memory_order_relaxed);
     LOG_DEBUG(blog::cat::upscale, std::string("fsr2_") + log_label + "_dumped target=" + hex64(target.resource_key) +
         " render_frame=" + std::to_string(render_frame) + " retained_writes=" + std::to_string(target_writes.size()) +
         " related_last_writes=" + std::to_string(related_writes.size()));
+    return true;
 }
 
 bool read_resource_info(ID3D11View *view, const wchar_t *kind, ResourceInfo &out_info);
@@ -2487,10 +2517,11 @@ void maybe_capture_unknown_motion_consumer(ID3D11DeviceContext &context, const f
 #endif
 
 void maybe_dump_sdk_input_chains(ID3D11DeviceContext *context, const ffx12::FrameInput &input,
-    std::uint64_t instance, std::uint64_t render_frame)
+    std::uint64_t instance, std::uint64_t render_frame, const neo::producer::ConsumeEvidence *evidence)
 {
-    if (!color_source_trace_pending()) return;
+    if (!g_config.fsr2_trace_color_producers) return;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    {
     std::unique_lock capture_lock(g_before_sr_producer_mutex, std::try_to_lock);
     if (capture_lock.owns_lock() && context && input.color &&
         !g_before_sr_producer_dumped.load(std::memory_order_relaxed))
@@ -2500,7 +2531,7 @@ void maybe_dump_sdk_input_chains(ID3D11DeviceContext *context, const ffx12::Fram
         if (capture.state() == neo::diagnostics::CaptureState::idle && capture.arm(*context, *input.color))
             LOG_DEBUG(blog::cat::probe, "before_sr_producer_snapshot_armed");
         if (g_before_sr_producer_observation_gap.exchange(false, std::memory_order_relaxed)) capture.observe_gap();
-        capture.observe_sdk(*context, *input.color, instance, render_frame);
+        capture.observe_sdk(*context, *input.color, instance, render_frame, evidence);
         capture.poll(*context);
         // 2026-11-16：其他实例可促成快照退休，但不能抢走尚未锁存目标SDK身份的唯一回执。
         // 失败终态仍报告失败；ready仅在目标消费已记录后报告，避免sdk_observed=false被当作完成。
@@ -2515,22 +2546,62 @@ void maybe_dump_sdk_input_chains(ID3D11DeviceContext *context, const ffx12::Fram
             g_before_sr_producer_dumped.store(true, std::memory_order_relaxed);
         }
     }
+    }
 #endif
-    if ((GetAsyncKeyState(VK_F6) & 0x8000) == 0) return;
+    using Session = neo::diagnostics::SourceHistorySession;
+    Session::Action action;
+    SourceHistoryCleanup cleanup;
+    {
+        std::lock_guard lock(g_color_source_mutex);
+        action = g_color_source_session.sdk((GetAsyncKeyState(VK_F6) & 0x8000) != 0,
+            reinterpret_cast<std::uint64_t>(context), instance, render_frame, GetTickCount64(), input.color && input.motion);
+        if (action == Session::Action::arm)
+        {
+            cleanup.clear_locked();
+            g_fsr2_color_producers_dumped.store(false, std::memory_order_relaxed);
+            g_fsr2_motion_producers_dumped.store(false, std::memory_order_relaxed);
+            // 同一窗口内持有 context 身份，避免销毁后的裸地址复用被认成匹配 SDK。
+            g_color_source_context = context;
+            g_color_source_context->AddRef();
+        }
+        else if (action == Session::Action::expire)
+        {
+            cleanup.clear_locked();
+        }
+    }
+    if (action == Session::Action::arm)
+    {
+        LOG_INFO(blog::cat::probe, "source_history_window armed instance=" + std::to_string(instance) +
+            " requested_frame=" + std::to_string(render_frame));
+        return;
+    }
+    if (action == Session::Action::expire)
+    {
+        LOG_INFO(blog::cat::probe, "source_history_window expired no matching later SDK input; candidates discarded");
+        return;
+    }
+    if (action != Session::Action::capture) return;
 
-    // 2026-11-15：只在 SDK 调用点取证；扫描命中的 draw 未必是实际派发选中的那一路视图。
+    // 双缓冲时使用本次实际 SDK 目标，禁止将请求帧的旧纹理冒充捕获帧。
     ResourceInfo color {}, view {}, motion {};
+    bool color_ok = false, motion_ok = false;
     if (read_resource_info_from_resource(input.color, L"sdk_color", color))
     {
-        if (read_resource_info(input.color_source_view, L"sdk_color_view", view) &&
-            view.resource_key == color.resource_key)
+        if (read_resource_info(input.color_source_view, L"sdk_color_view", view) && view.resource_key == color.resource_key)
             color.view_format = view.view_format;
-        dump_source_history(context, color, instance, render_frame, L"Dx11FsrBridge.color_chain", "color_chain",
+        color_ok = dump_source_history(context, color, instance, render_frame, L"Dx11FsrBridge.color_chain", "color_chain",
             g_fsr2_color_producers_dumped);
     }
     if (read_resource_info_from_resource(input.motion, L"sdk_motion", motion))
-        dump_source_history(context, motion, instance, render_frame, L"Dx11FsrBridge.motion_chain", "motion_chain",
+        motion_ok = dump_source_history(context, motion, instance, render_frame, L"Dx11FsrBridge.motion_chain", "motion_chain",
             g_fsr2_motion_producers_dumped);
+    {
+        std::lock_guard lock(g_color_source_mutex);
+        g_color_source_session.exported(color_ok && motion_ok);
+        cleanup.clear_locked();
+    }
+    LOG_INFO(blog::cat::probe, std::string("source_history_window export color=") + (color_ok ? "ok" : "failed") +
+        " motion=" + (motion_ok ? "ok" : "failed") + " captured_frame=" + std::to_string(render_frame));
 }
 
 void note_2d_post_context(SimilarityStats &stats, const DispatchState &snapshot, UINT group_x, UINT group_y, UINT group_z)
@@ -6648,6 +6719,9 @@ HRESULT route_present(IDXGISwapChain *swapchain, UINT sync_interval, UINT flags,
     {
         ~Restore() { g_present_active = false; }
     } restore;
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    maintain_color_source_history();
+#endif
     observe_present(swapchain, sync_interval, flags);
     const HRESULT result = present();
     repair_present_execution(swapchain);
@@ -10920,7 +10994,12 @@ UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
                 // 2026-11-16：同尺寸 DSV 不能证明同相机/同帧输入；只交付当前 FSR 实际消费的深度。
                 ffx12::FrameInput sdk_in {};
                 sdk_in.color = color_tex;
-                sdk_in.color_transfer = neo::producer::take_transfer(*context, *color_tex);
+                neo::producer::ConsumeEvidence *transfer_evidence = nullptr;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+                neo::producer::ConsumeEvidence transfer_evidence_storage;
+                if (before_sr_producer_observation_pending()) transfer_evidence = &transfer_evidence_storage;
+#endif
+                sdk_in.color_transfer = neo::producer::take_transfer(*context, *color_tex, transfer_evidence);
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
                 // 2026-11-15：沿匹配 color 的同一次 PS 绑定传递视图，不再查 context 或猜测纹理的读法。
                 const auto color_inputs = frame.inputs();
@@ -11333,7 +11412,7 @@ UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
                 }
 
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
-                maybe_dump_sdk_input_chains(context, sdk_in, call_params.instance, call_params.frame_index);
+                maybe_dump_sdk_input_chains(context, sdk_in, call_params.instance, call_params.frame_index, transfer_evidence);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
                 maybe_capture_unknown_motion_consumer(*context, sdk_in, frame.inputs(), *draw_info,
                     call_params.instance, call_params.frame_index, call_gen);
@@ -12284,11 +12363,18 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         const auto sequence = record_color_source_call(context, entry_name, element_count, 0, 0);
 #endif
-        auto producer_write = neo::producer::begin_draw(*context, element_count, Indexed, vertex_start, vertex_base);
+        neo::producer::DrawEvidence *transfer_evidence = nullptr;
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        // 非零sequence表示自动采集已锁存此writer；普通Draw不初始化证据或多查状态。
+        std::optional<neo::producer::DrawEvidence> transfer_evidence_storage;
+        if (sequence) { transfer_evidence_storage.emplace(); transfer_evidence = &*transfer_evidence_storage; }
+#endif
+        auto producer_write = neo::producer::begin_draw(*context, element_count, Indexed, vertex_start, vertex_base,
+            transfer_evidence);
         draw();
         producer_write.returned();
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-        note_before_sr_producer_return(context, sequence);
+        note_before_sr_producer_return(context, sequence, transfer_evidence);
 #endif
     };
     neo::graphics::execute_draw(observed_draw, upscale, tone_map, spatial, [&]
@@ -13032,7 +13118,8 @@ bool swapchain_capture_repair_needed()
 
 bool swapchain_present_hook_needed()
 {
-    return swapchain_present_observation_needed() || swapchain_capture_repair_needed();
+    return swapchain_present_observation_needed() || swapchain_capture_repair_needed() ||
+        g_config.fsr2_trace_color_producers;
 }
 
 bool swapchain_control_hook_needed()

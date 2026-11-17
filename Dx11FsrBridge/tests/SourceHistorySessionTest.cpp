@@ -1,0 +1,72 @@
+#include "../diagnostics/SourceHistorySession.h"
+#include <cstdio>
+using Session = neo::diagnostics::SourceHistorySession;
+int main()
+{
+    unsigned checks = 0, failures = 0;
+    const auto expect = [&](bool pass, const char *why) { ++checks; if (!pass) { ++failures; std::printf("FAIL %s\n", why); } };
+    using Action = Session::Action;
+    using Phase = Session::Phase;
+    Session s;
+    std::uint64_t gen = 0;
+    expect(!s.collecting() && !s.observe_call(gen), "idle draw does not collect");
+    for (unsigned i = 0; i < 100000; ++i) s.observe_call(gen);
+    expect(s.calls() == 0 && s.bytes() == 0 && s.writes() == 0, "unrequested draws retain zero state");
+    expect(s.sdk(false, 1, 2, 10, 100, true) == Action::none, "no key no request");
+    expect(s.sdk(true, 1, 2, 10, 100, true) == Action::arm, "rising key arms only");
+    expect(s.requested_frame() == 10 && s.captured_frame() == 0 && s.collecting(), "request identity");
+    expect(s.sdk(true, 1, 2, 10, 101, true) == Action::none, "same SDK frame cannot capture");
+    expect(s.sdk(true, 3, 2, 11, 102, true) == Action::none, "other context cannot capture");
+    expect(s.sdk(true, 1, 4, 11, 103, true) == Action::none, "other instance cannot capture");
+    expect(s.sdk(false, 1, 2, 11, 104, false) == Action::none, "missing actual input cannot capture");
+    expect(s.observe_call(gen) && s.reserve_write(gen, true, 128), "matching window accepts bounded candidate");
+    expect(!s.reserve_write(gen + 1, false, 1), "old generation cannot pollute new request");
+    expect(s.sdk(false, 1, 2, 11, 105, true) == Action::capture, "later actual SDK input freezes");
+    expect(s.captured_frame() == 11 && !s.collecting() && s.phase() == Phase::exporting, "freeze before export");
+    expect(!s.observe_call(gen) && !s.reserve_write(gen, false, 1), "frozen window does not accumulate");
+    expect(s.sdk(true, 1, 2, 12, 106, true) == Action::none, "in-flight export not replaced");
+    s.exported(false);
+    expect(s.phase() == Phase::failed && !s.collecting(), "file failure is terminal, not exported");
+    expect(s.sdk(true, 1, 2, 13, 107, true) == Action::none, "held key cannot rearm");
+    s.sdk(false, 1, 2, 13, 108, true);
+    expect(s.sdk(true, 1, 2, 13, 109, true) == Action::arm, "release and repress rearm");
+    expect(s.generation() == 2 && s.calls() == 0 && s.writes() == 0, "rearm resets window counts");
+    expect(s.sdk(false, 1, 2, 12, 110, true) == Action::expire && s.phase() == Phase::failed, "frame regression cancels");
+
+    const auto arm = [](Session &x) { return x.sdk(true, 1, 2, 1, 10, true) == Action::arm; };
+    Session calls;
+    expect(arm(calls), "call budget arm");
+    for (std::size_t i = 0; i < Session::call_limit(); ++i) expect(calls.observe_call(gen), "call within budget");
+    expect(!calls.observe_call(gen) && calls.truncated() && !calls.collecting(), "call budget stops without another SDK");
+    expect(calls.sdk(false, 1, 2, 2, 20, true) == Action::none && calls.phase() == Phase::failed, "budget failure discards incomplete candidates");
+    Session writes;
+    arm(writes); writes.observe_call(gen);
+    for (std::size_t i = 0; i < Session::write_limit(); ++i) expect(writes.reserve_write(gen, false, 1), "write within budget");
+    expect(!writes.reserve_write(gen, false, 1) && writes.writes() == Session::write_limit(), "global write cap");
+    Session resources;
+    arm(resources); resources.observe_call(gen);
+    for (std::size_t i = 0; i < Session::resource_limit(); ++i) expect(resources.reserve_write(gen, true, 1), "resource within budget");
+    expect(!resources.reserve_write(gen, true, 1) && resources.resources() == Session::resource_limit(), "global resource cap");
+    Session bytes;
+    arm(bytes); bytes.observe_call(gen);
+    expect(bytes.reserve_write(gen, true, Session::byte_limit()), "exact payload budget allowed");
+    expect(!bytes.reserve_write(gen, false, 1) && bytes.truncated(), "payload over budget stops");
+    Session time;
+    arm(time);
+    expect(time.sdk(false, 1, 2, 2, 10 + Session::window_ms(), true) == Action::expire, "deadline does not export stale window");
+    Session no_sdk;
+    arm(no_sdk);
+    expect(!no_sdk.expire(10 + Session::window_ms() - 1), "active window before deadline");
+    expect(no_sdk.expire(10 + Session::window_ms()) && no_sdk.phase() == Phase::failed, "Present expires without SDK");
+    expect(!no_sdk.observe_call(gen) && !no_sdk.reserve_write(1, true, 1), "expired window does no work");
+    expect(!no_sdk.expire(10000), "expiration reports once");
+    Session sdk;
+    arm(sdk);
+    for (std::size_t i = 0; i < Session::sdk_limit(); ++i) expect(sdk.sdk(false, 9, 2, 2, 11, true) == Action::none, "foreign SDK cannot steal");
+    expect(sdk.sdk(false, 9, 2, 2, 11, true) == Action::expire, "bounded unmatched SDK window");
+    Session empty;
+    arm(empty);
+    expect(empty.sdk(false, 1, 2, 2, 11, true) == Action::capture && empty.writes() == 0, "empty window remains empty");
+    std::printf("SourceHistorySession: %u checks %u failures\n", checks, failures);
+    return failures ? 1 : 0;
+}

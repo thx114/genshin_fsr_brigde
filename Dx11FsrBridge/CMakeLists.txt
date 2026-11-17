@@ -396,6 +396,9 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     add_executable(BridgeCpuParityBench tests/BridgeCpuParityBench.cpp)
     fsrbridge_configure_test(BridgeCpuParityBench)
     target_link_libraries(BridgeCpuParityBench PRIVATE d3d11)
+    add_executable(SourceHistorySessionTest tests/SourceHistorySessionTest.cpp)
+    fsrbridge_configure_test(SourceHistorySessionTest)
+    add_test(NAME SourceHistorySessionTest COMMAND SourceHistorySessionTest)
     add_executable(BeforeSrProducerCaptureTest tests/BeforeSrProducerCaptureTest.cpp
         diagnostics/BeforeSrProducerCapture.cpp)
     fsrbridge_configure_test(BeforeSrProducerCaptureTest)
@@ -535,6 +538,15 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         endforeach()
         add_test(NAME F6EvalReceiptDlaaIntegration COMMAND ProviderFrameHost ngx-receipt-dlaa
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:F6ReceiptProvider>")
+        if(DX11FSRBRIDGE_DIAGNOSTICS AND NOT DX11FSRBRIDGE_RELEASE_RUNTIME)
+            foreach(mode IN ITEMS ngx-history-window ngx-history-file-failure)
+                add_test(NAME SourceHistory-${mode} COMMAND "${CMAKE_COMMAND}"
+                    "-DHOST=$<TARGET_FILE:ProviderFrameHost>" "-DMODE=${mode}"
+                    "-DBRIDGE=$<TARGET_FILE:Dx11FsrBridge>" "-DPROVIDER=$<TARGET_FILE:BeforeSrProvider>"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/RunSourceHistory.cmake")
+                set_tests_properties(SourceHistory-${mode} PROPERTIES TIMEOUT 45)
+            endforeach()
+        endif()
         add_test(NAME BeforeSrIntegration COMMAND ProviderFrameHost ngx-before-sr
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME NgxInputMapCurrentIntegration COMMAND ProviderFrameHost ngx-input-map-current

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../interop/BeforeSrV1.h"
+#include "ProducerTransferEvidence.h"
 #include "../ComVtableMethods.h"
 #include <d3d11_1.h>
 #include <wrl/client.h>
@@ -42,7 +42,8 @@ public:
 
 private:
     friend DrawWrite begin_draw(ID3D11DeviceContext &, UINT) noexcept;
-    friend DrawWrite begin_draw(ID3D11DeviceContext &, UINT, bool, UINT, INT) noexcept;
+    friend DrawWrite begin_draw(ID3D11DeviceContext &, UINT, bool, UINT, INT, DrawEvidence *) noexcept;
+    DrawEvidence *evidence_ = nullptr; // 只借用同步调用栈，returned后不再使用。
     Microsoft::WRL::ComPtr<IUnknown> record_;
     Microsoft::WRL::ComPtr<IUnknown> constants_;
     Microsoft::WRL::ComPtr<IUnknown> geometry_[2];
@@ -51,8 +52,10 @@ private:
 };
 
 DrawWrite begin_draw(ID3D11DeviceContext &context, UINT elements) noexcept;
-DrawWrite begin_draw(ID3D11DeviceContext &context, UINT elements, bool indexed, UINT start, INT base) noexcept;
-interop::ColorTransfer take_transfer(ID3D11DeviceContext &context, ID3D11Texture2D &source) noexcept;
+DrawWrite begin_draw(ID3D11DeviceContext &context, UINT elements, bool indexed, UINT start, INT base,
+    DrawEvidence *evidence = nullptr) noexcept;
+interop::ColorTransfer take_transfer(ID3D11DeviceContext &context, ID3D11Texture2D &source,
+    ConsumeEvidence *evidence = nullptr) noexcept;
 
 // 新观察入口仍经现有COM路由；扩展接口单独按实际公开槽数安装，旧代理不因此失去基础Draw钩子。
 std::span<const com_vtable::MethodPatch> extra_methods(void (*repair)(ID3D11DeviceContext *)) noexcept;

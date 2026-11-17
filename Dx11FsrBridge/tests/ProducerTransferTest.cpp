@@ -12,6 +12,8 @@ using neo::interop::ColorTransfer;
 namespace
 {
 unsigned checks = 0;
+DrawEvidence last_draw;
+bool collect_draw_evidence = true;
 void check(bool value, const char *label)
 {
     ++checks;
@@ -78,13 +80,13 @@ void STDMETHODCALLTYPE target(ID3D11DeviceContext *context, UINT count, ID3D11Re
 }
 void STDMETHODCALLTYPE draw(ID3D11DeviceContext *context, UINT count, UINT first)
 {
-    auto writer = begin_draw(*context, count, false, first, 0);
+    auto writer = begin_draw(*context, count, false, first, 0, collect_draw_evidence ? &last_draw : nullptr);
     Draw {}(context, count, first);
     writer.returned();
 }
 void STDMETHODCALLTYPE indexed(ID3D11DeviceContext *context, UINT count, UINT first, INT base)
 {
-    auto writer = begin_draw(*context, count, true, first, base);
+    auto writer = begin_draw(*context, count, true, first, base, collect_draw_evidence ? &last_draw : nullptr);
     Indexed {}(context, count, first, base);
     writer.returned();
 }
@@ -247,13 +249,38 @@ int main()
     const auto expect = [&](producer_fixture::Controls controls, ColorTransfer expected, const char *label)
     {
         check(fixture.record(*context.Get(), *color.Get(), controls), "actual producer draw");
-        const auto actual = take_transfer(*context.Get(), *color.Get());
+        ConsumeEvidence consumed;
+        const auto actual = take_transfer(*context.Get(), *color.Get(), &consumed);
+        check(consumed.transfer == actual && consumed.source_resource == reinterpret_cast<std::uintptr_t>(color.Get()),
+            "single decision owns actual color and transfer");
+        if (actual == ColorTransfer::srgb)
+        {
+            check(last_draw.reason == DrawReason::certified && last_draw.checked == last_draw.passed,
+                "all evaluated gates and synchronous return certified");
+            check(last_draw.target_resource == consumed.source_resource && last_draw.corners == 15,
+                "certificate covers actual RTV0 with full geometry");
+            check(consumed.reason == ConsumeReason::accepted && consumed.was_srgb && consumed.owner_matches &&
+                consumed.epoch_matches && consumed.certificate_cleared, "first consume evidence agrees");
+        }
         std::printf("%s transfer=%u expected=%u\n", label, unsigned(actual), unsigned(expected));
         check(actual == expected, label);
         return pixel(*device.Get(), *context.Get(), *color.Get());
     };
     const auto first = expect({}, ColorTransfer::srgb, "cold full-frame Update");
-    check(take_transfer(*context.Get(), *color.Get()) == ColorTransfer::unknown, "writer certificate consumed once");
+    ConsumeEvidence second_take;
+    check(take_transfer(*context.Get(), *color.Get(), &second_take) == ColorTransfer::unknown &&
+        second_take.reason == ConsumeReason::uncertified && !second_take.was_srgb,
+        "writer certificate consumed once with independent second decision");
+    check(fixture.record(*context.Get(), *color.Get()), "new writer for owner mismatch");
+    ComPtr<ID3D11DeviceContext> other_owner;
+    check(SUCCEEDED(device->CreateDeferredContext(0, other_owner.GetAddressOf())), "separate execution owner");
+    attach_context(*other_owner.Get());
+    ConsumeEvidence wrong_owner;
+    check(take_transfer(*other_owner.Get(), *color.Get(), &wrong_owner) == ColorTransfer::unknown &&
+        wrong_owner.reason == ConsumeReason::owner_mismatch && wrong_owner.was_srgb &&
+        !wrong_owner.certificate_cleared, "wrong owner neither borrows nor consumes certificate");
+    check(take_transfer(*context.Get(), *color.Get()) == ColorTransfer::srgb,
+        "legitimate owner still consumes after rejected observer");
     producer_fixture::Controls controls;
     controls.update_method = producer_fixture::UpdateMethod::map_discard;
     controls.linear_rgb = {.61f, .14f, .27f};
@@ -262,6 +289,8 @@ int main()
     check((first & 255) > 90 && ((first >> 16) & 255) > 180, "nontrivial OETF pixel");
     controls.gamma = 1.25f;
     expect(controls, ColorTransfer::unknown, "same resource gamma changed");
+    check(last_draw.reason == DrawReason::cb_controls &&
+        !(last_draw.checked & static_cast<unsigned>(DrawGate::geometry)), "gamma rejected before unchecked geometry");
     controls.gamma = 1;
     expect(controls, ColorTransfer::srgb, "same resource gamma recovered");
     controls.overlay = 1;
@@ -328,6 +357,8 @@ int main()
         ctx.IASetVertexBuffers(0,1,vertices.GetAddressOf(),&stride,&offset);
     };
     expect(controls, ColorTransfer::unknown, "same VS with partial geometry rejected");
+    check(last_draw.reason == DrawReason::geometry_coverage && last_draw.buffers[0].reads_passed == 3,
+        "partial geometry evidence belongs to actual CPU mirror");
     controls.before_draw = {};
     expect(controls, ColorTransfer::srgb, "full geometry recovered");
     check(fixture.record(*context.Get(), *color.Get()), "current before unknown copy");
@@ -420,6 +451,50 @@ int main()
     check(fixture.record(*context.Get(), *color.Get()), "same immutable geometry after opaque");
     check(take_transfer(*context.Get(), *color.Get()) == ColorTransfer::srgb,
         "immutable creation contract preserves geometry across opaque epoch");
+    collect_draw_evidence = false;
+    check(fixture.record(*context.Get(), *color.Get()), "nullptr evidence writer path");
+    check(take_transfer(*context.Get(), *color.Get()) == ColorTransfer::srgb &&
+        take_transfer(*context.Get(), *color.Get()) == ColorTransfer::unknown, "nullptr path preserves one-shot semantics");
+    collect_draw_evidence = true;
+    const auto return_failure = [&](DrawReason expected, auto &&mutate)
+    {
+        producer_fixture::Controls mutation_controls;
+        mutation_controls.before_draw = [&](auto &active_context)
+        {
+        DrawEvidence evidence;
+        auto pending = begin_draw(*context.Get(), 3, false, 0, 0, &evidence);
+        check(evidence.reason == DrawReason::awaiting_return, "begin does not certify before original return");
+        Draw {}(context.Get(), 3, 0);
+        mutate();
+        pending.returned();
+        check(evidence.reason == expected && (evidence.checked & static_cast<unsigned>(DrawGate::returned)) &&
+            !(evidence.passed & static_cast<unsigned>(DrawGate::returned)), "returned first failure is explicit");
+        check(take_transfer(*context.Get(), *color.Get()) == ColorTransfer::unknown, "failed return leaves unknown");
+        active_context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+        };
+        check(fixture.record(*context.Get(), *color.Get(), mutation_controls), "bound writer returned-mutation window");
+    };
+    return_failure(DrawReason::return_cb_version, [&]
+    {
+        ComPtr<ID3D11Buffer> cb;
+        context->PSGetConstantBuffers(0, 1, cb.GetAddressOf());
+        const std::array<float, 420> values {};
+        context->UpdateSubresource(cb.Get(), 0, nullptr, values.data(), 0, 0);
+    });
+    return_failure(DrawReason::return_serial, [&]
+    {
+        ComPtr<ID3D11RenderTargetView> view;
+        context->OMGetRenderTargets(1, view.GetAddressOf(), nullptr);
+        const float clear_color[4] {};
+        context->ClearRenderTargetView(view.Get(), clear_color);
+    });
+    return_failure(DrawReason::return_epoch, [&] { context->ExecuteCommandList(list.Get(), TRUE); });
+    check(fixture.record(*context.Get(), *color.Get()), "writer before consume epoch mismatch");
+    context->ExecuteCommandList(list.Get(), TRUE);
+    ConsumeEvidence stale_epoch;
+    check(take_transfer(*context.Get(), *color.Get(), &stale_epoch) == ColorTransfer::unknown &&
+        stale_epoch.reason == ConsumeReason::epoch_mismatch && stale_epoch.was_srgb &&
+        !stale_epoch.epoch_matches, "opaque after return rejects same certificate at actual consume");
     std::printf("ProducerTransferTest PASS checks=%u\n", checks);
     return 0;
 }

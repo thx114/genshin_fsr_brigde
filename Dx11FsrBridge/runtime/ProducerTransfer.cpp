@@ -22,6 +22,7 @@ constexpr GUID k_contents {0x44263cb6, 0x42de, 0x4fab, {0x90,0x68,0x66,0x6c,0x21
 constexpr GUID k_execution {0xf1b6746e, 0x413b, 0x43ed, {0xbd,0x14,0xad,0x82,0x99,0x78,0xa3,0x43}};
 constexpr GUID k_vertex {0x8a680ef0, 0x4fe8, 0x4442, {0xbe,0x66,0x1e,0x6b,0x18,0x29,0xdb,0xa4}};
 constexpr GUID k_layout {0xa5295390, 0xbaf6, 0x4d8a, {0x9a,0x20,0xab,0x7c,0x5f,0x46,0xc4,0x14}};
+constexpr GUID k_layout_evidence {0xa5295391, 0xbaf6, 0x4d8a, {0x9a,0x20,0xab,0x7c,0x5f,0x46,0xc4,0x14}};
 constexpr GUID k_geometry {0x64ba12da, 0x2c45, 0x4d84, {0xb9,0x34,0x14,0xf9,0x22,0xaf,0x85,0xcc}};
 constexpr UINT k_constant_bytes = 105 * 16;
 constexpr std::array<UINT, 3> k_control_offsets {20 * 16, 20 * 16 + 4, 25 * 16};
@@ -132,6 +133,7 @@ struct Target
     ComPtr<Contents> contents;
     D3D11_RENDER_TARGET_VIEW_DESC view {};
     D3D11_TEXTURE2D_DESC texture {};
+    std::uintptr_t resource = 0;
 };
 
 struct Geometry final : PrivateObject
@@ -192,9 +194,9 @@ ComPtr<Contents> view_contents(ID3D11View *view, Target *target = nullptr) noexc
     if (!resource || FAILED(resource.As(&texture))) return {};
     D3D11_TEXTURE2D_DESC desc {};
     texture->GetDesc(&desc);
+    if (target) { target->texture = desc; target->resource = reinterpret_cast<std::uintptr_t>(resource.Get()); }
     if (!rgba8(desc.Format) || desc.MipLevels != 1 || desc.ArraySize != 1 || desc.SampleDesc.Count != 1 ||
         desc.CPUAccessFlags != 0 || desc.Usage != D3D11_USAGE_DEFAULT) return {};
-    if (target) target->texture = desc;
     return add_private<Contents>(*resource.Get(), k_contents);
 }
 
@@ -228,7 +230,22 @@ bool program_matches(const void *data, std::size_t size, bool vertex = false) no
     return found;
 }
 
-ComPtr<Constants> srgb_controls(ID3D11DeviceContext &context, std::uint64_t &version, std::uint64_t epoch) noexcept
+void checking(DrawEvidence *evidence, DrawGate gate) noexcept
+{
+    if (evidence) evidence->checked |= static_cast<std::uint32_t>(gate);
+}
+void passed(DrawEvidence *evidence, DrawGate gate) noexcept
+{
+    if (evidence) evidence->passed |= static_cast<std::uint32_t>(gate);
+}
+bool accept_if(DrawEvidence *evidence, bool valid, DrawReason reason) noexcept
+{
+    if (!valid && evidence) evidence->reason = reason;
+    return valid;
+}
+
+ComPtr<Constants> srgb_controls(ID3D11DeviceContext &context, std::uint64_t &version, std::uint64_t epoch,
+    DrawEvidence *evidence) noexcept
 {
     ComPtr<ID3D11Buffer> buffer;
     ComPtr<ID3D11DeviceContext1> extended;
@@ -236,137 +253,224 @@ ComPtr<Constants> srgb_controls(ID3D11DeviceContext &context, std::uint64_t &ver
     if (SUCCEEDED(context.QueryInterface(IID_PPV_ARGS(extended.GetAddressOf()))))
         extended->PSGetConstantBuffers1(0, 1, buffer.GetAddressOf(), &first, &count);
     else context.PSGetConstantBuffers(0, 1, buffer.GetAddressOf());
+    if (evidence)
+    {
+        evidence->controls.resource = reinterpret_cast<std::uintptr_t>(buffer.Get());
+        evidence->controls.first = first;
+        evidence->controls.count = count;
+    }
     // 此程序固定105个register；非零first需要另一组CPU绝对偏移，不能借base0的镜像。
-    if (!buffer || first != 0 || count < 105) return {};
+    if (!accept_if(evidence, buffer.Get() != nullptr, DrawReason::cb_missing) ||
+        !accept_if(evidence, first == 0 && count >= 105, DrawReason::cb_range)) return {};
     auto shadow = constants(buffer.Get());
-    if (!shadow) return {};
+    if (!accept_if(evidence, shadow.Get() != nullptr, DrawReason::cb_shadow_missing)) return {};
     std::lock_guard lock(shadow->mutex);
-    if (shadow->mapped || shadow->known != 7 || shadow->epoch != epoch)
-        return {};
+    if (evidence)
+    {
+        auto &out = evidence->controls;
+        out.shadow_present = true;
+        out.mapped = shadow->mapped != nullptr;
+        out.known = shadow->known;
+        out.epoch = shadow->epoch;
+        out.version_begin = shadow->version;
+        out.values = shadow->values;
+    }
+    if (!accept_if(evidence, !shadow->mapped, DrawReason::cb_mapped) ||
+        !accept_if(evidence, shadow->known == 7, DrawReason::cb_unknown) ||
+        !accept_if(evidence, shadow->epoch == epoch, DrawReason::cb_epoch)) return {};
     const auto &[mode, gamma, overlay] = shadow->values;
-    if (!std::isfinite(mode) || !std::isfinite(gamma) || !std::isfinite(overlay) ||
-        mode > .5f || gamma != 1.f || overlay > .5f) return {};
+    if (!accept_if(evidence, std::isfinite(mode) && std::isfinite(gamma) && std::isfinite(overlay),
+        DrawReason::cb_controls_nonfinite) ||
+        !accept_if(evidence, mode <= .5f && gamma == 1.f && overlay <= .5f, DrawReason::cb_controls)) return {};
     version = shadow->version;
     return shadow;
 }
 
 bool geometry_bytes(ID3D11Buffer &buffer, UINT offset, void *out, UINT count, std::uint64_t epoch,
-    ComPtr<IUnknown> &witness, std::uint64_t &version) noexcept
+    ComPtr<IUnknown> &witness, std::uint64_t &version, DrawEvidence *evidence, unsigned slot) noexcept
 {
     auto shadow = private_object<Geometry>(&buffer, k_geometry);
-    if (!shadow) return false;
+    if (evidence)
+    {
+        auto &item = evidence->buffers[slot];
+        item.read_offset = offset;
+        item.read_bytes = count;
+        ++item.reads_checked;
+    }
+    if (!accept_if(evidence, shadow.Get() != nullptr, DrawReason::geometry_shadow_missing)) return false;
     std::lock_guard lock(shadow->mutex);
-    if (shadow->mapped || (!shadow->immutable && shadow->epoch != epoch) ||
-        offset > shadow->size || count > shadow->size - offset ||
-        std::find(shadow->known.begin() + offset, shadow->known.begin() + offset + count, false) !=
-            shadow->known.begin() + offset + count) return false;
-    if (witness && (witness.Get() != shadow.Get() || version != shadow->version)) return false;
+    if (evidence)
+    {
+        auto &item = evidence->buffers[slot];
+        item.shadow_present = true;
+        item.mapped = shadow->mapped != nullptr;
+        item.immutable = shadow->immutable;
+        item.epoch = shadow->epoch;
+        item.version_begin = shadow->version;
+    }
+    if (!accept_if(evidence, !shadow->mapped, DrawReason::geometry_mapped) ||
+        !accept_if(evidence, shadow->immutable || shadow->epoch == epoch, DrawReason::geometry_epoch) ||
+        !accept_if(evidence, offset <= shadow->size && count <= shadow->size - offset,
+            DrawReason::geometry_range)) return false;
+    if (!accept_if(evidence,
+        std::find(shadow->known.begin() + offset, shadow->known.begin() + offset + count, false) ==
+            shadow->known.begin() + offset + count, DrawReason::geometry_unknown) ||
+        !accept_if(evidence, !witness || (witness.Get() == shadow.Get() && version == shadow->version),
+            DrawReason::geometry_version)) return false;
     witness = shadow;
     version = shadow->version;
     std::memcpy(out, shadow->bytes.data() + offset, count);
+    if (evidence) ++evidence->buffers[slot].reads_passed;
     return true;
 }
 
 bool fullscreen_geometry(ID3D11DeviceContext &context, bool indexed, UINT start, INT base,
-    std::uint64_t epoch, ComPtr<IUnknown> (&witness)[2], std::uint64_t (&versions)[2]) noexcept
+    std::uint64_t epoch, ComPtr<IUnknown> (&witness)[2], std::uint64_t (&versions)[2],
+    DrawEvidence *evidence) noexcept
 {
     ComPtr<ID3D11VertexShader> vertex;
     context.VSGetShader(vertex.GetAddressOf(), nullptr, nullptr);
     UINT known = 0, size = sizeof(known);
-    if (!vertex || FAILED(vertex->GetPrivateData(k_vertex, &size, &known)) || known != 1) return false;
+    if (evidence) evidence->vertex_shader = reinterpret_cast<std::uintptr_t>(vertex.Get());
+    if (!accept_if(evidence, vertex && SUCCEEDED(vertex->GetPrivateData(k_vertex, &size, &known)) && known == 1,
+        DrawReason::vertex_program)) return false;
     ComPtr<ID3D11InputLayout> layout;
     context.IAGetInputLayout(layout.GetAddressOf());
+    if (evidence)
+    {
+        evidence->layout = reinterpret_cast<std::uintptr_t>(layout.Get());
+        UINT bytes = sizeof(evidence->layout_metadata);
+        evidence->layout_observed = layout && SUCCEEDED(layout->GetPrivateData(k_layout_evidence,
+            &bytes, &evidence->layout_metadata));
+    }
+    if (!accept_if(evidence, layout.Get() != nullptr, DrawReason::layout_missing)) return false;
     Position position;
     size = sizeof(position);
-    if (!layout || FAILED(layout->GetPrivateData(k_layout, &size, &position))) return false;
+    if (!accept_if(evidence, SUCCEEDED(layout->GetPrivateData(k_layout, &size, &position)),
+        DrawReason::layout_untracked)) return false;
+    if (evidence)
+    {
+        evidence->position_slot = position.slot;
+        evidence->position_offset = position.offset;
+        evidence->position_bytes = position.bytes;
+    }
     D3D11_PRIMITIVE_TOPOLOGY topology {};
     context.IAGetPrimitiveTopology(&topology);
-    if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) return false;
+    if (evidence) evidence->topology = topology;
+    if (!accept_if(evidence, topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, DrawReason::topology))
+        return false;
     ComPtr<ID3D11Buffer> vertices, indices;
     UINT stride = 0, offset = 0, index_offset = 0;
     context.IAGetVertexBuffers(position.slot, 1, vertices.GetAddressOf(), &stride, &offset);
-    if (!vertices || stride < position.offset + position.bytes) return false;
+    if (evidence)
+    {
+        evidence->vertex_stride = stride;
+        evidence->vertex_offset = offset;
+        evidence->buffers[0].resource = reinterpret_cast<std::uintptr_t>(vertices.Get());
+        if (vertices) { vertices->GetDesc(&evidence->buffers[0].desc); evidence->buffers[0].desc_observed = true; }
+    }
+    if (!accept_if(evidence, vertices.Get() != nullptr, DrawReason::vertex_buffer) ||
+        !accept_if(evidence, stride >= position.offset + position.bytes, DrawReason::vertex_stride)) return false;
     DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
     if (indexed) context.IAGetIndexBuffer(indices.GetAddressOf(), &index_format, &index_offset);
+    if (evidence)
+    {
+        evidence->index_format = index_format;
+        evidence->index_offset = index_offset;
+        evidence->buffers[1].resource = reinterpret_cast<std::uintptr_t>(indices.Get());
+        if (indices) { indices->GetDesc(&evidence->buffers[1].desc); evidence->buffers[1].desc_observed = true; }
+    }
     const UINT index_size = index_format == DXGI_FORMAT_R16_UINT ? 2u : index_format == DXGI_FORMAT_R32_UINT ? 4u : 0;
-    if (indexed && (!indices || !index_size)) return false;
+    if (indexed && (!accept_if(evidence, indices.Get() != nullptr, DrawReason::index_buffer) ||
+        !accept_if(evidence, index_size != 0, DrawReason::index_format))) return false;
     std::array<std::array<float, 2>, 3> points;
     for (UINT i = 0; i < 3; ++i)
     {
         std::int64_t index = static_cast<std::int64_t>(start) + i;
         if (indexed)
         {
-            const auto index_address = static_cast<std::uint64_t>(index_offset) + index * index_size;
             UINT value = 0;
-            if (index_address > UINT_MAX || !geometry_bytes(*indices.Get(), static_cast<UINT>(index_address),
-                &value, index_size, epoch, witness[1], versions[1])) return false;
+            const std::uint64_t byte = static_cast<std::uint64_t>(index_offset) +
+                (static_cast<std::uint64_t>(start) + i) * index_size;
+            if (!accept_if(evidence, byte <= UINT_MAX, DrawReason::geometry_range) ||
+                !geometry_bytes(*indices.Get(), static_cast<UINT>(byte), &value, index_size, epoch,
+                    witness[1], versions[1], evidence, 1)) return false;
             index = static_cast<std::int64_t>(value) + base;
         }
+        if (evidence) evidence->indices[i] = index;
         const auto address = static_cast<std::int64_t>(offset) + index * stride + position.offset;
-        if (index < 0 || address < 0 || address > UINT_MAX ||
+        if (!accept_if(evidence, index >= 0 && address >= 0 && address <= UINT_MAX,
+            DrawReason::geometry_range) ||
             !geometry_bytes(*vertices.Get(), static_cast<UINT>(address), points[i].data(), sizeof(points[i]),
-                epoch, witness[0], versions[0]))
-            return false;
-        if (!std::isfinite(points[i][0]) || !std::isfinite(points[i][1])) return false;
+                epoch, witness[0], versions[0], evidence, 0)) return false;
+        if (evidence) evidence->points[i] = points[i];
+        if (!accept_if(evidence, std::isfinite(points[i][0]) && std::isfinite(points[i][1]),
+            DrawReason::geometry_nonfinite)) return false;
     }
-    const auto cross = [](const auto &a, const auto &b, const auto &p)
-    { return (double(b[0]) - a[0]) * (double(p[1]) - a[1]) - (double(b[1]) - a[1]) * (double(p[0]) - a[0]); };
+    const auto cross = [](const auto &a, const auto &b, const auto &point)
+    { return (double(b[0]) - a[0]) * (double(point[1]) - a[1]) - (double(b[1]) - a[1]) * (double(point[0]) - a[0]); };
     const double area = cross(points[0], points[1], points[2]);
-    if (!std::isfinite(area) || area == 0) return false;
+    if (!accept_if(evidence, std::isfinite(area) && area != 0, DrawReason::geometry_degenerate)) return false;
     constexpr std::array<std::array<float, 2>, 4> corners {{{-1,-1}, {-1,1}, {1,-1}, {1,1}}};
-    for (const auto &corner : corners)
+    for (unsigned c = 0; c < corners.size(); ++c)
+    {
         for (unsigned i = 0; i < 3; ++i)
-            if (cross(points[i], points[(i + 1) % 3], corner) * area < 0) return false;
+            if (!accept_if(evidence, !(cross(points[i], points[(i + 1) % 3], corners[c]) * area < 0),
+                DrawReason::geometry_coverage)) return false;
+        if (evidence) evidence->corners |= 1u << c;
+    }
     return true;
 }
 
-bool full_output(ID3D11DeviceContext &context, const Target &target) noexcept
+bool full_output(ID3D11DeviceContext &context, const Target &target, DrawEvidence *evidence) noexcept
 {
     UINT count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
     std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports;
     context.RSGetViewports(&count, viewports.data());
-    if (count != 1 || viewports[0].TopLeftX != 0 || viewports[0].TopLeftY != 0 ||
-        viewports[0].Width != target.texture.Width || viewports[0].Height != target.texture.Height ||
-        viewports[0].MinDepth != 0 || viewports[0].MaxDepth != 1) return false;
+    if (!accept_if(evidence, count == 1 && viewports[0].TopLeftX == 0 && viewports[0].TopLeftY == 0 &&
+        viewports[0].Width == target.texture.Width && viewports[0].Height == target.texture.Height &&
+        viewports[0].MinDepth == 0 && viewports[0].MaxDepth == 1, DrawReason::viewport)) return false;
     ComPtr<ID3D11RasterizerState> raster;
     context.RSGetState(raster.GetAddressOf());
-    if (!raster) return false; // 默认背面剔除需要另证绕序，当前不猜。
+    if (!accept_if(evidence, raster.Get() != nullptr, DrawReason::rasterizer)) return false; // 默认剔除不猜。
     D3D11_RASTERIZER_DESC rd {};
     raster->GetDesc(&rd);
-    if (rd.FillMode != D3D11_FILL_SOLID || rd.CullMode != D3D11_CULL_NONE) return false;
+    if (!accept_if(evidence, rd.FillMode == D3D11_FILL_SOLID && rd.CullMode == D3D11_CULL_NONE,
+        DrawReason::rasterizer)) return false;
     ComPtr<ID3D11RasterizerState2> raster2;
     if (SUCCEEDED(raster.As(&raster2)))
     {
         D3D11_RASTERIZER_DESC2 extended {};
         raster2->GetDesc2(&extended);
-        if (extended.ConservativeRaster != D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF ||
-            extended.ForcedSampleCount != 0) return false;
+        if (!accept_if(evidence, extended.ConservativeRaster == D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF &&
+            extended.ForcedSampleCount == 0, DrawReason::rasterizer_extended)) return false;
     }
     if (rd.ScissorEnable)
     {
         std::array<D3D11_RECT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> rectangles;
         count = static_cast<UINT>(rectangles.size());
         context.RSGetScissorRects(&count, rectangles.data());
-        if (count != 1 || rectangles[0].left > 0 || rectangles[0].top > 0 ||
-            rectangles[0].right < static_cast<LONG>(target.texture.Width) ||
-            rectangles[0].bottom < static_cast<LONG>(target.texture.Height)) return false;
+        if (!accept_if(evidence, count == 1 && rectangles[0].left <= 0 && rectangles[0].top <= 0 &&
+            rectangles[0].right >= static_cast<LONG>(target.texture.Width) &&
+            rectangles[0].bottom >= static_cast<LONG>(target.texture.Height), DrawReason::scissor)) return false;
     }
     ComPtr<ID3D11DepthStencilState> depth;
     context.OMGetDepthStencilState(depth.GetAddressOf(), nullptr);
-    if (!depth) return false;
+    if (!accept_if(evidence, depth.Get() != nullptr, DrawReason::depth_stencil)) return false;
     D3D11_DEPTH_STENCIL_DESC dd {};
     depth->GetDesc(&dd);
-    if (dd.StencilEnable || (dd.DepthEnable && dd.DepthFunc != D3D11_COMPARISON_ALWAYS)) return false;
+    if (!accept_if(evidence, !dd.StencilEnable && (!dd.DepthEnable || dd.DepthFunc == D3D11_COMPARISON_ALWAYS),
+        DrawReason::depth_stencil)) return false;
     ComPtr<ID3D11Predicate> predicate;
     context.GetPredication(predicate.GetAddressOf(), nullptr);
-    if (predicate) return false;
+    if (!accept_if(evidence, !predicate, DrawReason::predication)) return false;
     ComPtr<ID3D11GeometryShader> geometry;
     ComPtr<ID3D11HullShader> hull;
     ComPtr<ID3D11DomainShader> domain;
     context.GSGetShader(geometry.GetAddressOf(), nullptr, nullptr);
     context.HSGetShader(hull.GetAddressOf(), nullptr, nullptr);
     context.DSGetShader(domain.GetAddressOf(), nullptr, nullptr);
-    return !geometry && !hull && !domain;
+    return accept_if(evidence, !geometry && !hull && !domain, DrawReason::extra_shader_stage);
 }
 
 void opaque_commands() noexcept { ++g_opaque_epoch; }
@@ -477,29 +581,49 @@ HRESULT STDMETHODCALLTYPE create_layout(ID3D11Device *device, const D3D11_INPUT_
 {
     const auto result = LayoutRoute {}(device, elements, count, bytecode, bytes, out);
     if (FAILED(result) || !out || !*out || !program_matches(bytecode, bytes, true)) return result;
+    // 只在匹配VS的冷路径保存有界数值元数据；不保存SemanticName借用指针。
+    LayoutEvidence metadata;
+    metadata.count = count;
+    for (UINT i = 0; i < count && i < metadata.elements.size(); ++i)
+    {
+        const auto &item = elements[i];
+        metadata.elements[i] = {item.SemanticName && _stricmp(item.SemanticName, "POSITION") == 0 &&
+            item.SemanticIndex == 0, item.SemanticIndex, item.InputSlot, item.AlignedByteOffset,
+            static_cast<UINT>(item.InputSlotClass), item.InstanceDataStepRate, item.Format};
+    }
     std::array<UINT, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> next {};
     Position position;
     bool found = false;
-    for (UINT i = 0; i < count; ++i)
+    const auto remember = [&]
     {
-        const auto &element = elements[i];
-        const UINT width = element.Format == DXGI_FORMAT_R32G32_FLOAT ? 8u :
-            element.Format == DXGI_FORMAT_R32G32B32_FLOAT ? 12u :
-            element.Format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 0u;
-        if (element.InputSlot >= next.size() || !width) return result;
-        const UINT offset = element.AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT ?
-            next[element.InputSlot] : element.AlignedByteOffset;
-        if (offset > 4096 - width) return result;
-        next[element.InputSlot] = offset + width;
-        if (element.SemanticName && _stricmp(element.SemanticName, "POSITION") == 0 && element.SemanticIndex == 0)
+        for (UINT i = 0; i < count; ++i)
         {
-            if (found || element.InputSlotClass != D3D11_INPUT_PER_VERTEX_DATA || element.InstanceDataStepRate)
-                return result;
-            position = {element.InputSlot, offset, width};
-            found = true;
+            metadata.inspected = i + 1;
+            metadata.rejected_element = i;
+            const auto &element = elements[i];
+            const UINT width = element.Format == DXGI_FORMAT_R32G32_FLOAT ? 8u :
+                element.Format == DXGI_FORMAT_R32G32B32_FLOAT ? 12u :
+                element.Format == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 0u;
+            if (element.InputSlot >= next.size() || !width)
+                { metadata.reason = LayoutReason::unsupported_element; return; }
+            const UINT offset = element.AlignedByteOffset == D3D11_APPEND_ALIGNED_ELEMENT ?
+                next[element.InputSlot] : element.AlignedByteOffset;
+            if (offset > 4096 - width) { metadata.reason = LayoutReason::offset_range; return; }
+            next[element.InputSlot] = offset + width;
+            if (element.SemanticName && _stricmp(element.SemanticName, "POSITION") == 0 && element.SemanticIndex == 0)
+            {
+                if (found || element.InputSlotClass != D3D11_INPUT_PER_VERTEX_DATA || element.InstanceDataStepRate)
+                    { metadata.reason = LayoutReason::position_rate; return; }
+                position = {element.InputSlot, offset, width};
+                found = true;
+            }
         }
-    }
-    if (found) (*out)->SetPrivateData(k_layout, sizeof(position), &position);
+        metadata.rejected_element = UINT_MAX;
+        metadata.reason = found ? LayoutReason::accepted : LayoutReason::missing_position;
+        if (found) (*out)->SetPrivateData(k_layout, sizeof(position), &position);
+    };
+    remember();
+    (*out)->SetPrivateData(k_layout_evidence, sizeof(metadata), &metadata);
     return result;
 }
 }
@@ -730,48 +854,89 @@ void unordered_write(ID3D11DeviceContext &context) noexcept
 DrawWrite begin_draw(ID3D11DeviceContext &context, UINT elements) noexcept
 { return begin_draw(context, elements, false, 0, 0); }
 
-DrawWrite begin_draw(ID3D11DeviceContext &context, UINT elements, bool indexed, UINT start, INT base) noexcept
+DrawWrite begin_draw(ID3D11DeviceContext &context, UINT elements, bool indexed, UINT start, INT base,
+    DrawEvidence *evidence) noexcept
 {
     DrawWrite result;
-    if (!enabled()) return result;
+    result.evidence_ = evidence;
+    if (evidence)
+    {
+        *evidence = {};
+        evidence->context = reinterpret_cast<std::uintptr_t>(&context);
+        evidence->elements = elements;
+        evidence->indexed = indexed;
+        evidence->start = start;
+        evidence->base = base;
+    }
+    checking(evidence, DrawGate::enabled);
+    if (!accept_if(evidence, enabled(), DrawReason::disabled)) return result;
+    passed(evidence, DrawGate::enabled);
     const auto epoch = g_opaque_epoch.load(std::memory_order_acquire);
+    if (evidence) evidence->begin_epoch = epoch;
+    checking(evidence, DrawGate::execution);
     auto execution = private_object<Execution>(&context, k_execution);
-    if (!execution) return result;
+    if (!accept_if(evidence, execution.Get() != nullptr, DrawReason::context_untracked)) return result;
+    passed(evidence, DrawGate::execution);
     std::lock_guard lock(execution->mutex);
     for (auto &target : execution->targets) if (target.contents) target.contents->overwritten();
     for (auto &value : execution->graphics_uavs) if (value) value->overwritten();
     auto &target = execution->targets[0];
-    if (elements != 3 || !target.contents || context.GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
-        (target.view.Format != DXGI_FORMAT_R8G8B8A8_UNORM && target.view.Format != DXGI_FORMAT_B8G8R8A8_UNORM) ||
-        target.view.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || target.view.Texture2D.MipSlice != 0)
-        return result;
+    if (evidence)
+    {
+        evidence->owner = execution->owner;
+        evidence->target_resource = target.resource;
+        evidence->target_format = target.view.Format;
+        evidence->target_width = target.texture.Width;
+        evidence->target_height = target.texture.Height;
+    }
+    checking(evidence, DrawGate::target);
+    if (!accept_if(evidence, elements == 3, DrawReason::draw_count) ||
+        !accept_if(evidence, target.contents.Get() != nullptr, DrawReason::target_untracked) ||
+        !accept_if(evidence, context.GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE, DrawReason::context_deferred) ||
+        !accept_if(evidence, (target.view.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+            target.view.Format == DXGI_FORMAT_B8G8R8A8_UNORM) &&
+            target.view.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D && target.view.Texture2D.MipSlice == 0,
+            DrawReason::target_view)) return result;
+    passed(evidence, DrawGate::target);
+    checking(evidence, DrawGate::pixel);
     ComPtr<ID3D11PixelShader> shader;
     context.PSGetShader(shader.GetAddressOf(), nullptr, nullptr);
     UINT recognized = 0, size = sizeof(recognized);
-    if (!shader || FAILED(shader->GetPrivateData(k_program, &size, &recognized)) || recognized != 1) return result;
-    auto shadow = srgb_controls(context, result.constants_version_, epoch);
-    if (!shadow || !full_output(context, target) || !fullscreen_geometry(context, indexed, start, base, epoch,
-        result.geometry_, result.geometry_versions_))
-        return result;
+    if (!accept_if(evidence, shader && SUCCEEDED(shader->GetPrivateData(k_program, &size, &recognized)) &&
+        recognized == 1, DrawReason::pixel_program)) return result;
+    passed(evidence, DrawGate::pixel);
+    checking(evidence, DrawGate::controls);
+    auto shadow = srgb_controls(context, result.constants_version_, epoch, evidence);
+    if (!shadow) return result;
+    passed(evidence, DrawGate::controls);
+    checking(evidence, DrawGate::coverage);
+    if (!full_output(context, target, evidence)) return result;
+    passed(evidence, DrawGate::coverage);
+    checking(evidence, DrawGate::geometry);
+    if (!fullscreen_geometry(context, indexed, start, base, epoch, result.geometry_, result.geometry_versions_,
+        evidence)) return result;
+    passed(evidence, DrawGate::geometry);
     result.constants_ = shadow;
+    checking(evidence, DrawGate::blend);
     ComPtr<ID3D11BlendState> blend;
     UINT sample_mask = 0;
     context.OMGetBlendState(blend.GetAddressOf(), nullptr, &sample_mask);
-    if (sample_mask != ~0u) return result;
+    if (!accept_if(evidence, sample_mask == ~0u, DrawReason::sample_mask)) return result;
     if (blend)
     {
         D3D11_BLEND_DESC desc {};
         blend->GetDesc(&desc);
-        if (desc.AlphaToCoverageEnable || desc.RenderTarget[0].BlendEnable ||
-            (desc.RenderTarget[0].RenderTargetWriteMask & 7) != 7) return result;
+        if (!accept_if(evidence, !desc.AlphaToCoverageEnable && !desc.RenderTarget[0].BlendEnable &&
+            (desc.RenderTarget[0].RenderTargetWriteMask & 7) == 7, DrawReason::blend)) return result;
         ComPtr<ID3D11BlendState1> extended;
         if (SUCCEEDED(blend.As(&extended)))
         {
             D3D11_BLEND_DESC1 desc1 {};
             extended->GetDesc1(&desc1);
-            if (desc1.RenderTarget[0].LogicOpEnable) return result;
+            if (!accept_if(evidence, !desc1.RenderTarget[0].LogicOpEnable, DrawReason::logic_op)) return result;
         }
     }
+    passed(evidence, DrawGate::blend);
     result.record_ = target.contents;
     result.owner_ = execution->owner;
     result.epoch_ = epoch;
@@ -779,12 +944,16 @@ DrawWrite begin_draw(ID3D11DeviceContext &context, UINT elements, bool indexed, 
         std::lock_guard contents_lock(target.contents->mutex);
         result.serial_ = target.contents->serial;
     }
+    if (evidence) { evidence->serial_begin = result.serial_; evidence->reason = DrawReason::awaiting_return; }
     return result;
 }
 
 void DrawWrite::returned() noexcept
 {
-    if (!record_) return;
+    auto *evidence = evidence_;
+    evidence_ = nullptr;
+    if (!record_) return; // 保留begin的首个拒绝原因，未求值的返回检查不冒充失败。
+    checking(evidence, DrawGate::returned);
     auto *contents = static_cast<Contents *>(record_.Get());
     auto *shadow = static_cast<Constants *>(constants_.Get());
     for (unsigned i = 0; i < 2; ++i)
@@ -792,30 +961,85 @@ void DrawWrite::returned() noexcept
         auto *geometry = static_cast<Geometry *>(geometry_[i].Get());
         if (!geometry) continue;
         std::lock_guard geometry_lock(geometry->mutex);
-        if (geometry->mapped || geometry->version != geometry_versions_[i]) { record_.Reset(); return; }
+        if (evidence) evidence->buffers[i].version_return = geometry->version;
+        if (!accept_if(evidence, !geometry->mapped, DrawReason::return_geometry_mapped) ||
+            !accept_if(evidence, geometry->version == geometry_versions_[i], DrawReason::return_geometry_version))
+            { record_.Reset(); return; }
     }
     std::lock_guard constants_lock(shadow->mutex);
     std::lock_guard lock(contents->mutex);
-    if (contents->serial == serial_ && epoch_ == g_opaque_epoch.load(std::memory_order_relaxed) &&
-        shadow->version == constants_version_ && !shadow->mapped && shadow->known == 7)
+    if (evidence)
     {
-        contents->srgb = true;
-        contents->owner = owner_;
-        contents->epoch = epoch_;
-        contents->constants_version = constants_version_;
+        evidence->serial_return = contents->serial;
+        evidence->controls.version_return = shadow->version;
+    }
+    if (accept_if(evidence, contents->serial == serial_, DrawReason::return_serial))
+    {
+        const auto current = g_opaque_epoch.load(std::memory_order_relaxed);
+        if (evidence) evidence->return_epoch = current;
+        if (accept_if(evidence, epoch_ == current, DrawReason::return_epoch) &&
+            accept_if(evidence, shadow->version == constants_version_, DrawReason::return_cb_version) &&
+            accept_if(evidence, !shadow->mapped, DrawReason::return_cb_mapped) &&
+            accept_if(evidence, shadow->known == 7, DrawReason::return_cb_unknown))
+        {
+            contents->srgb = true;
+            contents->owner = owner_;
+            contents->epoch = epoch_;
+            contents->constants_version = constants_version_;
+            passed(evidence, DrawGate::returned);
+            if (evidence) evidence->reason = DrawReason::certified;
+        }
     }
     record_.Reset();
 }
 
-interop::ColorTransfer take_transfer(ID3D11DeviceContext &context, ID3D11Texture2D &source) noexcept
+interop::ColorTransfer take_transfer(ID3D11DeviceContext &context, ID3D11Texture2D &source,
+    ConsumeEvidence *evidence) noexcept
 {
-    if (!enabled()) return interop::ColorTransfer::unknown;
+    if (evidence)
+    {
+        *evidence = {};
+        evidence->context = reinterpret_cast<std::uintptr_t>(&context);
+        evidence->source_resource = reinterpret_cast<std::uintptr_t>(&source);
+    }
+    if (!enabled())
+    {
+        if (evidence) evidence->reason = ConsumeReason::disabled;
+        return interop::ColorTransfer::unknown;
+    }
     auto contents = private_object<Contents>(&source, k_contents);
     auto execution = private_object<Execution>(&context, k_execution);
-    if (!contents || !execution) return interop::ColorTransfer::unknown;
+    if (evidence)
+    {
+        evidence->contents_present = contents.Get() != nullptr;
+        evidence->execution_present = execution.Get() != nullptr;
+    }
+    if (!contents || !execution)
+    {
+        if (evidence) evidence->reason = !contents ? ConsumeReason::source_untracked : ConsumeReason::context_untracked;
+        return interop::ColorTransfer::unknown;
+    }
     std::lock_guard lock(contents->mutex);
-    const bool current = contents->srgb && contents->owner == execution->owner &&
-        contents->epoch == g_opaque_epoch.load(std::memory_order_relaxed);
+    // 同一次锁内决策与消费一起保存；诊断不能额外take或在锁外重读证书。
+    const auto current_epoch = (evidence || (contents->srgb && contents->owner == execution->owner)) ?
+        g_opaque_epoch.load(std::memory_order_relaxed) : 0;
+    const bool current = contents->srgb && contents->owner == execution->owner && contents->epoch == current_epoch;
+    if (evidence)
+    {
+        evidence->owner = execution->owner;
+        evidence->certificate_owner = contents->owner;
+        evidence->current_epoch = current_epoch;
+        evidence->certificate_epoch = contents->epoch;
+        evidence->serial = contents->serial;
+        evidence->was_srgb = contents->srgb;
+        evidence->owner_matches = contents->owner == execution->owner;
+        evidence->epoch_matches = current_epoch && contents->epoch == current_epoch;
+        evidence->certificate_cleared = contents->owner == execution->owner;
+        evidence->transfer = current ? interop::ColorTransfer::srgb : interop::ColorTransfer::unknown;
+        evidence->reason = !contents->srgb ? ConsumeReason::uncertified :
+            contents->owner != execution->owner ? ConsumeReason::owner_mismatch :
+            contents->epoch != current_epoch ? ConsumeReason::epoch_mismatch : ConsumeReason::accepted;
+    }
     // 同一writer只能授权一次本桥消费，不让未重写的旧generation自动成为下一帧证书。
     if (contents->owner == execution->owner) contents->srgb = false;
     return current ? interop::ColorTransfer::srgb : interop::ColorTransfer::unknown;

@@ -74,6 +74,7 @@ tools/*
 !tools/FpsUnlockInstaller/**
 !tools/fsr2-dump-analyze.py
 !tools/Test-NeoProviders.ps1
+!tools/Test-BridgeCpuParity.ps1
 !tools/Test-NeoF6Interop.ps1
 
 !tools/Fetch-NgxHeaders.ps1
