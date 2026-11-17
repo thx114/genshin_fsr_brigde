@@ -9894,9 +9894,9 @@ UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
         // 2026-08-25（多实例修复）：状态按实例隔离。旧实现 = 全局代次门控 + 全局参数：
         // UI/次实例的 Render 会抬升全局代次并覆写全局参数 → 主 accumulate draw 偶发
         // 用错实例（jitter/frame/context key）或 gate 提前命中 → 原生帧漏出（无蓝框）+ 闪烁。
-        // 现在：hook 侧按实例存参数/代次；draw→实例 用"输出关联"（该实例写过的双缓冲
-        // 输出指针 r1a/r1b，确定性；实例重建后输出纹理复用，按"最新 Render 代次"裁决）
-        // + "尺寸+最新代次"bootstrap；每实例代次门控（每 Render 一次派发）。
+        // 现在：hook 侧按实例存参数/代次；draw→实例接受唯一资源归属或唯一兼容 token。
+        // 2026-11-17：多路归属歧义保留原 Draw 与各路 token，提交先后不能证明机位。
+        // 每实例代次门控仍保证每 Render 一次派发。
         struct Sdk234InstState
         {
             std::uint64_t instance = 0;
@@ -10074,6 +10074,8 @@ UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
         const bool p1_ghost_instance_present = live_count == 0 && saw_dormant_instance;
         const auto claim = neo::graphics::attribute_frame(std::span(evidence.data(), render.count),
             claim_color_ptr, render.observed_tick, k_p1_bootstrap_health_ms);
+        // 2026-11-17：歧义不是任一实例的帧。原 Draw 保留，不能先分配状态、交棒或消费别人的 token。
+        if (claim.path == neo::graphics::AttributionPath::Ambiguous) return UpscaleDrawResult::original;
         // 2026-11-16（PID44888）：尺寸不匹配既不消费 Render，也不推进实例/接管/历史状态。
         if (!claim.instance && std::none_of(render.entries.begin(), render.entries.begin() + render.count,
             [](const auto &entry) { return entry.dimensions_match; })) return UpscaleDrawResult::original;
@@ -12095,6 +12097,11 @@ bool try_spatial_copy_draw(ID3D11DeviceContext *context, UINT element_count, Dra
 bool fsr2_family_should_skip_draw(ID3D11DeviceContext *context)
 {
     if (!g_config.fsr2_family_skip)
+        return false;
+    // 2026-11-17（多机位交错回退）：Render 可以在本帧 prepass 后、accumulate 前到来。
+    // 上一帧成功或此刻只有一个 token 都不能保证稍后的归属唯一；原生回退必须保有本帧输入。
+    // token 归属路径始终执行原生 prepass，避免为预测未来 Render 再维护一套状态或同步。
+    if (g_config.ffx12 && il2cpp_callsite::active())
         return false;
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
     // ★ T-6 第二道 fail-open gate（SDS §3.3.3 / D9，**主要放手点**）：

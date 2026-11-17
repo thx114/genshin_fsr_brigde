@@ -58,6 +58,7 @@ struct Feature
 std::array<Feature, il2cpp_callsite::k_render_instance_capacity> g_features {};
 Parameters g_params, g_query;
 unsigned g_params_count = 0, g_created = 0, g_released = 0, g_evaluated = 0, g_frame = 0;
+unsigned g_attempted = 0;
 std::array<std::uint64_t, k_scene_count> g_keys {};
 std::array<std::uint64_t, k_scene_count> g_last_evaluate_tick {};
 
@@ -90,6 +91,7 @@ extern "C" __declspec(dllexport) void ConfigureMultiSceneFixture(const std::uint
     std::copy_n(keys, g_keys.size(), g_keys.begin());
 }
 extern "C" __declspec(dllexport) void SelectMultiSceneFrame(unsigned frame) noexcept { g_frame = frame; }
+extern "C" __declspec(dllexport) unsigned MultiSceneAttempts() noexcept { return g_attempted; }
 extern "C" __declspec(dllexport) bool MultiSceneComplete() noexcept
 {
     std::printf("multi scene: delivered=%u expected=%zu created=%u released=%u\n",
@@ -159,6 +161,7 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
     neo::ngx::F6EvalReceiptV1 *receipt)
 {
     using namespace neo::interop;
+    ++g_attempted;
     if (!context || !params || !receipt || g_frame >= std::size(k_frames) || g_frame != g_evaluated)
         return NVSDK_NGX_Result_Fail;
     auto *feature = static_cast<Feature *>(nullptr);

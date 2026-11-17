@@ -47,6 +47,7 @@ struct RenderToken
 };
 
 inline constexpr std::size_t k_render_instance_capacity = 8;
+inline constexpr std::uint64_t k_render_token_lifetime_ms = 250;
 
 struct RenderSnapshot
 {

@@ -482,7 +482,6 @@ bool last_params_for(std::uint64_t instance, CapturedParams &out, std::uint64_t 
 RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t render_h,
     std::uint32_t display_w, std::uint32_t display_h)
 {
-    constexpr std::uint64_t k_token_lifetime_ms = 250;
     RenderSnapshot snapshot;
     std::lock_guard lock(g_inst_mutex);
     snapshot.observed_tick = GetTickCount64();
@@ -501,7 +500,7 @@ RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t rend
         for (const auto &token : entry.pending)
         {
             if (!token.generation || token.capture_tick > snapshot.observed_tick ||
-                snapshot.observed_tick - token.capture_tick > k_token_lifetime_ms ||
+                snapshot.observed_tick - token.capture_tick > k_render_token_lifetime_ms ||
                 !matches(token.params))
                 continue;
             // 连续记录多帧时按捕获顺序推进历史，不能用最新 token 跳过同实例的较早帧。

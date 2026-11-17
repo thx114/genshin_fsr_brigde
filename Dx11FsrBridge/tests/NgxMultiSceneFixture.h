@@ -37,4 +37,5 @@ inline constexpr std::uint32_t color(unsigned frame)
 using Configure = void (*)(const std::uint64_t *keys) noexcept;
 using Select = void (*)(unsigned frame) noexcept;
 using Complete = bool (*)() noexcept;
+using Attempts = unsigned (*)() noexcept;
 }

@@ -557,6 +557,14 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME NgxMultiSceneIntegration COMMAND ProviderFrameHost ngx-multi-scene
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:NgxMultiSceneProvider>")
+        foreach(order IN ITEMS forward reverse)
+            add_test(NAME NgxMultiSceneCold-${order} COMMAND ProviderFrameHost ngx-multi-scene-cold-${order}
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:NgxMultiSceneProvider>")
+            set_tests_properties(NgxMultiSceneCold-${order} PROPERTIES TIMEOUT 45)
+            add_test(NAME NgxMultiSceneHalf-${order} COMMAND ProviderFrameHost ngx-multi-scene-half-${order}
+                "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:NgxMultiSceneProvider>")
+            set_tests_properties(NgxMultiSceneHalf-${order} PROPERTIES TIMEOUT 45)
+        endforeach()
         add_test(NAME NgxFailureRecoveryIntegration COMMAND ProviderFrameHost ngx-failure-recovery
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME NgxGuideViewsIntegration COMMAND ProviderFrameHost ngx-guide-views

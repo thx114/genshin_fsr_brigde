@@ -1,5 +1,4 @@
 #include "FrameAttribution.h"
-#include "../Fsr2FamilyTakeover.h"
 
 namespace neo::graphics
 {
@@ -12,55 +11,75 @@ Attribution attribute_frame(std::span<const FrameEvidence> candidates, std::uint
     std::uint64_t now, std::uint64_t source_memory_ms)
 {
     using Entry = il2cpp_callsite::RenderSnapshot::Entry;
-    const Entry *output_match = nullptr, *source_match = nullptr, *possible = nullptr, *latest = nullptr;
-    const auto consider = [](const Entry *&best, const Entry &candidate)
+    struct Matches
     {
-        if (!best || candidate.pending.generation > best->pending.generation) best = &candidate;
+        const Entry *entry = nullptr;
+        std::uint32_t count = 0;
+
+        void add(const Entry &candidate)
+        {
+            entry = &candidate;
+            ++count;
+        }
     };
+    Matches owners, outputs, sources, intersection, pending;
     Attribution result;
-    bool shared_output = false;
     for (const auto &evidence : candidates)
     {
         const auto &capture = *evidence.capture;
         if (!capture.dimensions_match) continue;
-        if (evidence.owns_target)
-        {
-            if (!result.unique_output_owner) result.unique_output_owner = capture.instance;
-            else if (result.unique_output_owner != capture.instance) shared_output = true;
-        }
+        if (evidence.owns_target) owners.add(capture);
         if (!capture.pending.generation) continue;
-        if (evidence.owns_target) consider(output_match, capture);
+        pending.add(capture);
+        const bool source_fresh = recently_observed(evidence.last_write_tick, now, source_memory_ms);
+        const bool source_matches = color && evidence.previous_color == color && source_fresh;
+        if (evidence.owns_target) outputs.add(capture);
+        if (source_matches) sources.add(capture);
+        if (evidence.owns_target && source_matches) intersection.add(capture);
         if (evidence.live) ++result.live_candidates;
         else ++result.dormant_candidates;
-        consider(latest, capture);
-        if (!color) continue;
-        if (evidence.previous_color == color) consider(source_match, capture);
-        else if (!fsr2_family_takeover::p1_exclude_candidate_by_source(evidence.previous_color != 0, false,
-                     recently_observed(evidence.last_write_tick, now, source_memory_ms)))
-            consider(possible, capture);
     }
-    // 两实例曾写同一纹理时仍可用新 token，但历史关联本身不足以授权无 token 的修复。
-    if (shared_output) result.unique_output_owner = 0;
-    if (output_match)
+    if (owners.count == 1) result.unique_output_owner = owners.entry->instance;
+
+    // 同一输出可以被相机依次复用；无 token 的旧 owner 只参与重复输出修复，不否决真实新 Render。
+    if (!pending.count)
     {
-        result.instance = output_match->instance;
-        result.token = output_match->pending;
-        result.path = AttributionPath::OutputWithToken;
-        result.live_candidates = result.dormant_candidates = 0;
+        if (result.unique_output_owner)
+        {
+            result.instance = result.unique_output_owner;
+            result.path = AttributionPath::RepairOnly;
+        }
+        else if (owners.count) result.path = AttributionPath::Ambiguous;
+        return result;
     }
-    else if (latest)
+
+    // 2026-11-17：冷启动同尺寸正序宿主把 A 归入 B，generation 仅表示提交先后，不能证明机位。
+    // 先合并正面资源证据；共享或冲突时必须唯一相交，不能由较新的 token 覆盖另一机位的归属。
+    const Entry *chosen = nullptr;
+    if (outputs.count && sources.count)
     {
-        // 全部来源记忆冲突时保留代次兜底；下游的多义拒绝与接管裁决仍独立执行。
-        const auto &chosen = *(source_match ? source_match : possible ? possible : latest);
-        result.instance = chosen.instance;
-        result.token = chosen.pending;
-        result.path = AttributionPath::Bootstrap;
+        if (intersection.count == 1) chosen = intersection.entry;
     }
-    else if (result.unique_output_owner)
+    else if (outputs.count == 1) chosen = outputs.entry;
+    else if (sources.count == 1) chosen = sources.entry;
+    else if (!outputs.count && !sources.count)
     {
-        result.instance = result.unique_output_owner;
-        result.path = AttributionPath::RepairOnly;
+        // 换源/双缓冲时旧颜色不同不能排除该机位；没有正面归属时只接受唯一匹配 token。
+        if (pending.count == 1) chosen = pending.entry;
     }
+
+    if (!chosen)
+    {
+        if (outputs.count || sources.count || result.live_candidates || result.dormant_candidates)
+            result.path = AttributionPath::Ambiguous;
+        return result;
+    }
+    result.instance = chosen->instance;
+    result.token = chosen->pending;
+    const bool owns_output = (outputs.count == 1 && outputs.entry == chosen) ||
+        (intersection.count == 1 && intersection.entry == chosen);
+    result.path = owns_output ? AttributionPath::OutputWithToken : AttributionPath::Bootstrap;
+    if (owns_output) result.live_candidates = result.dormant_candidates = 0;
     return result;
 }
 }

@@ -11,6 +11,7 @@
 #include "../interop/BeforeSrV1.h"
 #include "../ComMethodRoutes.h"
 #include "../NgxBackend.h"
+#include "../Il2CppCallSiteHook.h"
 
 #include <cstring>
 #include <filesystem>
@@ -77,6 +78,13 @@ struct RenderFixture
         reinterpret_cast<Observe>(k_methods.data() + k_render_offset)(fields.data(), nullptr);
     }
 };
+
+void wait_for_render_token_expiry()
+{
+    // GetTickCount64 有离散 tick；Sleep 的请求时长不能证明捕获窗口已经严格过期。
+    const auto start = GetTickCount64();
+    while (GetTickCount64() - start <= il2cpp_callsite::k_render_token_lifetime_ms) Sleep(1);
+}
 
 CaptureFrame square_frame(UINT size, bool expect_provider, UINT r = 32, UINT g = 96, UINT b = 900,
     bool same_size = false)
@@ -396,13 +404,14 @@ bool run_candidate_admission(ID3D11Device &device, ID3D11DeviceContext &context,
 }
 
 bool run_multi_scene(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
-    std::FILE *observations)
+    std::FILE *observations, bool cold_start, bool half_warm, bool forward_render)
 {
     using namespace neo::tests::multi_scene;
     const auto configure = reinterpret_cast<Configure>(GetProcAddress(provider, "ConfigureMultiSceneFixture"));
     const auto select = reinterpret_cast<Select>(GetProcAddress(provider, "SelectMultiSceneFrame"));
     const auto complete = reinterpret_cast<Complete>(GetProcAddress(provider, "MultiSceneComplete"));
-    if (!configure || !select || !complete) return false;
+    const auto attempts = reinterpret_cast<Attempts>(GetProcAddress(provider, "MultiSceneAttempts"));
+    if (!configure || !select || !complete || !attempts) return false;
     std::array<RenderFixture, k_scene_count> instances;
     std::array<std::array<CaptureTextures, 2>, k_scene_count> textures;
     std::array<unsigned, k_scene_count> draw_counts {};
@@ -410,8 +419,53 @@ bool run_multi_scene(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE
     for (std::size_t i = 0; i < keys.size(); ++i) keys[i] = instances[i].key();
     configure(keys.data());
     std::uint64_t batch_tick = 0;
+    if (cold_start)
+    {
+        // 2026-11-17：两路同尺寸同时冷启动不能猜机位。之后等待真实 token 过期，验证唯一输入可恢复。
+        const CaptureExtent extent {k_frames[0].width, k_frames[0].height};
+        for (unsigned n = 0; n < 2; ++n)
+        {
+            CaptureFrame frame {extent, extent, [&]
+                {
+                    if (n != 0) return;
+                    batch_tick = GetTickCount64();
+                    for (unsigned offset = 0; offset < 2; ++offset)
+                        instances[forward_render ? offset : 1 - offset].publish(extent, extent, 0.f, 0.f);
+                }, false};
+            frame.retained_textures = &textures[n][0];
+            frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+            frame.typeless_depth = true;
+            select(0);
+            const bool original = draw_capture(&device, &context, CaptureEntry::draw, frame, observations);
+            const auto age = GetTickCount64() - batch_tick;
+            std::fprintf(observations, "multi cold: scene=%u forward=%d original=%d attempts=%u age_ms=%llu\n",
+                n, forward_render, original, attempts(), static_cast<unsigned long long>(age));
+            if (!original || attempts() || age > il2cpp_callsite::k_render_token_lifetime_ms) return false;
+        }
+        wait_for_render_token_expiry();
+    }
     for (unsigned n = 0; n < std::size(k_frames); ++n)
     {
+        if (half_warm && n == 1)
+        {
+            // A 已成功但本帧换到全新输入/输出；B 尚未成功，不能因 A 的旧颜色不同便误派给 B。
+            const CaptureExtent size {k_frames[0].width, k_frames[0].height};
+            CaptureFrame changing {size, size, [&]
+                {
+                    for (unsigned offset = 0; offset < 2; ++offset)
+                        instances[forward_render ? offset : 1 - offset].publish(size, size, 0.f, 0.f);
+                }, false};
+            changing.retained_textures = &textures[0][1];
+            changing.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+            changing.typeless_depth = true;
+            const auto before = attempts();
+            select(n);
+            const bool original = draw_capture(&device, &context, CaptureEntry::draw, changing, observations);
+            std::fprintf(observations, "multi half-warm: forward=%d original=%d attempts=%u before=%u\n",
+                forward_render, original, attempts(), before);
+            if (!original || attempts() != before) return false;
+            wait_for_render_token_expiry();
+        }
         const auto &test = k_frames[n];
         const CaptureExtent extent {test.width, test.height};
         auto &instance = instances[test.scene];
@@ -427,7 +481,7 @@ bool run_multi_scene(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE
                         batch_tick = GetTickCount64();
                         for (unsigned offset = 0; offset < k_scene_count; ++offset)
                         {
-                            const auto &pending = k_frames[n + k_scene_count - 1 - offset];
+                            const auto &pending = k_frames[n + (forward_render ? offset : k_scene_count - 1 - offset)];
                             const CaptureExtent size {pending.width, pending.height};
                             instances[pending.scene].publish(size, size, 0.f, 0.f);
                         }
@@ -585,7 +639,9 @@ int wmain(int argc, wchar_t **argv)
     const bool delayed_input = mode == L"ngx-input-map-delayed";
     const bool input_map = mode == L"ngx-input-map-current" || delayed_input;
     const bool scene_depth = mode == L"ngx-scene-depth";
-    const bool multi_scene = mode == L"ngx-multi-scene";
+    const bool multi_cold = mode == L"ngx-multi-scene-cold-forward" || mode == L"ngx-multi-scene-cold-reverse";
+    const bool multi_half = mode == L"ngx-multi-scene-half-forward" || mode == L"ngx-multi-scene-half-reverse";
+    const bool multi_scene = mode == L"ngx-multi-scene" || multi_cold || multi_half;
     const bool failure_recovery = mode == L"ngx-failure-recovery";
     const bool guide_views = mode == L"ngx-guide-views";
     const bool generic_admission = mode == L"ngx-candidate-admission-generic";
@@ -761,7 +817,8 @@ int wmain(int argc, wchar_t **argv)
     if (scene_depth)
         return run_scene_depth(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
     if (multi_scene)
-        return run_multi_scene(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+        return run_multi_scene(*device.Get(), *context.Get(), provider_module, observations.get(), multi_cold, multi_half,
+            mode.ends_with(L"forward")) ? 0 : 1;
     if (failure_recovery)
         return run_failure_recovery(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
     if (guide_views)

@@ -8,7 +8,7 @@ namespace neo::graphics
 {
 enum class AttributionPath : std::uint32_t
 {
-    None, OutputWithToken, Bootstrap, RepairOnly,
+    None, OutputWithToken, Bootstrap, RepairOnly, Ambiguous,
 };
 
 struct FrameEvidence

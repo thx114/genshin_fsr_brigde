@@ -216,6 +216,8 @@ ngx_core create_feature ok=1 preset=0 rc=0x1
 
 **参数语义**：通用段的键（`TransparentJitter`、`Ffx12DepthInverted`、`Ffx12JitterMode`、`Ffx12JitterDelay`、`Fsr2MotionVectorsJittered`）两条后端都生效；FFX 专用段的键（`Ffx12NonLinear`、`Ffx12Hdr`、`Ffx12FovScale`、`Ffx12CameraNear` 等）**只对 FFX 生效**，NGX 走自己的 `Ngx*` 段（`NgxHdr`、`NgxRenderPreset`、`NgxCrossKeyReuse`、`NgxLogLevel` 等）。
 
+**多场景**：`Ffx12SingleInstance=0`（默认）让两个后端接管各路场景。NGX 按实例保留独立 feature、资源池和时域历史，缓存容量与 Render 捕获端一致；`NgxCrossKeyReuse` 仅控制缓存满后新实例接收旧槽的方式，重分配时会 Reset。没有可交付输出时默认放行原生绘制；诊断构建可用 `Ffx12FailClosed=1` 显式阻断，发布构建不读取此诊断键。四路交错、四个 Render 同时挂起及尺寸切换由宿主回归覆盖，游戏与 ReShade 的画面仍需实机验收。
+
 > [!WARNING]
 > **已知问题（2.5.0 及更早版本）**：游戏渲染精度高于 `0.7`（菜单里的 `0.8`–`0.999`）时，部分机器上 NGX 建 feature 会失败（`ngx_core create_feature ok=0 rc=0xBAD00010`，即 `UnsupportedParameter`），且**本次游戏会话内不会重试** —— 表现为 DLSS 调试叠加层消失、超分回到游戏原版 FSR2，必须重启游戏。原因是桥把这几档的显示/渲染比（≈1.0–1.3）一律映射成 DLSS 的 `UltraQuality` 档，而该档只接受固定比例。主分支已修复（建 feature 前把该档兜底为 `MaxQuality`，渲染精度 `0.9` 实测由失败转为正常），修复随下一版发布；在此之前渲染精度用 `0.7` 及以下可以避开（`0.7` 已实测正常，更低档未逐一验证）。
 
