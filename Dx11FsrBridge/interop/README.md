@@ -21,10 +21,26 @@ F6 V1 求值路径独占下面的查询入口，不调用这个记录者；若�
 
 `color_view_format` 是游戏累积 Draw 的实际 typed SRV 格式；`color_storage_format` 是 NGX 输入副本的存储格式，两者可不同。
 只有实际被复制的源纹理、mip 0 的单层 `Texture2D` SRV 才发布视图格式；空视图或同尺寸错资源留为 `DXGI_FORMAT_UNKNOWN`。
-原生 AO 成功时不把游戏原始 SRV 格式当作改色后的来源声明，`color_view_format` 同样留为 `DXGI_FORMAT_UNKNOWN`。
+原生 AO 成功时发布 AO 实际使用的 UNORM SRV，并只继承本帧已认证输入的编码；未知输入仍为未知。
 目前 Color/Depth/Motion 对应同一次派发、完整 render-size 区域，mip 0、slice 0，原点 `(0,0)`。
 `color_transfer == unknown` 不能授权按 G22、sRGB、线性或 HDR 处理：视图解码方式不能证明内容的编码，
 也不能以内置 NGX IsHDR 或最终交换链代替。F6 若要在自己的共享纹理上处理，须另行验证复制及工作格式，不可仅凭查询放行颜色门。
+
+## 当前 producer 编码认证
+
+2026-11-16 的认证来自已审实际 PS/VS 指令程序和同次 Draw 的状态，不依赖场景名、资源地址或最终交换链。
+已审 PS 的 SDR 分支使用 `max(1.055 * pow(c, 1/2.4) - 0.055, 0)`，对应常用快速 sRGB 近似，
+保留游戏自己的量化抖动。只有当前 CB0 的模式选择 SDR、附加 gamma 等于 1、叠色关闭时，才可声明 `srgb`。
+PQ 坐标后接未知 LUT、额外 gamma 和未知叠色路径保留 `unknown`；本声明不代表精确分段 sRGB 曲线或 GPU 完成。
+
+CPU 常量镜像来自实际 CreateBuffer 初值、UpdateSubresource 或 Map/Unmap；GPU 复制、丢弃和不透明命令会使旧声明失效。
+认证还要求单个完整视口、有效全屏三角形、完整裁剪、无不确定深度遮挡、无混合或逻辑操作，且写入 RGB。
+全屏几何只从不超过 4096 字节的实际 VB/IB CPU 数据判断；带 UAV 或 STREAM_OUTPUT 的 GPU 可写几何不参与认证。
+IMMUTABLE 几何可凭 D3D 创建契约保留初值，其余几何在不透明命令后需要新的 CPU 来源。
+暂不支持 Context1 非零 constant-buffer first 或不足 105 个寄存器的范围。
+
+证书绑定实际资源、context、写入序号及观察代次，仅在原 Draw 返回且常量和几何版本未变时发布，供本桥消费一次。
+任何已观察覆盖都会作废旧证书；没有完整证据时继续正常 SR 并返回 `unknown`。这些检查不新增同步 GPU 读回、计时探针或配置键。
 
 ## 源颜色取证（仅诊断构建）
 

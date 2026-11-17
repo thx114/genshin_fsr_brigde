@@ -3,6 +3,7 @@
 #include <d3d11.h>
 #include <cstddef>
 #include <cstdint>
+#include "ColorTransfer.h"
 
 namespace neo::interop
 {
@@ -11,8 +12,7 @@ inline constexpr char k_unregister_before_sr_v1[] = "Dx11FsrBridge_UnregisterBef
 inline constexpr char k_query_before_sr_frame_v1[] = "Dx11FsrBridge_QueryBeforeSrFrameV1";
 
 // 2026-11-15：视图格式描述硬件取样方式，不是产生这些像素的 transfer 声明。
-// 当前桥没有独立的游戏输入声明；不能用 IsHDR=0、UNORM、sRGB SRV 或最终交换链代替。
-enum class ColorTransfer : std::uint32_t { unknown = 0, srgb = 1, linear = 2, pq = 3 };
+// 2026-11-16：仅当前writer程序及CPU控制量给出声明；不能用IsHDR、视图或交换链代替。
 inline constexpr std::uint32_t k_before_sr_depth_inverted = 1u << 0;
 inline constexpr std::uint32_t k_before_sr_motion_jittered = 1u << 1;
 inline constexpr std::uint32_t k_before_sr_reset = 1u << 2;

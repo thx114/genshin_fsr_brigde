@@ -11,6 +11,7 @@ int main()
 {
     constexpr std::uint64_t now = 430, window = 50, color = 9;
     Entry a { 1 }, b { 2 }, c { 3 };
+    a.dimensions_match = b.dimensions_match = c.dimensions_match = true;
     a.pending.generation = 7;
     b.pending.generation = 8;
     c.pending.generation = 9;
@@ -64,6 +65,14 @@ int main()
         "when all source memories disagree, preserve original newest-generation bootstrap");
     check(attribute_frame(evidence, 0, now, window).instance == b.instance,
         "missing source provides no preference");
+    b.dimensions_match = false;
+    evidence[1].owns_target = true;
+    match = select();
+    check(match.instance == a.instance && !match.unique_output_owner,
+        "mismatched display cannot claim a token or repair an owned output");
+    check(b.pending.generation == 8, "attribution rejection leaves the other token intact");
+    a.dimensions_match = c.dimensions_match = false;
+    check(!select().instance, "all incompatible Render dimensions pass through before takeover");
     check(!neo::graphics::recently_observed(now + 1, now, window) &&
         neo::graphics::recently_observed(now - window, now, window), "recency uses one snapshot clock");
     std::printf("FrameAttribution: %u failures\n", failures);

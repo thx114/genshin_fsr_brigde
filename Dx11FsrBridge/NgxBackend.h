@@ -50,6 +50,9 @@ void set_frame_time_delta(bool on);                         // NgxSetFrameTimeDe
 void set_use_reactive_mask(bool on);                        // NgxUseReactiveMask，默认 false
 void set_log_level(int lv);                                 // NgxLogLevel 0..3，默认 1
 void set_passthrough(bool on);                              // NgxPassthrough，默认 false
+void set_diagnostic_pixel_readback(bool enable);             // NgxDiagnosticPixelReadback，默认 false，仅诊断构建
+// 2026-11-16：真实 DLL 回归与抽检共用周期，避免实现改动后测试静默漏掉采样窗口。
+inline constexpr unsigned k_diagnostic_pixel_readback_interval = 600;
 void set_before_sr_ao(bool enable);                         // NgxBeforeSrAo，默认 false
 // NgxCrossKeyReuse，默认 true：实例缓存满后，新 key 可接收同尺寸/格式的 LRU 池与 feature，
 // 并 Reset。关闭时先退休旧 feature 再创建；缓存内已有实例始终各自保留历史。

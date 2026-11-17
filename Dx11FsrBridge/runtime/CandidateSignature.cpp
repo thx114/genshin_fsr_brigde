@@ -1,5 +1,7 @@
 #include "CandidateSignature.h"
 
+#include <algorithm>
+
 namespace neo::graphics
 {
 namespace
@@ -31,8 +33,9 @@ std::optional<TargetUpscalerDrawInfo> identify_standard_candidate(const Standard
         color.height > output_color.height || cb0_bytes < k_min_fsr_constants)
         return std::nullopt;
 
-    return TargetUpscalerDrawInfo { color.width, color.height, output_color.width, output_color.height,
+    const TargetUpscalerDrawInfo layout { color.width, color.height, output_color.width, output_color.height,
         cb0_key, color.resource_key, motion.resource_key };
+    return validate_accumulation_candidate(srvs, rtvs, geometry, layout) ? std::optional(layout) : std::nullopt;
 }
 
 static DXGI_FORMAT resource_view_or_format(const ResourceInfo &info)
@@ -100,6 +103,139 @@ static bool fsr_feature_transparency(const ResourceInfo &info)
     }
 }
 
+static DXGI_FORMAT format_family(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+    case DXGI_FORMAT_R8G8_TYPELESS:
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_SNORM:
+        return DXGI_FORMAT_R8G8_TYPELESS;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    case DXGI_FORMAT_R16G16_TYPELESS:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16_UNORM:
+    case DXGI_FORMAT_R16G16_SNORM:
+        return DXGI_FORMAT_R16G16_TYPELESS;
+    default:
+        return format;
+    }
+}
+
+static bool history_matches(const ResourceInfo &history, const ResourceInfo &output)
+{
+    return history.resource_key && same_size(history, output) &&
+        format_family(resource_view_or_format(history)) == format_family(resource_view_or_format(output));
+}
+
+static bool fsr_feature_weights(const ResourceInfo &info)
+{
+    if (info.width != 16 || info.height != 16) return false;
+    switch (resource_view_or_format(info))
+    {
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool validate_accumulation_candidate(std::span<const ResourceInfo> srvs, std::span<const ResourceInfo> rtvs,
+    CandidateGeometry geometry, const TargetUpscalerDrawInfo &layout)
+{
+    const std::array slots {layout.color_srv_slot, layout.weights_srv_slot, layout.depth_srv_slot,
+        layout.motion_srv_slot, layout.history_metadata_srv_slot, layout.history_color_srv_slot};
+    if (geometry.cb0_bytes < k_min_fsr_constants || !geometry.viewport_width || !geometry.viewport_height ||
+        layout.output_rtv_slot >= rtvs.size() || layout.metadata_rtv_slot >= rtvs.size() ||
+        layout.output_rtv_slot == layout.metadata_rtv_slot)
+        return false;
+    std::array<std::uint64_t, 9> keys {};
+    std::size_t count = 0;
+    const auto distinct = [&](std::uint64_t key)
+    {
+        if (!key || std::find(keys.begin(), keys.begin() + count, key) != keys.begin() + count) return false;
+        keys[count++] = key;
+        return true;
+    };
+    for (const auto slot : slots)
+        if (slot >= srvs.size() || !distinct(srvs[slot].resource_key)) return false;
+    const auto &color = srvs[layout.color_srv_slot], &weights = srvs[layout.weights_srv_slot];
+    const auto &depth = srvs[layout.depth_srv_slot], &motion = srvs[layout.motion_srv_slot];
+    const auto &history_metadata = srvs[layout.history_metadata_srv_slot];
+    const auto &history_color = srvs[layout.history_color_srv_slot];
+    const auto &output = rtvs[layout.output_rtv_slot], &metadata = rtvs[layout.metadata_rtv_slot];
+    if (!distinct(output.resource_key) || !distinct(metadata.resource_key) || !color.width || !color.height ||
+        !same_size(color, depth) || !same_size(color, motion) || !same_size(output, metadata) ||
+        !same_size(output, history_metadata) || !same_size(output, history_color) ||
+        output.width != geometry.viewport_width || output.height != geometry.viewport_height ||
+        color.width > output.width || color.height > output.height || weights.width != 16 || weights.height != 16)
+        return false;
+    const auto flags_slot = layout.standard_layout ? 4u : layout.transparency_srv_slot;
+    if (flags_slot != UINT_MAX)
+    {
+        if (flags_slot >= srvs.size()) return false;
+        const auto &flags = srvs[flags_slot];
+        if (!same_size(color, flags) || !distinct(flags.resource_key)) return false;
+    }
+    // 2026-11-16（PID44888）：固定布局保留国际服已验证的 guide 格式；重排布局必须有独立历史对。
+    // 这只验证绑定关系，不认证 shader 的 temporal 算法或颜色传递函数。
+    return layout.standard_layout || (fsr_feature_weights(weights) && fsr_feature_color(color) &&
+        fsr_feature_depth(depth) && fsr_feature_motion(motion) && fsr_feature_color(output) &&
+        history_matches(history_metadata, metadata) && history_matches(history_color, output));
+}
+
+namespace
+{
+enum Role : unsigned { Color, Motion, Depth, Weights, HistoryMetadata, HistoryColor, RoleCount };
+// D3D11 的 PS 输入最多 128 槽；匹配每个角色最多遍历这张固定表，不枚举资源笛卡尔积。
+constexpr std::size_t k_input_slots = 128;
+struct RoleAssignment
+{
+    std::span<const ResourceInfo> inputs;
+    std::array<std::array<signed char, k_input_slots>, RoleCount> scores {};
+    std::array<std::uint32_t, RoleCount> slots {UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX};
+
+    bool assign(unsigned role, unsigned &visited)
+    {
+        if (visited & (1u << role)) return false;
+        visited |= 1u << role;
+        // 先用空闲资源，只有缺角色时才重排已选项；1:1 且两历史同格式时不会抢走唯一 guide。
+        for (unsigned occupied = 0; occupied < 2; ++occupied)
+            for (int score = 7; score >= 0; --score)
+                for (std::size_t i = 0; i < inputs.size(); ++i)
+                {
+                    if (scores[role][i] != score) continue;
+                    unsigned owner = RoleCount;
+                    for (unsigned j = 0; j < RoleCount; ++j)
+                        if (slots[j] != UINT_MAX && inputs[slots[j]].resource_key == inputs[i].resource_key)
+                            owner = j;
+                    if (occupied != static_cast<unsigned>(owner != RoleCount)) continue;
+                    if (owner != RoleCount && !assign(owner, visited)) continue;
+                    slots[role] = static_cast<std::uint32_t>(i);
+                    return true;
+                }
+        return false;
+    }
+};
+}
+
 std::optional<TargetUpscalerDrawInfo> identify_feature_candidate(std::span<const ResourceInfo> srvs,
     std::span<const ResourceInfo> rtvs, CandidateGeometry geometry)
 {
@@ -107,103 +243,85 @@ std::optional<TargetUpscalerDrawInfo> identify_feature_candidate(std::span<const
     if (cb0_bytes < k_min_fsr_constants || viewport_width == 0 || viewport_height == 0)
         return std::nullopt;
 
-    int output_slot = -1;
-    int output_score = -1;
-    for (std::size_t i = 0; i < rtvs.size(); ++i)
+    srvs = srvs.first(std::min(srvs.size(), k_input_slots));
+    rtvs = rtvs.first(std::min<std::size_t>(rtvs.size(), 8));
+    std::array<const ResourceInfo *, k_input_slots> render_extents {};
+    std::size_t extent_count = 0;
+    for (const auto &input : srvs)
     {
-        const ResourceInfo &candidate = rtvs[i];
-        if (candidate.resource_key == 0 || candidate.width != viewport_width ||
-            candidate.height != viewport_height || !fsr_feature_color(candidate))
+        if (!input.resource_key || !input.width || !input.height || !fsr_feature_depth(input)) continue;
+        if (std::any_of(render_extents.begin(), render_extents.begin() + extent_count,
+            [&](const auto *extent) { return same_size(input, *extent); })) continue;
+        render_extents[extent_count++] = &input;
+    }
+
+    std::optional<TargetUpscalerDrawInfo> best;
+    int best_score = -1;
+    for (std::size_t output_slot = 0; output_slot < rtvs.size(); ++output_slot)
+    {
+        const auto &output = rtvs[output_slot];
+        if (!output.resource_key || output.width != viewport_width || output.height != viewport_height ||
+            !fsr_feature_color(output))
             continue;
-        int score = 1;
-        const DXGI_FORMAT format = resource_view_or_format(candidate);
-        if (format == DXGI_FORMAT_R10G10B10A2_UNORM || format == DXGI_FORMAT_R11G11B10_FLOAT ||
-            format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-            score += 4;
-        if (score > output_score)
+        for (std::size_t metadata_slot = 0; metadata_slot < rtvs.size(); ++metadata_slot)
         {
-            output_slot = static_cast<int>(i);
-            output_score = score;
-        }
-    }
-    if (output_slot < 0)
-        return std::nullopt;
-    const ResourceInfo &output = rtvs[output_slot];
-
-    int weight_count = 0;
-    int history_count = 0;
-    for (const ResourceInfo &srv : srvs)
-    {
-        weight_count += srv.resource_key != 0 && srv.width == 16 && srv.height == 16 ? 1 : 0;
-        history_count += srv.resource_key != 0 && srv.width == output.width && srv.height == output.height ? 1 : 0;
-    }
-    if (weight_count == 0 || history_count < 2)
-        return std::nullopt;
-
-    int depth_slot = -1;
-    for (std::size_t i = 0; i < srvs.size(); ++i)
-    {
-        if (srvs[i].resource_key != 0 && fsr_feature_depth(srvs[i]))
-        {
-            depth_slot = static_cast<int>(i);
-            break;
-        }
-    }
-    if (depth_slot < 0)
-        return std::nullopt;
-    const ResourceInfo &depth = srvs[depth_slot];
-
-    int color_slot = -1, motion_slot = -1, transparency_slot = -1;
-    int color_score = -1, motion_score = -1, transparency_score = -1;
-    for (std::size_t i = 0; i < srvs.size(); ++i)
-    {
-        const ResourceInfo &candidate = srvs[i];
-        if (candidate.resource_key == 0 || candidate.width != depth.width ||
-            candidate.height != depth.height || static_cast<int>(i) == depth_slot ||
-            (candidate.width == 16 && candidate.height == 16))
-            continue;
-        if (fsr_feature_color(candidate))
-        {
-            int score = 1;
-            const DXGI_FORMAT format = resource_view_or_format(candidate);
-            if (format == DXGI_FORMAT_R11G11B10_FLOAT || format == DXGI_FORMAT_R16G16B16A16_FLOAT)
-                score += 4;
-            if (i == 0) score += 2; // known layout is only a tie-breaker, never a requirement
-            if (score > color_score) { color_score = score; color_slot = static_cast<int>(i); }
-        }
-        if (fsr_feature_motion(candidate))
-        {
-            int score = 1;
-            const DXGI_FORMAT format = resource_view_or_format(candidate);
-            if (format == DXGI_FORMAT_R16G16_FLOAT || format == DXGI_FORMAT_R16G16_SNORM ||
-                format == DXGI_FORMAT_R32G32_FLOAT) score += 4;
-            if (i == 3) score += 2; // tie-breaker for the observed game layout
-            if (score > motion_score) { motion_score = score; motion_slot = static_cast<int>(i); }
-        }
-        if (fsr_feature_transparency(candidate))
-        {
-            int score = 1;
-            if (i == 4) score += 2; // observed layout only breaks ties
-            if (score > transparency_score)
+            const auto &metadata = rtvs[metadata_slot];
+            if (!metadata.resource_key || metadata.resource_key == output.resource_key || !same_size(metadata, output))
+                continue;
+            for (const auto *extent : std::span(render_extents).first(extent_count))
             {
-                transparency_score = score;
-                transparency_slot = static_cast<int>(i);
+                const auto &depth = *extent;
+                if (depth.width > output.width || depth.height > output.height) continue;
+                RoleAssignment roles {srvs};
+                for (auto &scores : roles.scores) scores.fill(-1);
+                for (std::size_t i = 0; i < srvs.size(); ++i)
+                {
+                    const auto &input = srvs[i];
+                    if (!input.resource_key || input.resource_key == output.resource_key ||
+                        input.resource_key == metadata.resource_key) continue;
+                    if (history_matches(input, metadata)) roles.scores[HistoryMetadata][i] = 1;
+                    if (history_matches(input, output)) roles.scores[HistoryColor][i] = 1;
+                    if (fsr_feature_weights(input)) roles.scores[Weights][i] = 1;
+                    if (!same_size(input, depth) || (input.width == 16 && input.height == 16)) continue;
+                    if (fsr_feature_depth(input)) roles.scores[Depth][i] = 1;
+                    const auto format = resource_view_or_format(input);
+                    if (fsr_feature_color(input))
+                        roles.scores[Color][i] = static_cast<signed char>(1 + (i == 0 ? 2 : 0) +
+                            (format == DXGI_FORMAT_R11G11B10_FLOAT || format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 4 : 0));
+                    if (fsr_feature_motion(input))
+                        roles.scores[Motion][i] = static_cast<signed char>(1 + (i == 3 ? 2 : 0) +
+                            (format == DXGI_FORMAT_R16G16_FLOAT || format == DXGI_FORMAT_R16G16_SNORM ||
+                                format == DXGI_FORMAT_R32G32_FLOAT ? 4 : 0));
+                }
+                bool complete = true;
+                for (unsigned role = 0; role < RoleCount; ++role)
+                {
+                    unsigned visited = 0;
+                    if (!roles.assign(role, visited)) { complete = false; break; }
+                }
+                if (!complete) continue;
+                const auto &slots = roles.slots;
+                const auto &color = srvs[slots[Color]];
+                TargetUpscalerDrawInfo layout {color.width, color.height, output.width, output.height, cb0_key,
+                    color.resource_key, srvs[slots[Motion]].resource_key, slots[Color], slots[Depth], slots[Motion],
+                    UINT_MAX, static_cast<std::uint32_t>(output_slot), slots[Weights], slots[HistoryMetadata],
+                    slots[HistoryColor], static_cast<std::uint32_t>(metadata_slot), false};
+                for (std::size_t i = 0; i < srvs.size(); ++i)
+                {
+                    if (!same_size(srvs[i], color) || !fsr_feature_transparency(srvs[i])) continue;
+                    layout.transparency_srv_slot = static_cast<std::uint32_t>(i);
+                    if (validate_accumulation_candidate(srvs, rtvs, geometry, layout)) break;
+                    layout.transparency_srv_slot = UINT_MAX;
+                }
+                if (!validate_accumulation_candidate(srvs, rtvs, geometry, layout)) continue;
+                const auto format = resource_view_or_format(output);
+                const int score = 1 + (format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+                    format == DXGI_FORMAT_R11G11B10_FLOAT || format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 4 : 0);
+                if (score > best_score) { best = layout; best_score = score; }
             }
         }
     }
-    if (color_slot < 0 || motion_slot < 0 || color_slot == motion_slot)
-        return std::nullopt;
-    const ResourceInfo &color = srvs[color_slot];
-    if (color.width > output.width || color.height > output.height)
-        return std::nullopt;
-
-    return TargetUpscalerDrawInfo {
-        color.width, color.height, output.width, output.height, cb0_key,
-        color.resource_key, srvs[motion_slot].resource_key,
-        static_cast<std::uint32_t>(color_slot), static_cast<std::uint32_t>(depth_slot),
-        static_cast<std::uint32_t>(motion_slot),
-        transparency_slot >= 0 ? static_cast<std::uint32_t>(transparency_slot) : UINT_MAX,
-        static_cast<std::uint32_t>(output_slot)};
+    return best;
 }
 
 }

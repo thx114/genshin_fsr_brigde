@@ -1,6 +1,7 @@
 #include "../runtime/CandidateSignature.h"
 
 #include <cstdio>
+#include <algorithm>
 
 using namespace neo::graphics;
 
@@ -94,6 +95,60 @@ int main()
     invalid_inputs[1] = {};
     invalid_inputs[3].format = DXGI_FORMAT_R10G10B10A2_UNORM;
     check(!identify_feature_candidate(invalid_inputs, swapped_targets, k_geometry), "one surface cannot fill two roles");
+
+    // 2026-11-16（PID44888）：同尺寸 G-buffer 不能充当历史；packed MV 也不能替照明 pass 补齐证据。
+    const CandidateGeometry lighting_geometry {1536, 960, 3184, 77};
+    const StandardInputs lighting {
+        ResourceInfo {11, 1536, 960, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS},
+        ResourceInfo {12, 1536, 960, DXGI_FORMAT_R8G8_TYPELESS, DXGI_FORMAT_R8G8_UNORM},
+        ResourceInfo {13, 4, 4, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB},
+        ResourceInfo {14, 16, 16, DXGI_FORMAT_R16G16B16A16_FLOAT},
+        ResourceInfo {15, 1536, 960, DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R10G10B10A2_UNORM},
+        ResourceInfo {16, 1536, 960, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB},
+        ResourceInfo {17, 1536, 960, DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB},
+    };
+    const StandardTargets lighting_targets {ResourceInfo {18, 1536, 960, DXGI_FORMAT_R11G11B10_FLOAT}, {}};
+    check(!identify_feature_candidate(lighting, lighting_targets, lighting_geometry),
+        "captured lighting single RT and same-size G-buffer are not temporal history");
+    auto packed_lighting = lighting;
+    packed_lighting[1].format = packed_lighting[1].view_format = DXGI_FORMAT_R16G16_FLOAT;
+    check(!identify_feature_candidate(packed_lighting, lighting_targets, lighting_geometry),
+        "supported motion format cannot turn single-RT lighting into accumulation");
+    auto fake_mrt = lighting_targets;
+    fake_mrt[1] = {19, 1536, 960, DXGI_FORMAT_R8G8B8A8_UNORM};
+    check(!identify_feature_candidate(packed_lighting, fake_mrt, lighting_geometry),
+        "arbitrary 16x16 RGBA lighting data is not a weight LUT or matching history pair");
+
+    auto aliased = fixed;
+    aliased[6].resource_key = aliased[0].resource_key;
+    check(!identify_standard_candidate(aliased, targets, k_geometry, evidence),
+        "fixed layout cannot reuse current color as history");
+    auto aliased_targets = swapped_targets;
+    aliased_targets[1].resource_key = aliased_targets[0].resource_key;
+    check(!identify_feature_candidate(reordered, aliased_targets, k_geometry), "MRT resources must be distinct");
+
+    auto dlaa = reordered;
+    for (auto &srv : dlaa)
+        if (srv.width == k_render_w) { srv.width = k_display_w; srv.height = k_display_h; }
+    const auto adaptive_dlaa = identify_feature_candidate(dlaa, swapped_targets, k_geometry);
+    check(adaptive_dlaa && adaptive_dlaa->render_width == adaptive_dlaa->output_width,
+        "1:1 accumulation keeps independent history and output roles");
+    auto same_family = dlaa;
+    same_family[3].format = same_family[5].format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const StandardTargets same_family_targets {display(9, DXGI_FORMAT_R8G8B8A8_UNORM), metadata};
+    check(identify_feature_candidate(same_family, same_family_targets, k_geometry).has_value(),
+        "history and current color sharing a format family must still admit a complete assignment");
+    auto float_weights = reordered;
+    float_weights[0].format = DXGI_FORMAT_R32_FLOAT;
+    const auto lut_first = identify_feature_candidate(float_weights, swapped_targets, k_geometry);
+    check(lut_first && lut_first->weights_srv_slot == 0 && lut_first->depth_srv_slot == 6,
+        "R32_FLOAT weight LUT before real depth does not become the guide");
+    std::array<ResourceInfo, 8> extra_depth {};
+    extra_depth[0] = {20, 320, 200, DXGI_FORMAT_R32_FLOAT};
+    std::copy(reordered.begin(), reordered.end(), extra_depth.begin() + 1);
+    const auto later_depth = identify_feature_candidate(extra_depth, swapped_targets, k_geometry);
+    check(later_depth && later_depth->depth_srv_slot == 7 && later_depth->color_srv_slot == 4,
+        "unrelated depth before a complete accumulation does not mask the real extent");
     std::printf("CandidateSignature: %u failures\n", failures);
     return failures != 0;
 }

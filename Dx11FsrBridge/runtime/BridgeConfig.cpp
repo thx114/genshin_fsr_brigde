@@ -404,6 +404,10 @@ ConfigLoad read_config(const std::filesystem::path &module_dir)
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxLogLevel", 1, config_path.c_str());
     ngx::set_log_level(ngx_lv);
 
+    // 2026-11-16（原神 PID728）：诊断构建也默认不做同步像素读回；发布读取同一配置键。
+    ngx::set_diagnostic_pixel_readback(GetPrivateProfileIntW(
+        L"Dx11FsrBridge", L"NgxDiagnosticPixelReadback", 0, config_path.c_str()) == 1);
+
     // ---- 键 9：NgxPassthrough（默认 0）----
     const int ngx_pt =
         GetPrivateProfileIntW(L"Dx11FsrBridge", L"NgxPassthrough", 0, config_path.c_str());

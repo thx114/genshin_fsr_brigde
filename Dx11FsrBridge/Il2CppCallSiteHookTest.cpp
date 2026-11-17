@@ -229,25 +229,44 @@ void run_per_instance_test()
             if (snapshot.entries[i].instance == instance) return snapshot.entries[i].pending;
         return il2cpp_callsite::RenderToken {};
     };
-    const auto first = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h);
+    const auto first = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h, pa.display_w, pa.display_h);
     const auto older_a = token_for(first, a_ptr);
     CHECK(first.count == 2 && older_a.generation > 0 && older_a.generation < ga && older_a.params.frame_index == 42,
         "snapshot uses oldest pending frame for a concrete instance and size");
     CHECK(!token_for(first, b_ptr).generation, "snapshot includes known instance without mismatched pending token");
     CHECK(il2cpp_callsite::consume_render_token_for(a_ptr, older_a.generation), "consume exactly the first A frame");
-    const auto next = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h);
+    const auto next = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h, pa.display_w, pa.display_h);
     CHECK(token_for(next, a_ptr).generation == ga && token_for(next, a_ptr).params.frame_index == 43,
         "new snapshot exposes the following A frame");
     CHECK(il2cpp_callsite::consume_render_token_for(a_ptr, ga), "next A frame consumed");
-    const auto empty = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h);
+    const auto empty = il2cpp_callsite::snapshot_render_tokens(pa.render_w, pa.render_h, pa.display_w, pa.display_h);
     CHECK(empty.count == 2 && !token_for(empty, a_ptr).generation, "known A with no pending frame is not a token");
-    const auto other = il2cpp_callsite::snapshot_render_tokens(pb.render_w, pb.render_h);
+    const auto other = il2cpp_callsite::snapshot_render_tokens(pb.render_w, pb.render_h, pb.display_w, pb.display_h);
     CHECK(token_for(other, b_ptr).generation == gb, "consuming A does not remove B frame");
 
     // 全局兼容接口仍返回"最近一次 Render"（= A 的第二次）
     il2cpp_callsite::CapturedParams gp {};
     const bool got = il2cpp_callsite::last_params(gp);
     CHECK(got && gp.frame_index == 43, "per-instance: global last_params still latest (A)");
+
+    // 2026-11-16：照明输出与真实 Render 同 render、不同 display；拒绝后环内帧必须仍可用。
+    *reinterpret_cast<std::uint32_t *>(inst_a + 0x50) = 44;
+    *reinterpret_cast<std::uint32_t *>(inst_a + 0x68) = 1280;
+    *reinterpret_cast<std::uint32_t *>(inst_a + 0x6C) = 720;
+    fn(inst_a, nullptr);
+    *reinterpret_cast<std::uint32_t *>(inst_a + 0x50) = 45;
+    *reinterpret_cast<std::uint32_t *>(inst_a + 0x68) = 1920;
+    *reinterpret_cast<std::uint32_t *>(inst_a + 0x6C) = 1080;
+    fn(inst_a, nullptr);
+    const auto wrong_display = il2cpp_callsite::snapshot_render_tokens(960, 540, 960, 540);
+    CHECK(!token_for(wrong_display, a_ptr).generation && wrong_display.count == 2 &&
+        !wrong_display.entries[0].dimensions_match, "wrong display neither claims nor hides live instances");
+    const auto later_display = il2cpp_callsite::snapshot_render_tokens(960, 540, 1920, 1080);
+    CHECK(token_for(later_display, a_ptr).params.frame_index == 45,
+        "earlier incompatible display token cannot hide the matching frame in the ring");
+    const auto earlier_display = il2cpp_callsite::snapshot_render_tokens(960, 540, 1280, 720);
+    CHECK(token_for(earlier_display, a_ptr).params.frame_index == 44,
+        "read-only rejection and later lookup leave earlier matching token untouched");
 
     il2cpp_callsite::shutdown();
     CHECK(!il2cpp_callsite::active(), "per-instance: inactive after shutdown");

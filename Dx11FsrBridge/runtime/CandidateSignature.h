@@ -34,6 +34,11 @@ struct TargetUpscalerDrawInfo
     std::uint32_t motion_srv_slot = 3;
     std::uint32_t transparency_srv_slot = UINT_MAX;
     std::uint32_t output_rtv_slot = 1;
+    std::uint32_t weights_srv_slot = 1;
+    std::uint32_t history_metadata_srv_slot = 5;
+    std::uint32_t history_color_srv_slot = 6;
+    std::uint32_t metadata_rtv_slot = 0;
+    bool standard_layout = true;
 };
 
 constexpr std::uint32_t k_min_fsr_constants = 464;
@@ -56,6 +61,8 @@ struct StandardEvidence
 };
 
 bool fsr_feature_color(const ResourceInfo &info);
+bool validate_accumulation_candidate(std::span<const ResourceInfo> srvs, std::span<const ResourceInfo> rtvs,
+    CandidateGeometry geometry, const TargetUpscalerDrawInfo &layout);
 std::optional<TargetUpscalerDrawInfo> identify_standard_candidate(const StandardInputs &srvs,
     const StandardTargets &rtvs, CandidateGeometry geometry, StandardEvidence &evidence);
 std::optional<TargetUpscalerDrawInfo> identify_feature_candidate(std::span<const ResourceInfo> srvs,

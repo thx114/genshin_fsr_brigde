@@ -128,6 +128,7 @@ add_library(Dx11FsrBridge SHARED
     runtime/CandidateSignature.cpp
     runtime/OutputHistory.cpp
     runtime/FrameAttribution.cpp
+    runtime/ProducerTransfer.cpp
     runtime/BridgeConfig.cpp
     game/VersionDiscovery.cpp
     BridgeLogger.cpp
@@ -445,6 +446,10 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         target_link_libraries(NgxFrameResourcesTest PRIVATE d3d11 d3dcompiler)
         add_test(NAME NgxFrameResourcesTest COMMAND NgxFrameResourcesTest)
         add_executable(BeforeSrInputTest tests/BeforeSrInputTest.cpp ngx/BeforeSr.cpp)
+        add_executable(ProducerTransferTest tests/ProducerTransferTest.cpp)
+        fsrbridge_configure_test(ProducerTransferTest)
+        target_link_libraries(ProducerTransferTest PRIVATE d3d11 d3dcompiler)
+        add_test(NAME ProducerTransferTest COMMAND ProducerTransferTest)
         fsrbridge_configure_test(BeforeSrInputTest)
         target_link_libraries(BeforeSrInputTest PRIVATE d3d11)
         add_test(NAME BeforeSrInputTest COMMAND BeforeSrInputTest)
@@ -497,6 +502,11 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
         DX11FSRBRIDGE_TEST_DIAGNOSTICS=$<BOOL:${DX11FSRBRIDGE_DIAGNOSTICS_ON}>)
     target_link_libraries(ProviderFrameHost PRIVATE d3d11 d3dcompiler)
     if(DX11FSRBRIDGE_ENABLE_NGX)
+        foreach(setting IN ITEMS default off on)
+            add_test(NAME NgxDiagnosticPixelReadback-${setting} COMMAND ProviderFrameHost
+                ngx-pixel-readback-${setting} "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+            set_tests_properties(NgxDiagnosticPixelReadback-${setting} PROPERTIES TIMEOUT 120)
+        endforeach()
         if(DX11FSRBRIDGE_DIAGNOSTICS_ON AND NOT DX11FSRBRIDGE_RELEASE_RUNTIME)
             add_test(NAME BeforeSrProducerCaptureIntegration COMMAND ProviderFrameHost ngx-producer-capture
                 "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
@@ -539,6 +549,10 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME NgxGuideViewsIntegration COMMAND ProviderFrameHost ngx-guide-views
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+        add_test(NAME NgxCandidateAdmissionIntegration COMMAND ProviderFrameHost ngx-candidate-admission
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
+        add_test(NAME NgxCandidateAdmissionGenericIntegration COMMAND ProviderFrameHost ngx-candidate-admission-generic
+            "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME BeforeSrAoIntegration COMMAND ProviderFrameHost ngx-ao
             "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
         add_test(NAME BeforeSrAoOffIntegration COMMAND ProviderFrameHost ngx-ao-off
@@ -549,7 +563,8 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
             PROPERTIES TIMEOUT 45)
         set_tests_properties(F6EvalReceiptIntegration F6EvalReceiptDlaaIntegration BeforeSrIntegration
             NgxInputMapCurrentIntegration NgxInputMapDelayedIntegration NgxSceneDepthIntegration
-            NgxMultiSceneIntegration NgxFailureRecoveryIntegration PROPERTIES TIMEOUT 45)
+            NgxMultiSceneIntegration NgxFailureRecoveryIntegration NgxCandidateAdmissionIntegration
+            NgxCandidateAdmissionGenericIntegration PROPERTIES TIMEOUT 45)
     endif()
     add_executable(CreateRouteIntegrationTest tests/create-routing/Host.cpp)
     target_link_libraries(CreateRouteIntegrationTest PRIVATE d3dcompiler dxgi)

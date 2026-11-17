@@ -22,6 +22,7 @@ Attribution attribute_frame(std::span<const FrameEvidence> candidates, std::uint
     for (const auto &evidence : candidates)
     {
         const auto &capture = *evidence.capture;
+        if (!capture.dimensions_match) continue;
         if (evidence.owns_target)
         {
             if (!result.unique_output_owner) result.unique_output_owner = capture.instance;

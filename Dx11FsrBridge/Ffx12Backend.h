@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include "interop/ColorTransfer.h"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -40,6 +41,8 @@ struct FrameInput
     bool use_transparency_mask = false;
     float sharpness = 0.0f;
     ID3D11ShaderResourceView *color_source_view = nullptr; // 借用同次 Draw 中 color 的源视图。
+    // 2026-11-16：由当前原生writer/CPU常量代次认证，不能从NGX flags或纹理格式猜测。
+    neo::interop::ColorTransfer color_transfer = neo::interop::ColorTransfer::unknown;
     bool depth_from_dsv = false; // NGX 采样前必须解除该场景深度的 OM 写绑定。
     // 2026-11-16（guide 格式复现）：typeless 资源不能说明本次 Draw 的实际读法，必须保留源 SRV。
     ID3D11ShaderResourceView *depth_source_view = nullptr;

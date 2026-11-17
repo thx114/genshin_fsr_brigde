@@ -54,6 +54,7 @@ struct RenderSnapshot
     {
         std::uint64_t instance = 0;
         RenderToken pending {}; // generation=0：有实例，但当前尺寸没有可消费的 token。
+        bool dimensions_match = false; // 当前候选的 render/display 与该实例事实匹配，才可认领或修复。
     };
 
     std::array<Entry, k_render_instance_capacity> entries {};
@@ -90,7 +91,8 @@ bool last_params(CapturedParams &out);
 bool last_params_for(std::uint64_t instance, CapturedParams &out, std::uint64_t &generation);
 // 每个实例返回匹配尺寸的最早未消费帧。一次读取实例集合和 pending 状态，
 // 避免 Render 写线程在 Draw 的归属判定中途改变证据。
-RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t render_h);
+RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t render_h,
+    std::uint32_t display_w, std::uint32_t display_h);
 // 退休该实例的已采用代次及更早的帧；不能消费另一实例或更新的帧。
 bool consume_render_token_for(std::uint64_t instance, std::uint64_t generation);
 // 2026-09-19：pending 环形槽每实例只有 4 个，写满时**覆盖最旧** token。

@@ -479,7 +479,8 @@ bool last_params_for(std::uint64_t instance, CapturedParams &out, std::uint64_t 
     return false;
 }
 
-RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t render_h)
+RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t render_h,
+    std::uint32_t display_w, std::uint32_t display_h)
 {
     constexpr std::uint64_t k_token_lifetime_ms = 250;
     RenderSnapshot snapshot;
@@ -491,17 +492,25 @@ RenderSnapshot snapshot_render_tokens(std::uint32_t render_w, std::uint32_t rend
         const auto &entry = g_inst_params[i];
         auto &observation = snapshot.entries[i];
         observation.instance = entry.instance;
-        if (!render_w || !render_h) continue;
+        const auto matches = [&](const CapturedParams &params)
+        {
+            return render_w && render_h && display_w && display_h && params.render_w == render_w &&
+                params.render_h == render_h && params.display_w == display_w && params.display_h == display_h;
+        };
+        observation.dimensions_match = matches(entry.params);
         for (const auto &token : entry.pending)
         {
             if (!token.generation || token.capture_tick > snapshot.observed_tick ||
                 snapshot.observed_tick - token.capture_tick > k_token_lifetime_ms ||
-                token.params.render_w != render_w || token.params.render_h != render_h)
+                !matches(token.params))
                 continue;
             // 连续记录多帧时按捕获顺序推进历史，不能用最新 token 跳过同实例的较早帧。
             if (!observation.pending.generation || token.generation < observation.pending.generation)
                 observation.pending = token;
         }
+        // 2026-11-16（PID44888）：同渲染尺寸的照明输出不能认领上采样 token；匹配在环内完成，
+        // 避免旧 display 的头 token 遮住随后真正匹配的帧，同时保留所有实例供活性仲裁。
+        if (observation.pending.generation) observation.dimensions_match = true;
     }
     return snapshot;
 }

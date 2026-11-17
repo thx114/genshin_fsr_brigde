@@ -8,6 +8,8 @@
 #include "../game/AnchorPatterns.h"
 #include "../ngx/F6EvalReceiptV1.h"
 #include "../interop/BeforeSrV1.h"
+#include "../ComMethodRoutes.h"
+#include "../NgxBackend.h"
 
 #include <cstring>
 #include <filesystem>
@@ -66,6 +68,71 @@ CaptureFrame square_frame(UINT size, bool expect_provider, UINT r = 32, UINT g =
     const UINT display_size = same_size ? size : size * 2;
     const CaptureExtent render { size, size }, display { display_size, display_size };
     return { render, display, [=] { instance.publish(render, display, 0.f, 0.f); }, expect_provider, r, g, b };
+}
+
+using PixelMapFunction = HRESULT (STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT,
+    D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE *);
+HRESULT STDMETHODCALLTYPE observe_pixel_map(ID3D11DeviceContext *, ID3D11Resource *, UINT,
+    D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE *);
+using PixelMapRoutes = ComMethodRoutes<PixelMapFunction, &observe_pixel_map, 14, true>;
+PixelMapRoutes g_pixel_map;
+std::atomic<unsigned> g_pixel_map_attempts {}, g_pixel_map_successes {};
+
+HRESULT STDMETHODCALLTYPE observe_pixel_map(ID3D11DeviceContext *context, ID3D11Resource *resource,
+    UINT subresource, D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE *mapped)
+{
+    bool synchronous_pixel = false;
+    if (resource && type == D3D11_MAP_READ && flags == 0)
+    {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        if (SUCCEEDED(resource->QueryInterface(IID_PPV_ARGS(&texture))))
+        {
+            D3D11_TEXTURE2D_DESC desc {};
+            texture->GetDesc(&desc);
+            synchronous_pixel = desc.Width == 1 && desc.Height == 1 &&
+                desc.Usage == D3D11_USAGE_STAGING && (desc.CPUAccessFlags & D3D11_CPU_ACCESS_READ) != 0;
+        }
+    }
+    if (synchronous_pixel) g_pixel_map_attempts.fetch_add(1, std::memory_order_relaxed);
+    const HRESULT result = g_pixel_map(context, resource, subresource, type, flags, mapped);
+    if (synchronous_pixel && SUCCEEDED(result)) g_pixel_map_successes.fetch_add(1, std::memory_order_relaxed);
+    return result;
+}
+
+bool run_pixel_readback(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
+    std::FILE *observations, bool expect_samples)
+{
+    const auto configure = reinterpret_cast<void (*)()>(GetProcAddress(provider, "ConfigureBeforeSrAoFixture"));
+    const auto evaluations = reinterpret_cast<unsigned (*)()>(GetProcAddress(provider, "BeforeSrAoFixtureFrames"));
+    if (!configure || !evaluations || evaluations() != 0 ||
+        !com_vtable::patch(&context, 115, {route_slot(g_pixel_map)})) return false;
+    configure();
+    RenderFixture instance;
+    const CaptureExtent render {32, 32}, display {64, 64};
+    const unsigned interval = ngx::k_diagnostic_pixel_readback_interval;
+    for (unsigned n = 1; n <= interval + 1; ++n)
+    {
+        CaptureFrame frame {render, display, [&] { instance.publish(render, display, 0.f, 0.f); }, true};
+        frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        frame.alternate_scene_pixel = n % 2 ? 0xFF314A65u : 0xFFA47228u;
+        frame.exact_provider_pixel = frame.alternate_scene_pixel;
+        // 2026-11-16（PID728）：不用 retained_textures；它自己的 1x1 输入读回会污染被测计数。
+        // 同一宿主必须在旧 DLL 缺键和新 DLL 显式开启时观测到 6+2，零结果才有意义。
+        const bool pixels = draw_capture(&device, &context, CaptureEntry::draw, frame, observations);
+        const unsigned attempts = g_pixel_map_attempts.load(std::memory_order_relaxed);
+        const unsigned successes = g_pixel_map_successes.load(std::memory_order_relaxed);
+        const unsigned expected = expect_samples ? 6u + 2u * (n / interval) : 0u;
+        const unsigned evaluated = evaluations();
+        const bool correct = pixels && evaluated == n && attempts == expected && successes == expected;
+        if (!correct || n == 1 || n == interval - 1 || n == interval || n == interval + 1)
+            std::fprintf(observations,
+                "pixel readback: render=%u eval_total=%u exact_current=%d map_attempts_total=%u "
+                "map_successes_total=%u expected_total=%u\n", n, evaluated, pixels, attempts, successes, expected);
+        if (!correct) return false;
+    }
+    std::fprintf(observations, "pixel readback complete: eval_total=%u exact_current_frames=%u\n",
+        evaluations(), interval + 1);
+    return true;
 }
 
 bool run_input_map(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
@@ -254,6 +321,61 @@ bool run_guide_views(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE
         log.find("\"binding_bytes_complete\":true", first) == std::string::npos ||
         log.find("\"view_format\":49", first) == std::string::npos)) return false;
     return true;
+}
+
+bool run_candidate_admission(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
+    std::FILE *observations, bool generic)
+{
+    const auto configure = reinterpret_cast<void (*)()>(GetProcAddress(provider, "ConfigureBeforeSrAoFixture"));
+    const auto evaluations = reinterpret_cast<unsigned (*)()>(GetProcAddress(provider, "BeforeSrAoFixtureFrames"));
+    if (!configure || !evaluations) return false;
+    configure();
+    RenderFixture instances[2];
+    unsigned expected = 0;
+    bool all = true;
+    for (unsigned n = 0; n < 6; ++n)
+    {
+        const unsigned scene = n % 2;
+        const CaptureExtent render {128, 96}, display {256, 192};
+        const bool dlaa = n >= 4;
+        const auto actual_display = dlaa ? render : display;
+        // 2026-11-16：假 Draw 和真 accumulation 之间不发布第二个 Render；真输出是未消费 token 的证据。
+        CaptureFrame decoy {render, render,
+            [&] { instances[scene].publish(render, actual_display, 0.f, 0.f); }, false};
+        decoy.color_r10 = decoy.color_g10 = decoy.color_b10 = 1023;
+        if (n < 2)
+        {
+            decoy.layout = CaptureLayout::lighting;
+            if (n == 0)
+            {
+                decoy.motion_source_format = DXGI_FORMAT_R8G8_TYPELESS;
+                decoy.motion_source_view = DXGI_FORMAT_R8G8_UNORM;
+            }
+        }
+        else if (dlaa)
+        {
+            decoy.alias_history = true;
+            decoy.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+        const bool native = draw_capture(&device, &context, CaptureEntry::draw, decoy, observations);
+        const unsigned after_decoy = evaluations();
+        CaptureFrame real {render, actual_display, [] {}, true};
+        real.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+        real.alternate_scene_pixel = 0xFF315B91u + n * 0x00090703u;
+        real.exact_provider_pixel = real.alternate_scene_pixel;
+        // 重排与 1:1 交替覆盖；不把合成 fixture 的常量 PS 宣传为 temporal 算法认证。
+        real.layout = generic || n >= 3 ? CaptureLayout::reordered : CaptureLayout::standard;
+        const bool delivered = draw_capture(&device, &context, CaptureEntry::draw, real, observations);
+        ++expected;
+        std::fprintf(observations,
+            "candidate admission: step=%u scene=%c decoy=%s native_pixels=%d eval_after_decoy=%u "
+            "expected_before=%u current_pixels=%d eval_after_real=%u expected_after=%u new_render=0\n",
+            n + 1, 'A' + scene, n < 2 ? (n ? "lighting-packed" : "lighting-rg8") :
+                dlaa ? "alias-history" : "wrong-display", native, after_decoy, expected - 1,
+            delivered, evaluations(), expected);
+        all &= native && after_decoy == expected - 1 && delivered && evaluations() == expected;
+    }
+    return all;
 }
 
 bool run_multi_scene(ID3D11Device &device, ID3D11DeviceContext &context, HMODULE provider,
@@ -446,10 +568,19 @@ int wmain(int argc, wchar_t **argv)
     const bool multi_scene = mode == L"ngx-multi-scene";
     const bool failure_recovery = mode == L"ngx-failure-recovery";
     const bool guide_views = mode == L"ngx-guide-views";
+    const bool generic_admission = mode == L"ngx-candidate-admission-generic";
+    const bool candidate_admission = mode == L"ngx-candidate-admission" || generic_admission;
+    const bool pixel_readback_on = mode == L"ngx-pixel-readback-on";
+    const bool pixel_readback_legacy = mode == L"ngx-pixel-readback-legacy";
+    const bool pixel_readback = pixel_readback_on || pixel_readback_legacy ||
+        mode == L"ngx-pixel-readback-default" || mode == L"ngx-pixel-readback-off";
     const bool fixture = receipt || before_sr || input_map || ao_fixture ||
-        scene_depth || multi_scene || failure_recovery || producer_capture || guide_views;
+        scene_depth || multi_scene || failure_recovery || producer_capture || guide_views || candidate_admission ||
+        pixel_readback;
     const wchar_t *fixture_name = multi_scene ? L"NgxMultiSceneProvider.dll" :
-        before_sr || producer_capture || scene_depth || failure_recovery || guide_views || (ao_fixture && !ao_v1) ? L"BeforeSrProvider.dll" :
+        before_sr || producer_capture || scene_depth || failure_recovery || guide_views || candidate_admission ||
+            pixel_readback ||
+            (ao_fixture && !ao_v1) ? L"BeforeSrProvider.dll" :
         L"F6ReceiptProvider.dll";
     if (argc != 2 && (argc != 4 || !fixture))
     {
@@ -491,15 +622,18 @@ int wmain(int argc, wchar_t **argv)
     // 调用者提供独立目录；只写本夹具所需的配置，不使用或改写安装/发布配置。
     std::ofstream config(root / L"Dx11FsrBridge.ini", std::ios::out | std::ios::trunc);
     config << "[Dx11FsrBridge]\nEnabled=1\nRenderScaleMenu=0\nTransparentJitter=0\nFsr2TranslationMode=2\n"
-        "Fsr2Mode2OnDemandState=1\nFsr2Il2CppHook=1\nFfx12=1\nFfx12Hdr=0\nFfx12NonLinear=0\n"
+        "Fsr2Mode2OnDemandState=" << !generic_admission << "\nFsr2Il2CppHook=1\nFfx12=1\nFfx12Hdr=0\nFfx12NonLinear=0\n"
         "Ffx12GpuInterop=1\nFfx12JitterMode=" << (input_map ? 3 : 0) << "\nFfx12JitterDelay=" << delayed_input
         << "\nFfx12AsyncUpscale=" << async << '\n'
         << "Fsr2Il2CppRenderRva=0x" << std::hex << ucb + k_render_offset << "\nFsr2Il2CppUcbRva=0x" << ucb << '\n';
+    if (generic_admission) config << "Fsr2FastStateTracking=0\n";
     if (ngx)
     {
         if (producer_capture || guide_views) config << "Fsr2TraceColorProducers=1\nFsr2FamilySkip=0\n";
         config << "Ffx12Backend=ngx\nNgxHdr=0\nNgxLogLevel=3\nNgxProvider="
             << (nvidia ? "nvidia" : "external") << '\n';
+        if (pixel_readback_on || mode == L"ngx-pixel-readback-off")
+            config << "NgxDiagnosticPixelReadback=" << pixel_readback_on << '\n';
         if (prewarm) config << "NgxPrewarmAtSwapchain=1\n";
         if (failure_recovery) config << "Fsr2FamilySkip=1\n";
         if (test_ao)
@@ -609,6 +743,12 @@ int wmain(int argc, wchar_t **argv)
         return run_failure_recovery(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
     if (guide_views)
         return run_guide_views(*device.Get(), *context.Get(), provider_module, observations.get()) ? 0 : 1;
+    if (candidate_admission)
+        return run_candidate_admission(*device.Get(), *context.Get(), provider_module, observations.get(),
+            generic_admission) ? 0 : 1;
+    if (pixel_readback)
+        return run_pixel_readback(*device.Get(), *context.Get(), provider_module, observations.get(),
+            pixel_readback_legacy || (pixel_readback_on && DX11FSRBRIDGE_TEST_DIAGNOSTICS)) ? 0 : 1;
     if (producer_capture)
     {
         RenderFixture target_instance, other_instance;

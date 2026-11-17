@@ -18,6 +18,7 @@
 #include "runtime/GraphicsIngress.h"
 #include "runtime/DrawSequence.h"
 #include "runtime/FrameBindings.h"
+#include "runtime/ProducerTransfer.h"
 #include "runtime/JitterReadback.h"
 #include "runtime/OutputHistory.h"
 #include "runtime/CandidateSignature.h"
@@ -7200,6 +7201,7 @@ void STDMETHODCALLTYPE hooked_cs_set_shader_resources(ID3D11DeviceContext *conte
 
 void STDMETHODCALLTYPE hooked_cs_set_uavs(ID3D11DeviceContext *context, UINT start_slot, UINT count, ID3D11UnorderedAccessView *const *views, const UINT *initial_counts)
 {
+    const neo::producer::TargetRefresh producer_targets(*context, true);
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
     {
@@ -7282,6 +7284,7 @@ void ensure_context_device_texture_hook(ID3D11DeviceContext *context)
 
 void STDMETHODCALLTYPE hooked_om_set_render_targets(ID3D11DeviceContext *context, UINT count, ID3D11RenderTargetView *const *rtvs, ID3D11DepthStencilView *dsv)
 {
+    const neo::producer::TargetRefresh producer_targets(*context);
     ensure_context_device_texture_hook(context);
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     if (g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state)
@@ -7325,6 +7328,7 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets_and_uavs(
     ID3D11UnorderedAccessView *const *unordered_access_views,
     const UINT *uav_initial_counts)
 {
+    const neo::producer::TargetRefresh producer_targets(*context);
     ensure_context_device_texture_hook(context);
     if (g_config.dx11_on12_swapchain)
     {
@@ -7359,6 +7363,7 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
         g_original_dispatch(context, group_x, group_y, group_z);
         return;
     }
+    neo::producer::unordered_write(*context);
 
     // 【诊断】PerfProbe：compute dispatch 钩子整体（**抽样**计时）。
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
@@ -7402,19 +7407,11 @@ void STDMETHODCALLTYPE hooked_dispatch(ID3D11DeviceContext *context, UINT group_
 #endif
 }
 
-// 接管路径指纹缓存（正缓存）：缓存"识别成功"的资源特征指纹 → 布局。
-// 键 = 特征值（尺寸/格式/槽位组合，非指针）——UI 切换/视图地址复用无关。
-// 命中：按缓存布局读少量视图验证指纹 → 直接构造 info（省 9 视图完整读取）。
+// 2026-11-16（PID44888）：正缓存保存完整角色布局，只省重复角色搜索。
+// 当前 Draw 仍须重验 LUT、独立历史/MRT、类型视图和资源去别名，指纹不包含资源指针。
 struct UpscalerPathCacheEntry
 {
-    std::uint32_t color_slot = 0;
-    std::uint32_t depth_slot = 2;
-    std::uint32_t motion_slot = 3;
-    std::uint32_t transparency_slot = UINT_MAX;
-    std::uint32_t output_rtv_slot = 1;
-    std::uint32_t output_w = 0;
-    std::uint32_t output_h = 0;
-    std::uint32_t output_fmt = 0;
+    TargetUpscalerDrawInfo layout;
     std::uint64_t last_hit_tick = 0;
 };
 constexpr std::size_t k_path_cache_capacity = 8;
@@ -7433,16 +7430,19 @@ std::uint64_t upscaler_path_fingerprint(
         mix(static_cast<std::uint64_t>(r.width));
         mix(static_cast<std::uint64_t>(r.height));
         mix(static_cast<std::uint64_t>(r.format));
+        mix(static_cast<std::uint64_t>(r.view_format));
     };
     mix(static_cast<std::uint64_t>(info.color_srv_slot));
     mix(static_cast<std::uint64_t>(info.motion_srv_slot));
     mix(static_cast<std::uint64_t>(info.depth_srv_slot));
     mix(static_cast<std::uint64_t>(info.output_rtv_slot));
-    mix_info(inputs[info.color_srv_slot]);
-    mix_info(inputs[info.motion_srv_slot]);
-    mix_info(inputs[info.depth_srv_slot]);
-    mix_info(outputs[0]);
-    mix_info(outputs[1]);
+    mix(info.weights_srv_slot);
+    mix(info.history_metadata_srv_slot);
+    mix(info.history_color_srv_slot);
+    mix(info.metadata_rtv_slot);
+    mix(info.standard_layout);
+    for (const auto &input : inputs) mix_info(input);
+    for (const auto &output : outputs) mix_info(output);
     return h;
 }
 
@@ -7467,70 +7467,39 @@ struct SlotMetadata
 };
 
 std::optional<TargetUpscalerDrawInfo> try_upscaler_path_cache_fast(
-    SlotMetadata<ID3D11RenderTargetView, 2> &targets, SlotMetadata<ID3D11ShaderResourceView, 7> &inputs)
+    const std::array<ResourceInfo, 2> &targets, const std::array<ResourceInfo, 7> &inputs,
+    neo::graphics::CandidateGeometry geometry)
 {
-    const auto &out0 = targets.get(0);
-    if (!out0.resource_key) return std::nullopt;
     std::array<std::pair<std::uint64_t, UpscalerPathCacheEntry>, k_path_cache_capacity> candidates;
     std::size_t count = 0;
     {
         std::lock_guard lock(g_upscaler_path_cache_mutex);
         for (const auto &[key, entry] : g_upscaler_path_cache)
-            if (entry.output_w == out0.width && entry.output_h == out0.height &&
-                entry.output_fmt == static_cast<std::uint32_t>(out0.format))
+            if (entry.layout.output_width == geometry.viewport_width &&
+                entry.layout.output_height == geometry.viewport_height)
                 candidates[count++] = { key, entry };
     }
     for (const auto &[fingerprint, entry] : std::span(candidates).first(count))
     {
-        const auto &color = inputs.get(entry.color_slot);
-        const auto &motion = inputs.get(entry.motion_slot);
-        const auto &depth = inputs.get(entry.depth_slot);
-        if (color.resource_key == 0 || motion.resource_key == 0 || depth.resource_key == 0)
+        const auto &layout = entry.layout;
+        // 2026-11-16（PID44888）：缓存只省角色搜索，不能把旧的历史/LUT/MRT 事实带入新 Draw。
+        if (!neo::graphics::validate_accumulation_candidate(inputs, targets, geometry, layout) ||
+            upscaler_path_fingerprint(inputs, targets, layout) != fingerprint)
             continue;
-
-        ResourceInfo out1 {};
-        if (entry.output_rtv_slot < 2)
-            out1 = targets.get(entry.output_rtv_slot);
-
-        std::uint64_t h = 14695981039346656037ull;
-        const auto mix = [&h](std::uint64_t v) { h ^= v; h *= 1099511628211ull; };
-        const auto mix_info = [&mix](const ResourceInfo &r)
-        {
-            mix(static_cast<std::uint64_t>(r.width));
-            mix(static_cast<std::uint64_t>(r.height));
-            mix(static_cast<std::uint64_t>(r.format));
-        };
-        mix(static_cast<std::uint64_t>(entry.color_slot));
-        mix(static_cast<std::uint64_t>(entry.motion_slot));
-        mix(static_cast<std::uint64_t>(entry.depth_slot));
-        mix(static_cast<std::uint64_t>(entry.output_rtv_slot));
-        mix_info(color);
-        mix_info(motion);
-        mix_info(depth);
-        mix_info(out0);
-        mix_info(out1);
-        if (h != fingerprint)
-            continue;
-
-        TargetUpscalerDrawInfo info;
+        const auto &color = inputs[layout.color_srv_slot], &motion = inputs[layout.motion_srv_slot];
+        const auto &output = targets[layout.output_rtv_slot];
+        auto info = layout;
         info.render_width = color.width;
         info.render_height = color.height;
-        info.output_width = out0.width;
-        info.output_height = out0.height;
-        info.color_srv_slot = entry.color_slot;
-        info.depth_srv_slot = entry.depth_slot;
-        info.motion_srv_slot = entry.motion_slot;
-        info.transparency_srv_slot = entry.transparency_slot;
-        info.output_rtv_slot = entry.output_rtv_slot;
+        info.output_width = output.width;
+        info.output_height = output.height;
+        info.constant_buffer_key = geometry.cb0_key;
         info.color_resource_key = color.resource_key;
         info.motion_resource_key = motion.resource_key;
-        // 匹配期间可能被淘汰或覆盖（transparency 槽不在指纹内），提交时只采信仍在表里的布局。
+        // 匹配期间可能被淘汰；读取和提交分开，保持原先的短锁范围。
         std::lock_guard lock(g_upscaler_path_cache_mutex);
         const auto hit = g_upscaler_path_cache.find(fingerprint);
-        if (hit == g_upscaler_path_cache.end() || hit->second.color_slot != entry.color_slot ||
-            hit->second.motion_slot != entry.motion_slot || hit->second.depth_slot != entry.depth_slot ||
-            hit->second.output_rtv_slot != entry.output_rtv_slot) continue;
-        info.transparency_srv_slot = hit->second.transparency_slot;
+        if (hit == g_upscaler_path_cache.end()) continue;
         hit->second.last_hit_tick = GetTickCount64();
         return info;
     }
@@ -7826,36 +7795,10 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     perf_funnel.mark(perf_probe::FunnelStage::after_ps_query);
 #endif
 
-    // 快速路径：正缓存命中直接构造接管（省 9 视图完整读取——只读 RTV[0] + 布局 3 SRV 验证指纹）
-    //
-    // ⚠️ 2026-09-27（B106）：这个调用**必须留在下面两条便宜判据之前**。
-    // `try_upscaler_path_cache_fast` 的判据里**完全不含 cb0，也不看视口**
-    // （只看 RTV[0] 的 output 尺寸/格式 + 缓存布局上的 3 个 SRV + out1 指纹）。
-    // 若把它挪到便宜判据之后，原本能命中快路径的 draw 会走不到 ⇒ **缩小识别集合** ✗。
-    // 两条识别路径共享此次 draw 的绑定元数据。
+    // 2026-11-16：旧缓存不看 CB/视口/历史关系的判据已由 PID44888 误识别证伪。
+    // 保留同次 Draw 元数据共享；缓存验证放在完整几何之后，不能绕过新版识别契约。
     SlotMetadata<ID3D11RenderTargetView, 2> target_meta { render_targets };
     SlotMetadata<ID3D11ShaderResourceView, 7> input_meta { shader_resources };
-    if (const auto fast_info = try_upscaler_path_cache_fast(target_meta, input_meta))
-    {
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-        perf_funnel.mark(perf_probe::FunnelStage::fast_hit);
-#endif
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-        perf_probe::mark_draw_shape_identified(draw_shape_mark);
-#endif
-        // 【B109 保险】识别成功点 ①（正缓存快路径命中）：检查本次绘制的 `element_count`。
-        // 正常情形（`== 3`）立即返回、零原子操作；一旦出现非 3 ⇒ 一次性停用入口过滤器
-        // 并打 `draw_entry_filter_disabled …` 告警（fail-open 回原路径）。
-        // ⚠️ **不能**只放在下面那一处：这条快路径是 `return` 出去的另一条识别成功路径。
-        perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark,
-                                                       entry_admit.canary);
-        // B108：漏斗层的**非抽样**识别计数（与形状层那只手交叉核对，见 flush 的自洽断言）
-#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-        perf_probe::note_identified_total();
-#endif
-        register_cb0_for_jitter(constant_buffer);
-        return fast_info;
-    }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     perf_funnel.mark(perf_probe::FunnelStage::after_fast_path);
 #endif
@@ -7893,11 +7836,12 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     //   - 视口尺寸为 0（或 `viewport_count == 0`）同样被两套签名拒绝（真实 Texture2D 尺寸不可能为 0）。
     // ⇒ 不满足它的 draw 必被拒 ⇒ 前移不改变结果。
     // 收益：这条拒绝发生在读 7 个 SRV **之前** ⇒ 省 7 次视图读取。
-    // ⚠️ 同样必须在快路径之后（快路径只看 rtv0 的 output 特征，不看视口）✗。
+    // 2026-11-16：缓存同样受此几何约束，避免旧布局替不匹配 Draw 授权。
     D3D11_VIEWPORT viewport {};
     UINT viewport_count = 1;
     context->RSGetViewports(&viewport_count, &viewport);
 
+    target_meta.get(0);
     target_meta.get(1);
     const auto &outputs = target_meta.values;
 
@@ -7937,6 +7881,17 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
         viewport_count != 0 ? static_cast<std::uint32_t>(viewport.Height) : 0,
         constant_buffer_description.ByteWidth, constant_buffer_key,
     };
+    if (const auto fast_info = try_upscaler_path_cache_fast(outputs, inputs, geometry))
+    {
+#if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+        perf_funnel.mark(perf_probe::FunnelStage::fast_hit);
+        perf_probe::mark_draw_shape_identified(draw_shape_mark);
+        perf_probe::note_identified_total();
+#endif
+        perf_probe::note_draw_identified_element_count(element_count, draw_shape_mark, entry_admit.canary);
+        register_cb0_for_jitter(constant_buffer);
+        return fast_info;
+    }
     neo::graphics::StandardEvidence standard {};
     auto identified = neo::graphics::identify_standard_candidate(inputs, outputs, geometry, standard);
     const auto &[output_metadata, output_color] = outputs;
@@ -8019,14 +7974,7 @@ std::optional<TargetUpscalerDrawInfo> inspect_target_upscaler_draw_on_demand(
     {
         std::lock_guard lock(g_upscaler_path_cache_mutex);
         UpscalerPathCacheEntry entry;
-        entry.color_slot = identified->color_srv_slot;
-        entry.depth_slot = identified->depth_srv_slot;
-        entry.motion_slot = identified->motion_srv_slot;
-        entry.transparency_slot = identified->transparency_srv_slot;
-        entry.output_rtv_slot = identified->output_rtv_slot;
-        entry.output_w = outputs[0].width;
-        entry.output_h = outputs[0].height;
-        entry.output_fmt = static_cast<std::uint32_t>(outputs[0].format);
+        entry.layout = *identified;
         entry.last_hit_tick = GetTickCount64();
         const std::uint64_t fingerprint = upscaler_path_fingerprint(inputs, outputs, *identified);
         if (g_upscaler_path_cache.size() >= k_path_cache_capacity)
@@ -10015,7 +9963,8 @@ UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
         const auto claim_color_ptr = reinterpret_cast<std::uint64_t>(bound_color.Get());
 
         // 2) draw→实例 匹配
-        const auto render = il2cpp_callsite::snapshot_render_tokens(draw_info->render_width, draw_info->render_height);
+        const auto render = il2cpp_callsite::snapshot_render_tokens(draw_info->render_width, draw_info->render_height,
+            draw_info->output_width, draw_info->output_height);
         constexpr std::uint64_t k_p1_live_ms = 200;
         std::array<neo::graphics::FrameEvidence, il2cpp_callsite::k_render_instance_capacity> evidence {};
         std::array<std::uint64_t, il2cpp_callsite::k_render_instance_capacity> live_instances {};
@@ -10051,6 +10000,9 @@ UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
         const bool p1_ghost_instance_present = live_count == 0 && saw_dormant_instance;
         const auto claim = neo::graphics::attribute_frame(std::span(evidence.data(), render.count),
             claim_color_ptr, render.observed_tick, k_p1_bootstrap_health_ms);
+        // 2026-11-16（PID44888）：尺寸不匹配既不消费 Render，也不推进实例/接管/历史状态。
+        if (!claim.instance && std::none_of(render.entries.begin(), render.entries.begin() + render.count,
+            [](const auto &entry) { return entry.dimensions_match; })) return UpscaleDrawResult::original;
         const auto call_params = claim.token.params;
         const std::uint64_t call_gen = claim.token.generation;
         const std::uint64_t match_inst = claim.instance;
@@ -10968,6 +10920,7 @@ UpscaleDrawResult try_fsr2_translation_draw(ID3D11DeviceContext *context,
                 // 2026-11-16：同尺寸 DSV 不能证明同相机/同帧输入；只交付当前 FSR 实际消费的深度。
                 ffx12::FrameInput sdk_in {};
                 sdk_in.color = color_tex;
+                sdk_in.color_transfer = neo::producer::take_transfer(*context, *color_tex);
 #if defined(DX11FSRBRIDGE_ENABLE_NGX)
                 // 2026-11-15：沿匹配 color 的同一次 PS 绑定传递视图，不再查 context 或猜测纹理的读法。
                 const auto color_inputs = frame.inputs();
@@ -12243,7 +12196,7 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     const perf_probe::DrawShapeSlot &shape,
 #endif
-    Draw &&draw)
+    Draw &&draw, UINT vertex_start = 0, INT vertex_base = 0)
 {
     if (!context)
     {
@@ -12324,21 +12277,21 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
     bool final_scene_snapshot_boundary = false;
     std::uint64_t final_scene_snapshot_frame = 0;
 #endif
-#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
     // 2026-11-16（execute_draw 的 UD/UHD/UHSD 路线）：业务分支内的原 Draw 也必须成对记录。
     // before/after 仅包最终回退，故观测放在真实 next 调用；替换成功而未执行原 Draw 时不发事件。
     const auto observed_draw = [&]
     {
+#if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         const auto sequence = record_color_source_call(context, entry_name, element_count, 0, 0);
+#endif
+        auto producer_write = neo::producer::begin_draw(*context, element_count, Indexed, vertex_start, vertex_base);
         draw();
+        producer_write.returned();
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         note_before_sr_producer_return(context, sequence);
 #endif
     };
     neo::graphics::execute_draw(observed_draw, upscale, tone_map, spatial, [&]
-#else
-    neo::graphics::execute_draw(draw, upscale, tone_map, spatial, [&]
-#endif
     {
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         if (g_config.enable_similarity_probe || (g_config.trace_pixel_shader_draws &&
@@ -12363,7 +12316,7 @@ void STDMETHODCALLTYPE hooked_draw_indexed(ID3D11DeviceContext *context, UINT co
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::DrawShapeSlot::indexed(count, start, base),
 #endif
-        [&] { g_original_draw_indexed(context, count, start, base); });
+        [&] { g_original_draw_indexed(context, count, start, base); }, start, base);
 }
 
 void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT count, UINT start)
@@ -12372,7 +12325,7 @@ void STDMETHODCALLTYPE hooked_draw(ID3D11DeviceContext *context, UINT count, UIN
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
         perf_probe::DrawShapeSlot::non_indexed(count, start),
 #endif
-        [&] { g_original_draw(context, count, start); });
+        [&] { g_original_draw(context, count, start); }, start);
 }
 
 void STDMETHODCALLTYPE hooked_flush(ID3D11DeviceContext *context)
@@ -12383,6 +12336,7 @@ void STDMETHODCALLTYPE hooked_flush(ID3D11DeviceContext *context)
 HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource, D3D11_MAP map_type, UINT map_flags, D3D11_MAPPED_SUBRESOURCE *mapped)
 {
     const HRESULT hr = g_original_map(context, resource, subresource, map_type, map_flags, mapped);
+    neo::producer::mapped(*context, resource, subresource, map_type, hr, mapped);
     if (SUCCEEDED(hr) && resource != nullptr && mapped != nullptr && mapped->pData != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
@@ -12399,6 +12353,7 @@ HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext *context, ID3D11Resourc
 
 void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext *context, ID3D11Resource *resource, UINT subresource)
 {
+    neo::producer::unmapping(*context, resource, subresource);
     if (resource != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(resource);
@@ -12458,6 +12413,7 @@ void STDMETHODCALLTYPE hooked_rs_set_viewports(ID3D11DeviceContext *context, UIN
 
 void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11Resource *dst, ID3D11Resource *src)
 {
+    neo::producer::invalidate(dst);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     note_before_sr_producer_overwrite(context, dst, neo::diagnostics::ProducerWrite::copy_resource);
 #endif
@@ -12530,6 +12486,7 @@ void STDMETHODCALLTYPE hooked_copy_resource(ID3D11DeviceContext *context, ID3D11
 
 void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, UINT dst_x, UINT dst_y, UINT dst_z, ID3D11Resource *src, UINT src_subresource, const D3D11_BOX *src_box)
 {
+    neo::producer::invalidate(dst);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     note_before_sr_producer_overwrite(context, dst, neo::diagnostics::ProducerWrite::copy_subresource);
 #endif
@@ -12557,6 +12514,7 @@ void STDMETHODCALLTYPE hooked_copy_subresource_region(ID3D11DeviceContext *conte
 
 void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, ID3D11Resource *dst, UINT dst_subresource, const D3D11_BOX *dst_box, const void *src_data, UINT src_row_pitch, UINT src_depth_pitch)
 {
+    neo::producer::update_buffer(*context, dst, dst_subresource, dst_box, src_data);
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     note_before_sr_producer_overwrite(context, dst, neo::diagnostics::ProducerWrite::update_subresource);
 #endif
@@ -12588,6 +12546,12 @@ void STDMETHODCALLTYPE hooked_update_subresource(ID3D11DeviceContext *context, I
 
 void STDMETHODCALLTYPE hooked_clear_rtv(ID3D11DeviceContext *context, ID3D11RenderTargetView *rtv, const FLOAT color[4])
 {
+    if (rtv)
+    {
+        Microsoft::WRL::ComPtr<ID3D11Resource> destination;
+        rtv->GetResource(destination.GetAddressOf());
+        neo::producer::invalidate(destination.Get());
+    }
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     if (rtv && before_sr_producer_observation_pending())
     {
@@ -12640,6 +12604,9 @@ std::span<const com_vtable::MethodPatch> context_patch_plan()
         const auto plan = neo::graphics::context_observation(release,
             g_config.fsr2_translation_mode == 2 && g_config.fsr2_mode2_on_demand_state,
             g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm, g_config.dx11_on12_swapchain);
+#if defined(DX11FSRBRIDGE_ENABLE_NGX)
+        neo::producer::set_enabled(g_config.ffx12 && g_config.fsr2_translation_mode != 0);
+#endif
         // 2026-11-16：清理和区域复制在硬件/WARP均会还原 Draw 槽，
         // 命令返回观察必须覆盖发布版，不能只在诊断构型恢复入口。
         std::vector<com_vtable::MethodPatch> patches {
@@ -12663,9 +12630,9 @@ std::span<const com_vtable::MethodPatch> context_patch_plan()
                 route_slot(g_original_rs_set_viewports),
             });
         }
-        if (plan.track_targets)
+        if (plan.track_targets || neo::producer::enabled())
             patches.push_back(route_slot(g_original_om_set_render_targets));
-        if (plan.track_uavs)
+        if (plan.track_uavs || neo::producer::enabled())
             patches.push_back(route_slot(g_original_om_set_render_targets_and_uavs));
 #if !defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         patches.insert(patches.end(), {
@@ -12678,6 +12645,15 @@ std::span<const com_vtable::MethodPatch> context_patch_plan()
             route_slot(g_original_dispatch),
         });
 #endif
+        if (neo::producer::enabled())
+        {
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+            patches.push_back(route_slot(g_original_cs_set_uavs));
+            patches.push_back(route_slot(g_original_dispatch));
+#endif
+            const auto producer_methods = neo::producer::extra_methods(&repair_context_dispatch);
+            patches.insert(patches.end(), producer_methods.begin(), producer_methods.end());
+        }
         return patches;
     }();
     return configured;
@@ -12685,8 +12661,11 @@ std::span<const com_vtable::MethodPatch> context_patch_plan()
 
 bool install_context_hooks(ID3D11DeviceContext *context)
 {
-    return context && neo::graphics::bind_execution_dispatch(context, context_patch_plan(),
+    const bool installed = context && neo::graphics::bind_execution_dispatch(context, context_patch_plan(),
         route_slot(g_original_set_multithread_protected));
+    if (installed && neo::producer::enabled() && neo::producer::bind_extended(*context))
+        neo::producer::attach_context(*context);
+    return installed;
 }
 
 void rebind_context_dispatch(ID3D11DeviceContext *context)
@@ -12726,6 +12705,7 @@ BOOL STDMETHODCALLTYPE hooked_set_multithread_protected(ID3D11Multithread *prote
 HRESULT STDMETHODCALLTYPE hooked_create_buffer(ID3D11Device *device, const D3D11_BUFFER_DESC *desc, const D3D11_SUBRESOURCE_DATA *initial_data, ID3D11Buffer **buffer)
 {
     const HRESULT hr = g_original_create_buffer(device, desc, initial_data, buffer);
+    if (SUCCEEDED(hr) && desc && buffer && *buffer) neo::producer::remember_buffer(**buffer, *desc, initial_data);
     // Only constant buffers are tracked: every consumer of g_buffer_info /
     // g_buffer_snapshots (cb0 signature check, jitter readback, diagnostics)
     // operates on constant buffers, and snapshotting vertex/index/structured
@@ -12859,6 +12839,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_pixel_shader(ID3D11Device *device, const
     const HRESULT hr = g_original_create_pixel_shader(device, shader_bytecode, bytecode_length, class_linkage, pixel_shader);
     if (SUCCEEDED(hr) && pixel_shader != nullptr && *pixel_shader != nullptr)
     {
+        neo::producer::remember_shader(**pixel_shader, shader_bytecode, static_cast<std::size_t>(bytecode_length));
         const auto key = reinterpret_cast<std::uint64_t>(*pixel_shader);
 #if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
         const std::uint64_t fast_target_hash = g_mode2_fast_target_ps_hash.load(std::memory_order_relaxed);
@@ -12888,6 +12869,8 @@ HRESULT STDMETHODCALLTYPE hooked_create_vertex_shader(ID3D11Device *device, cons
         : 0;
 
     const HRESULT hr = g_original_create_vertex_shader(device, shader_bytecode, bytecode_length, class_linkage, vertex_shader);
+    if (SUCCEEDED(hr) && vertex_shader && *vertex_shader)
+        neo::producer::remember_vertex(**vertex_shader, shader_bytecode, static_cast<std::size_t>(bytecode_length));
     if (SUCCEEDED(hr) && vertex_shader != nullptr && *vertex_shader != nullptr)
     {
         const auto key = reinterpret_cast<std::uint64_t>(*vertex_shader);
@@ -12953,7 +12936,11 @@ bool install_device_hooks(ID3D11Device *device)
         route_slot(g_original_create_compute_shader),
     });
 #endif
+#if defined(DX11FSRBRIDGE_RELEASE_RUNTIME)
+    if (neo::producer::enabled()) patches.push_back(route_slot(g_original_create_vertex_shader));
+#endif
     bool installed = com_vtable::patch(device, interface_layout::device(device), patches);
+    if (installed) installed = neo::producer::bind_device(*device);
 
     if (g_config.trace_texture_creates || g_config.native_ldr_final_target_unorm)
     {
@@ -13283,6 +13270,7 @@ void install_factory_hooks_from_device(ID3D11Device *device)
 
 void bind_created_graphics(ID3D11Device *device, ID3D11DeviceContext *execution)
 {
+    (void)context_patch_plan();
     install_device_hooks(device);
     install_factory_hooks_from_device(device);
     install_context_hooks(execution);

@@ -42,6 +42,8 @@ struct CaptureTextures
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
 };
 
+enum class CaptureLayout { standard, reordered, lighting };
+
 struct CaptureFrame
 {
     CaptureExtent render {64, 64};
@@ -63,10 +65,14 @@ struct CaptureFrame
     DXGI_FORMAT depth_source_format = DXGI_FORMAT_UNKNOWN;
     CaptureTextures *retained_textures = nullptr;
     bool producer_roundtrip = false;
+    // 2026-11-16：真实writer必须在最终初始化之后写入SR本次读取的同一资源。
+    std::function<bool(ID3D11DeviceContext &, ID3D11Texture2D &)> color_producer;
     bool producer_overwrite = false;
     std::function<bool()> producer_before_consume;
     bool producer_om_uav = false;
     int producer_write_operation = -1;
+    CaptureLayout layout = CaptureLayout::standard;
+    bool alias_history = false;
 };
 
 inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
@@ -83,8 +89,19 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         "RWTexture2D<float4> a:register(u0), b:register(u1);"
         "[numthreads(8,8,1)] void cs(uint3 n:SV_DispatchThreadID) {"
         "a[n.xy]=float4(1,0,0,1); b[n.xy]=float4(0,1,0,1); }";
+    // 2026-11-16（PID44888）：照明型夹具确实解码法线/读取衰减，不用 shader 哈希伪造 temporal 证据。
+    const char lighting_shader[] =
+        "float4 vs(uint n:SV_VertexID):SV_Position {"
+        "return float4(n==2?3:-1,n==1?3:-1,0,1); }"
+        "Texture2D<float4> normal:register(t4); Texture2D<float2> attenuation:register(t1);"
+        "struct O { float4 color:SV_Target0; uint flags:SV_Target1; };"
+        "O ps(float4 position:SV_Position) { int3 p=int3(position.xy,0);"
+        "float3 n=normalize(normal.Load(p).xyz*2-1); float2 a=attenuation.Load(p);"
+        "O o; o.color=float4(n.x>0?1:0,a.x<0?1:0,a.y<0?1:0,1); o.flags=0; return o; }";
     const auto compile = [&](const char *name, const char *profile, ComPtr<ID3DBlob> &code) {
-        return SUCCEEDED(D3DCompile(shader, sizeof(shader), nullptr, nullptr, nullptr, name, profile,
+        const bool lighting = frame.layout == CaptureLayout::lighting;
+        return SUCCEEDED(D3DCompile(lighting ? lighting_shader : shader,
+            lighting ? sizeof(lighting_shader) : sizeof(shader), nullptr, nullptr, nullptr, name, profile,
             0, 0, &code, nullptr));
     };
     ComPtr<ID3DBlob> first_code, ps_code;
@@ -132,6 +149,16 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         desc.Format = n == 2 ? DXGI_FORMAT_R32_FLOAT : n == 3 ?
             (frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R16G16_FLOAT) :
             (n == 0 && frame.publish_render ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM);
+        // 2026-11-16（完整矩阵 mirrored 失败）：默认正例也必须提供单通道权重，不能依赖旧宽松判据。
+        // flags 也保持真实单通道；1:1 的 RGBA 占位 flags 会被合法分配为另一幅 history，污染别名负控。
+        if (n == 1 || n == 4) desc.Format = DXGI_FORMAT_R8_UNORM;
+        if (n == 1 && frame.layout != CaptureLayout::standard)
+            desc.Format = frame.layout == CaptureLayout::lighting ?
+                DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R16_UNORM;
+        if (frame.layout == CaptureLayout::reordered && (n == 5 || n == 7))
+            desc.Format = DXGI_FORMAT_R8G8_UNORM;
+        if (frame.layout == CaptureLayout::lighting && n == 0)
+            desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
         if (n == 3 && frame.motion_source_format != DXGI_FORMAT_UNKNOWN)
             desc.Format = frame.motion_source_format;
         const bool alternate_color = n == 0 && frame.color_source_view != DXGI_FORMAT_UNKNOWN;
@@ -142,7 +169,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             desc.Format = frame.depth_source_format;
         desc.BindFlags = n < 7 ? D3D11_BIND_SHADER_RESOURCE :
             (compute ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_RENDER_TARGET);
-        if (n == 0 && frame.producer_roundtrip) desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
+        if (n == 0 && (frame.producer_roundtrip || frame.color_producer)) desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
         if (n == 0 && frame.producer_om_uav) desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
         if (n == 2 && desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
             desc.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
@@ -156,6 +183,10 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             const auto value = n == 0 ? (alternate_color ? frame.alternate_scene_pixel : packed_scene) :
                 n == 2 ? 0x3f000000u : n == 3 ? (512u << 10) | 512u : 0u;
             pixels.assign(static_cast<std::size_t>(desc.Width) * desc.Height, value);
+            // 2026-11-16：三通道法线不与 packed MV 同属 R10，避免旧评分把唯一 motion 同时选作 color。
+            // 真实 R10 法线/RG8 衰减组合由 CandidateSignatureTest 的原始绑定用例单独覆盖。
+            if (frame.layout == CaptureLayout::lighting && n == 0)
+                std::fill(pixels.begin(), pixels.end(), 960u | (960u << 11) | (480u << 22));
             if (n == 2 || n == 3)
             {
                 // 2026-11-15（PR #16）：四个不同坐标，才能检测轴互换、旧内容复用以及错误读回行距。
@@ -168,6 +199,12 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             }
             init.pSysMem = pixels.data();
             init.SysMemPitch = desc.Width * sizeof(std::uint32_t);
+            if (n == 1 && desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+            {
+                wide_depth.assign(pixels.size(), 0);
+                init.pSysMem = wide_depth.data();
+                init.SysMemPitch = desc.Width * sizeof(std::uint64_t);
+            }
             if (n == 2 && desc.Format == DXGI_FORMAT_R32G8X24_TYPELESS)
             {
                 wide_depth.assign(pixels.size(), 0x3F000000ull);
@@ -271,6 +308,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     ComPtr<ID3D11DeviceContext> deferred;
     if (entry == CaptureEntry::command_list && FAILED(device->CreateDeferredContext(0, &deferred))) return false;
     auto *commands = deferred ? deferred.Get() : context;
+    if (frame.color_producer && !frame.color_producer(*commands, *textures[0].Get())) return false;
     ComPtr<ID3D11Buffer> constants, indices, arguments;
     const auto bind_graphics = [&]
     {
@@ -281,8 +319,19 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         commands->VSSetShader(vs.Get(), nullptr, 0);
         commands->PSSetShader(ps.Get(), nullptr, 0);
         commands->PSSetConstantBuffers(0, 1, constants.GetAddressOf());
-        commands->PSSetShaderResources(0, 7, inputs.data());
-        commands->OMSetRenderTargets(2, outputs, scene_dsv.Get());
+        auto bound_inputs = inputs;
+        std::array<ID3D11RenderTargetView *, 2> bound_outputs {outputs[0], outputs[1]};
+        if (frame.alias_history) bound_inputs[6] = bound_inputs[0];
+        if (frame.layout == CaptureLayout::reordered)
+        {
+            bound_inputs = {inputs[1], inputs[3], inputs[5], inputs[0], inputs[4], inputs[6], inputs[2]};
+            bound_outputs = {outputs[1], outputs[0]};
+        }
+        if (frame.layout == CaptureLayout::lighting)
+            bound_inputs = {inputs[2], inputs[3], inputs[4], inputs[1], inputs[0], inputs[5], inputs[6]};
+        commands->PSSetShaderResources(0, 7, bound_inputs.data());
+        commands->OMSetRenderTargets(frame.layout == CaptureLayout::lighting ? 1 : 2,
+            bound_outputs.data(), scene_dsv.Get());
         if (scene_dsv)
         {
             ComPtr<ID3D11DepthStencilView> bound;
@@ -323,6 +372,15 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         if (FAILED(device->CreateBuffer(&indirect, &initial, &arguments))) return false;
     }
     if (frame.publish_render) frame.publish_render();
+    if (frame.layout == CaptureLayout::lighting && pixel_receipt)
+    {
+        D3D11_TEXTURE2D_DESC normal_desc {}, motion_desc {};
+        textures[0]->GetDesc(&normal_desc);
+        textures[3]->GetDesc(&motion_desc);
+        std::fprintf(pixel_receipt, "lighting binding: normal_format=%u motion_format=%u one_rtv=1\n",
+            normal_desc.Format, motion_desc.Format);
+        if (normal_desc.Format != DXGI_FORMAT_R11G11B10_FLOAT) return false;
+    }
     switch (entry)
     {
     case CaptureEntry::draw:
@@ -373,14 +431,23 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
     const auto read_outputs = [&](std::optional<std::uint32_t> expected)
     {
         bool pixels_match = true;
-        for (unsigned n = 0; n < 2; ++n)
+        for (unsigned n = 0; n < (frame.layout == CaptureLayout::lighting ? 1u : 2u); ++n)
         {
-            context->CopyResource(readback.Get(), textures[n + 7].Get());
+            const bool metadata_pair = frame.layout == CaptureLayout::reordered && n == 0;
+            auto target_readback = readback;
+            if (metadata_pair)
+            {
+                auto metadata_desc = desc;
+                metadata_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+                if (FAILED(device->CreateTexture2D(&metadata_desc, nullptr, &target_readback))) return false;
+            }
+            context->CopyResource(target_readback.Get(), textures[n + 7].Get());
             D3D11_MAPPED_SUBRESOURCE mapped {};
-            if (FAILED(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+            if (FAILED(context->Map(target_readback.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
             const auto *pixel = static_cast<const unsigned char *>(mapped.pData) +
-                (frame.display.height / 2) * mapped.RowPitch + (frame.display.width / 2) * 4;
-            const bool native_pixel = pixel[n] == 255 && pixel[n ^ 1u] == 0 && pixel[2] == 0 && pixel[3] == 255;
+                (frame.display.height / 2) * mapped.RowPitch + (frame.display.width / 2) * (metadata_pair ? 2 : 4);
+            const bool native_pixel = pixel[n] == 255 && pixel[n ^ 1u] == 0 &&
+                (metadata_pair || (pixel[2] == 0 && pixel[3] == 255));
             const auto close_to_input = [](unsigned value, unsigned ten_bit)
             {
                 const int expected = static_cast<int>((ten_bit * 255 + 511) / 1023);
@@ -399,7 +466,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
                 }
                 return true;
             };
-            const bool provider_pixel = n == 0 ? pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 :
+            const bool provider_pixel = n == 0 ? pixel[0] == 0 && pixel[1] == 0 && (metadata_pair || pixel[2] == 0) :
                 frame.expect_attenuated_color ? attenuated() :
                 expected ? raw == *expected :
                 close_to_input(pixel[0], frame.color_r10) && close_to_input(pixel[1], frame.color_g10) &&
@@ -408,7 +475,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             if (pixel_receipt)
                 std::fprintf(pixel_receipt, "target=%u pixel=%u,%u,%u,%u expected=%s ok=%u\n", n,
                     pixel[0], pixel[1], pixel[2], pixel[3], frame.expect_provider ? "provider" : "native", correct);
-            context->Unmap(readback.Get(), 0);
+            context->Unmap(target_readback.Get(), 0);
             pixels_match &= correct;
         }
         return pixels_match;

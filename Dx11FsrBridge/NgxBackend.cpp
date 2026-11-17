@@ -359,6 +359,7 @@ bool                      g_dt_enabled    = true;
 bool                      g_use_reactive  = false;
 int                       g_log_level     = 1;
 bool                      g_passthrough   = false;
+bool                      g_diagnostic_pixel_readback = false;
 
 // ---- NgxCrossKeyReuse（默认 true）----
 // ★ 为什么是 std::atomic<bool> 而 g_passthrough 是普通 bool：
@@ -2968,6 +2969,11 @@ void set_passthrough(bool on)
     g_passthrough = on;
 }
 
+void set_diagnostic_pixel_readback(bool enable)
+{
+    g_diagnostic_pixel_readback = enable;
+}
+
 void set_before_sr_ao(bool enable)
 {
     g_before_sr_ao = enable;
@@ -3270,7 +3276,8 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
                 (reset_val ? k_before_sr_reset : 0u),
             .jitter_x = in.jitter_x, .jitter_y = in.jitter_y,
             .motion_scale_x = in.motion_scale_x, .motion_scale_y = in.motion_scale_y,
-        }, ao_applied ? inst.ao.color_output() : neo::ngx::BeforeSrColorSource { in.color, in.color_source_view } };
+        }, ao_applied ? inst.ao.color_output(in.color_transfer) :
+            neo::ngx::BeforeSrColorSource { in.color, in.color_source_view, in.color_transfer } };
     };
     ComPtr<ID3D11Texture2D> filtered_color;
     bool ao_applied = false;
@@ -3466,10 +3473,12 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     }
 
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
+    // 2026-11-16（原神 PID728）：同步像素 Map 会等待 GPU，日志等级不能关闭该操作。
+    // 首帧与周期抽检共用默认关闭的显式开关；实际帧延迟收益仍待游戏复测。
     // ---- §4.2 第 18 行：每 600 帧抽检输出纹理的两个角（左上 + 右下）----
     // ★ 两角皆全零 ⇒ 疑似 CopyResource 无声失败。**不置 g_release_all**（可能是场景本身全黑，
     //   §4.2 第 18 行的「是否置位」列明确为「否」）。
-    if ((frame_count % 600u) == 0u)
+    if (g_diagnostic_pixel_readback && (frame_count % k_diagnostic_pixel_readback_interval) == 0u)
     {
         bool tl_zero = false, br_zero = false;
         const bool tl_ok = sample_1x1_zero(ctx, inst.pool.output.Get(), 0, 0, tl_zero);
@@ -3491,7 +3500,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     // ---- §4.2 第 20 行：首帧全黑检测（三点采样，输出 vs 输入）----
     // ★ 判据：**输出三点全零 且 输入不是三点全零** ⇒ NGX 静默降级（Success 但没出图）。
     //   只做一次（首帧），因为它要 6 次 Map，代价远超一次 Evaluate。
-    if (!g_diag_first_eval_done)
+    if (g_diagnostic_pixel_readback && !g_diag_first_eval_done)
     {
         g_diag_first_eval_done = true;   // 无论采样成败都只做一次，避免采样失败后每帧重试
         const UINT cx = inst.pool.shape.output_width / 2u, cy = inst.pool.shape.output_height / 2u;
