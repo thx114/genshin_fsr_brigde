@@ -31,6 +31,13 @@ int wmain(int argc, wchar_t **argv)
         std::puts("Complete provider failed to replace rejected candidate");
         return 1;
     }
+    wchar_t expected[32768] {};
+    if (!GetFullPathNameW(argv[1], static_cast<DWORD>(std::size(expected)), expected, nullptr) ||
+        _wcsicmp(loaded.entry_path.c_str(), expected) != 0)
+    {
+        std::puts("Discovery did not record the actual entry module path");
+        return 1;
+    }
     std::puts("NGX discovery rejected a partial ABI, then bound a complete provider and its own F6 receipt");
     return 0;
 }

@@ -34,6 +34,7 @@ struct ProviderDiscovery
     ProviderApi api;
     const wchar_t *source = nullptr;
     std::wstring path;
+    std::wstring entry_path;
     bool nvidia = false;
 
     const wchar_t *failure = L"provider_missing";

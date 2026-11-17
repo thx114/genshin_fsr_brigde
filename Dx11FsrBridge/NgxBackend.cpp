@@ -63,6 +63,7 @@
 #include "NgxBackend.h"
 #include "Il2CppCallSiteHook.h"
 #include "ngx/FeatureHandle.h"
+#include "ngx/DiagnosticSampling.h"
 #include "ngx/ProviderDiscovery.h"
 #include "ngx/FrameResources.h"
 #include "ngx/BeforeSr.h"
@@ -853,15 +854,15 @@ std::string warn_to_string(unsigned int bits)
 // ★ 三者的阈值**各不相同**，且都是 SDS 明文写死的，不要合并成一个函数 ——
 //   合并会让"某条线的闸门调了、另一条忘了调"这种事故在下一次改动时重现。
 // ★ 三种形态的来源：
-//   ngx_in / ngx_out  → §3.10.1 表「闸门」列：count <= 8 || count % 1024 == 0
+//   ngx_in / ngx_out  → 前 8 帧及每 1021 帧，避免与抖动相位锁定。
 //   ngx_core eval 成功 → §3.10.1 表：每 1024 帧
 //   ngx_core eval 失败 → §3.10.1 表：每次（前 8 次全打，之后每 256 次一次）
 // ============================================================================
 
-// 前 8 帧全打 + 之后每 1024 帧一次（ngx_in / ngx_out 共用，§3.10.1）。
-static bool log_gate_win8_every1024(std::uint64_t count)
+// 2026-11-17（上游 3ab1dc0）：周期由同一接口提供给生产与相位覆盖测试。
+static bool log_gate_win8_jitter(std::uint64_t count)
 {
-    return count <= 8u || (count % 1024u) == 0u;
+    return neo::ngx::sample_jitter(count);
 }
 
 // 每 1024 帧一次（ngx_core eval 成功行，§3.10.1）。
@@ -1406,11 +1407,11 @@ static bool ensure_init(ID3D11Device *dev, bool prewarming = false)
             g_dlss_version_read = true;
         }
     }
-    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s source=%s provider=%s",
+    log_ngx_error(L"ngx_core init ok=1 available=1 rc=0x%X dlss=%s source=%s provider=%s entry=%s",
                   static_cast<unsigned>(NVSDK_NGX_Result_Success),
                   g_dlss_version.empty() ? L"?" : g_dlss_version.c_str(),
                   g_dlss_source.empty() ? L"none" : g_dlss_source.c_str(),
-                  hit.source);
+                  hit.source, hit.entry_path.empty() ? L"(unknown)" : hit.entry_path.c_str());
 
     // ---- 第 10b 步（2026-11-13，OPEN-ISSUES §4）：为选档准备**独立的**查询参数对象 ----
     // 为什么放在这里、而不是第一次选档时懒建：
@@ -3243,10 +3244,10 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     ri.instance_first = inst.first;
     const int reset_val = ngx_param_map::map_reset(ri) ? 1 : 0;
 
-    // ---- ngx_in 行（§3.10.1 输入侧；info；闸门 count <= 8 || count % 1024 == 0）----
+    // ---- ngx_in 行（§3.10.1 输入侧；info；闸门 前 8 帧及每 1021 帧）----
     // ★ fmt 的三个值取自**实际输入纹理的 GetDesc()**，不得凭空构造。
     // ★ 本行是**逐帧**行，绝不与一次性快照的 ngx_core 混用（§3.10.2 末尾的硬约束）。
-    if (log_gate_win8_every1024(frame_count))
+    if (log_gate_win8_jitter(frame_count))
     {
         D3D11_TEXTURE2D_DESC ddesc {}, mdesc {};
         in.depth->GetDesc(&ddesc);
@@ -3342,7 +3343,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
             in.render_w, in.render_h) ? inst.pool.reactive.Get() : nullptr);
 
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-    const bool sampled = log_gate_win8_every1024(frame_count);
+    const bool sampled = log_gate_win8_jitter(frame_count);
     const std::uint64_t eval_t0 = sampled ? qpc_us() : 0;
 #endif
     using neo::ngx::F6OutputStatus;
@@ -3453,7 +3454,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     {
         // F6 的公共 Success 也可能只是 skip/recreate。不能用池中的旧内容填本帧，更不能消费 Reset。
         inst.first = true;
-        if (log_gate_win8_every1024(frame_count))
+        if (log_gate_win8_jitter(frame_count))
             log_ngx_core(blog::Level::Info, L"ngx_out not_delivered receipt=%s request=%llu",
                 f6_output == F6OutputStatus::no_output ? L"no_output" : L"unproven",
                 static_cast<unsigned long long>(g_f6_request));
@@ -3465,7 +3466,7 @@ ffx12::DispatchResult dispatch(const ffx12::FrameInput &in, ID3D11DeviceContext 
     ctx->CopyResource(in.output_target, inst.pool.output.Get());
 
     // ngx_out 行（§3.10.1 输出侧；逐帧 = **debug**；失败才用 error）
-    if (log_gate_win8_every1024(frame_count))
+    if (log_gate_win8_jitter(frame_count))
     {
         log_ngx_core(blog::Level::Debug, L"ngx_out copy out=%ux%u fmt=%d evidence=%s",
                      shape->output_width, shape->output_height, static_cast<int>(odesc.Format),

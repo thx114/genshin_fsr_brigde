@@ -40,6 +40,15 @@ bool bind_candidate(HMODULE module, ProviderDiscovery &found, const wchar_t *sou
         return false;
     }
     api.evaluate_f6 = reinterpret_cast<F6EvaluateV1>(GetProcAddress(module, k_f6_evaluate_v1));
+    // 2026-11-17（上游 1a9df8f）：搜索路线不等于实现文件；记录 Create 入口所属模块供初始化取证。
+    HMODULE entry_module = nullptr;
+    wchar_t entry_path[32768] {};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(api.create), &entry_module))
+    {
+        const DWORD length = GetModuleFileNameW(entry_module, entry_path, static_cast<DWORD>(std::size(entry_path)));
+        if (length && length < std::size(entry_path)) found.entry_path.assign(entry_path, length);
+    }
     found.api = api;
     found.source = source;
     found.path = std::move(path);
