@@ -53,6 +53,7 @@ struct CaptureFrame
     UINT color_r10 = 32, color_g10 = 96, color_b10 = 900;
     DXGI_FORMAT color_source_view = DXGI_FORMAT_UNKNOWN;
     std::optional<std::uint32_t> exact_provider_pixel;
+    std::function<bool(const D3D11_MAPPED_SUBRESOURCE &)> validate_provider_color;
     std::uint32_t alternate_scene_pixel = k_before_sr_scene_color;
     std::span<const CaptureGuidePixel> guides;
     bool typeless_depth = false;
@@ -467,6 +468,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
                 return true;
             };
             const bool provider_pixel = n == 0 ? pixel[0] == 0 && pixel[1] == 0 && (metadata_pair || pixel[2] == 0) :
+                frame.validate_provider_color ? frame.validate_provider_color(mapped) :
                 frame.expect_attenuated_color ? attenuated() :
                 expected ? raw == *expected :
                 close_to_input(pixel[0], frame.color_r10) && close_to_input(pixel[1], frame.color_g10) &&
@@ -502,7 +504,7 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         commands->UpdateSubresource(constants.Get(), 0, nullptr, values.data(), 0, 0);
         commands->Draw(3, 0);
         commands->OMSetRenderTargets(0, nullptr, nullptr);
-        values.fill(0);
+        values.fill(frame.producer_overwrite || frame.producer_om_uav ? 0x3e800000 : 0);
         commands->UpdateSubresource(constants.Get(), 0, nullptr, values.data(), 0, 0);
         if (frame.producer_overwrite)
         {
@@ -535,6 +537,11 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
             ID3D11UnorderedAccessView *none_uav = nullptr;
             commands->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 1, 1, &none_uav, nullptr);
         }
+        if (frame.producer_overwrite || frame.producer_om_uav)
+        {
+            values.fill(0);
+            commands->UpdateSubresource(constants.Get(), 0, nullptr, values.data(), 0, 0);
+        }
         if (frame.producer_write_operation >= 0)
         {
             // 2026-11-16：实际改写 SDK 颜色后再消费；四种入口必须使旧 writer 失配。
@@ -566,8 +573,8 @@ inline bool draw_capture(ID3D11Device *device, ID3D11DeviceContext *context,
         }
         if (frame.producer_before_consume)
         {
-            // 2026-11-16：测试宿主先实读源像素，保证 writer 前的 CB 快照已退休，
-            // 再让另一实例 SDK 先到；不能靠 GPU 尚未完成使错误的报告门控碰巧通过。
+            // 2026-11-18：先实读源像素，保证另一实例 SDK 到来时测试的 GPU writer 已完成。
+            // 只有原目标消费才能封存采集窗口。
             D3D11_TEXTURE2D_DESC sample_desc {};
             textures[0]->GetDesc(&sample_desc);
             sample_desc.Width = sample_desc.Height = 1;

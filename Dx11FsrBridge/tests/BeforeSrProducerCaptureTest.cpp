@@ -84,6 +84,10 @@ void finish(BeforeSrProducerCapture &capture, Device &d)
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (capture.poll(*d.context.Get()) == CaptureState::pending && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (capture.state() != CaptureState::ready)
+        std::fprintf(stderr, "snapshot state=%u latest_writer=%llu device_reason=0x%08lx\n",
+            static_cast<unsigned>(capture.state()), static_cast<unsigned long long>(capture.latest_writer()),
+            static_cast<unsigned long>(d.device->GetDeviceRemovedReason()));
     check(capture.state() == CaptureState::ready, "snapshot retired");
 }
 void word(const ProducerConstant &item, unsigned expected)
@@ -605,6 +609,22 @@ void check_writer_events(Device &d, Device &other)
     check(description(other_context_write).find("\"latest_writer_matches\":false") != std::string::npos,
         "same resource written through another context conservatively invalidates provenance");
 
+    BeforeSrProducerCapture capped(WriterSelection::last_before_sdk);
+    check(capped.arm(*d.context.Get(), *color.Get()), "arm bounded SDK capture");
+    const auto limit = BeforeSrProducerCapture::max_writer_snapshots;
+    for (unsigned i = 0; i <= limit; ++i)
+    {
+        const std::uint64_t candidate = 100 + i;
+        check(capped.record_writer(*d.context.Get(), candidate, false) == (i < limit), "bounded snapshots");
+        d.context->Draw(3, 0);
+        capped.observe_return(*d.context.Get(), candidate);
+    }
+    capped.observe_sdk(*d.context.Get(), *color.Get(), 17, 4);
+    finish(capped, d);
+    check(capped.latest_writer() == 100 + limit && capped.sequence() == 99 + limit &&
+        description(capped).find("\"latest_writer_matches\":false") != std::string::npos,
+        "later writer beyond cap cannot match retained snapshot");
+
     D3D11_TEXTURE2D_DESC desc {};
     color->GetDesc(&desc);
     desc.BindFlags = 0;
@@ -763,11 +783,23 @@ int main()
     check(incomplete.arm(*d.context.Get(), *color.Get()), "arm incomplete source");
     check(incomplete.record_writer(*d.context.Get(), 25, false), "incomplete snapshot");
     check(!incomplete.record_writer(*d.context.Get(), 26, false), "incomplete snapshot also tracks later writer");
+    check(incomplete.latest_writer() == 26, "latest binding candidate is distinct from the retained snapshot");
+    neo::producer::DrawEvidence latest_evidence;
+    latest_evidence.context = reinterpret_cast<std::uintptr_t>(d.context.Get());
+    latest_evidence.target_resource = reinterpret_cast<std::uintptr_t>(color.Get());
+    latest_evidence.reason = neo::producer::DrawReason::layout_untracked;
+    // WARP 会拒绝未设置图元拓扑的 Draw，导致快照事件无法退休。
+    d.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    d.context->Draw(3, 0);
+    incomplete.observe_return(*d.context.Get(), 26, &latest_evidence);
     incomplete.observe_sdk(*d.context.Get(), *color.Get(), 7, 103);
     finish(incomplete, d);
     std::ostringstream missing; incomplete.write_json(missing);
     check(missing.str().find("\"binding_bytes_complete\":false") != std::string::npos, "missing DXBC explicit");
     check(missing.str().find("\"latest_writer_matches\":false") != std::string::npos, "stale writer explicit");
+    check(missing.str().find("\"sdk_latest_candidate\":{\"kind\":\"rtv\",\"slot\":0") != std::string::npos &&
+        missing.str().find("\"returned\":true,\"draw_target_matches\":true,\"draw_reason\":\"layout_untracked\"") !=
+            std::string::npos, "latest writer has independent binding and return evidence");
     found = false;
     for (const auto &item : incomplete.constants())
         if (item.stage == ProducerStage::pixel && item.slot == 5)

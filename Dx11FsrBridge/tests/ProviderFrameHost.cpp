@@ -1125,24 +1125,29 @@ int wmain(int argc, wchar_t **argv)
         const auto begin = contents.find("before_sr_producer_bindings");
         const auto end = begin == std::string::npos ? begin : contents.find('\n', begin);
         const auto receipt = begin == std::string::npos ? std::string {} : contents.substr(begin, end - begin);
+        const bool later_writer = producer_overwrite || producer_om_uav;
         const bool captured = receipt.find("\"binding_bytes_complete\":true") != std::string::npos &&
             receipt.find("\"sdk_observed\":true") != std::string::npos &&
             receipt.find("\"sdk_instance\":" + std::to_string(target_instance.key()) + ',') != std::string::npos &&
-            receipt.find(producer_overwrite || producer_om_uav || producer_write_operation >= 0 ?
+            receipt.find(producer_write_operation >= 0 ?
                 "\"latest_writer_matches\":false" :
                 "\"latest_writer_matches\":true") != std::string::npos &&
+            receipt.find(later_writer ? "\"snapshots_recorded\":2" : "\"snapshots_recorded\":1") != std::string::npos &&
             receipt.find("\"transfer\":\"unknown\"") != std::string::npos &&
             receipt.find("\"writer_execution\":\"not-proven\"") != std::string::npos &&
             receipt.find("\"original_call_returned\":true") != std::string::npos &&
             receipt.find("\"runtime_transfer_attempt\":{\"observed\":true") != std::string::npos &&
-            receipt.find("\"same_captured_resource\":true,\"reason\":\"pixel_program\"") != std::string::npos &&
+            receipt.find(producer_om_uav ? "\"same_captured_resource\":false" :
+                "\"same_captured_resource\":true,\"reason\":\"pixel_program\"") != std::string::npos &&
+            (!producer_om_uav || receipt.find("\"sdk_latest_candidate\":{\"kind\":\"om-uav\"") != std::string::npos) &&
             receipt.find("\"runtime_transfer_consumption\":{\"observed\":true,\"reason\":\"uncertified\"") !=
                 std::string::npos &&
             (producer_write_operation < 0 ||
                 (receipt.find("\"overwrite_count_window\":1") != std::string::npos &&
                     receipt.find("\"last_overwrite\":" + std::to_string(producer_write_operation) + ',') !=
                         std::string::npos)) &&
-            receipt.find("0000403f0000403f") != std::string::npos;
+            receipt.find(later_writer ? "0000803e0000803e" : "0000403f0000403f") != std::string::npos &&
+            (!later_writer || receipt.find("0000403f0000403f") == std::string::npos);
         std::fprintf(observations.get(), "producer capture: pixels=%d binding_snapshot=%d\n", result, captured);
         return result && captured ? 0 : 1;
     }

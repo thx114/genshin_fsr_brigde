@@ -657,7 +657,7 @@ ID3D11DeviceContext *g_color_source_context = nullptr;
 // 诊断只有一次有界快照。未确认 GPU 退休时保留实际对象，进程退出前不清理未知工作。
 auto &before_sr_producer_capture()
 {
-    static auto *capture = new neo::diagnostics::BeforeSrProducerCapture;
+    static auto *capture = new neo::diagnostics::BeforeSrProducerCapture(neo::diagnostics::WriterSelection::last_before_sdk);
     return *capture;
 }
 std::atomic_bool g_before_sr_producer_dumped = false;
@@ -2229,11 +2229,10 @@ std::uint64_t record_color_source_call(
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
     observe_before_sr_producer(context, [&](auto &capture)
     {
-        if (capture.record_writer(*context, sequence, std::strcmp(stage, "dispatch") == 0))
-        {
-            producer_sequence = sequence;
+        const bool first = capture.sequence() == 0;
+        if (capture.record_writer(*context, sequence, std::strcmp(stage, "dispatch") == 0) && first)
             LOG_DEBUG(blog::cat::probe, "before_sr_producer_snapshot_recorded sequence=" + std::to_string(sequence));
-        }
+        if (capture.latest_writer() == sequence) producer_sequence = sequence;
     });
 #endif
     // 自动 producer 与按键历史独立；等待用户请求时不复制镜像状态或构造绑定 vectors。
@@ -12372,7 +12371,7 @@ void route_game_draw(ID3D11DeviceContext *context, UINT element_count,
 #endif
         neo::producer::DrawEvidence *transfer_evidence = nullptr;
 #if defined(DX11FSRBRIDGE_ENABLE_DIAGNOSTICS)
-        // 非零sequence表示自动采集已锁存此writer；普通Draw不初始化证据或多查状态。
+        // 非零 sequence 表示自动采集已观察这笔目标绑定；普通 Draw 不额外采集证据。
         std::optional<neo::producer::DrawEvidence> transfer_evidence_storage;
         if (sequence) { transfer_evidence_storage.emplace(); transfer_evidence = &*transfer_evidence_storage; }
 #endif

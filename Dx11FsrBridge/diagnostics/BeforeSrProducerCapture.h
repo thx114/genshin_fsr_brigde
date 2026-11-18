@@ -14,6 +14,7 @@ namespace neo::diagnostics
 enum class ProducerStage : unsigned { vertex, pixel, compute };
 enum class CaptureState : unsigned { idle, armed, pending, ready, failed };
 enum class ProducerWrite : unsigned { copy_resource, copy_subresource, clear_target, update_subresource };
+enum class WriterSelection { first_observed, last_before_sdk };
 
 struct ProducerConstant
 {
@@ -49,6 +50,10 @@ class BeforeSrProducerCapture
 public:
     static constexpr unsigned max_shader_bytes = 1024 * 1024;
     static constexpr unsigned max_constant_bytes = 2 * 1024 * 1024;
+    static constexpr unsigned max_writer_snapshots = 8;
+
+    explicit BeforeSrProducerCapture(WriterSelection selection = WriterSelection::first_observed)
+        : selection_(selection) {}
 
     static HRESULT remember_shader(ID3D11DeviceChild &shader, const void *data, unsigned size);
     bool arm(ID3D11DeviceContext &context, ID3D11Resource &color);
@@ -70,24 +75,39 @@ public:
     }
     const std::vector<ProducerConstant> &constants() const { return constants_; }
     std::uint64_t sequence() const { return sequence_; }
+    std::uint64_t latest_writer() const { return latest_.sequence; }
     std::size_t retained_bytes() const { return retained_bytes_; }
 
 private:
     using Buffer = Microsoft::WRL::ComPtr<ID3D11Buffer>;
+    enum class OutputKind { rtv, om_uav, cs_uav };
+    struct CandidateOutput
+    {
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        unsigned dimension = 0, slot = 0;
+        bool found = false, unordered = false;
+    };
+    void observe_writer_binding(ID3D11DeviceContext &context, std::uint64_t sequence, OutputKind kind,
+        DXGI_FORMAT format, unsigned slot, unsigned mip);
     bool capture_constants(ProducerStage stage);
     void capture_shader(ProducerStage stage, ID3D11DeviceChild *shader);
     void capture_inputs(ProducerStage stage);
     void capture_graphics_state();
     void observe_unordered_writer(ID3D11DeviceContext &context, std::uint64_t sequence,
-        bool compute, unsigned first_slot = 0);
+        bool compute, CandidateOutput &output, unsigned first_slot = 0);
+    void begin_snapshot(std::uint64_t sequence, bool compute, const CandidateOutput &output);
+    void seal_readback(ID3D11DeviceContext &context);
 
+    const WriterSelection selection_;
     CaptureState state_ = CaptureState::idle;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11Resource> color_;
-    Microsoft::WRL::ComPtr<ID3D11View> writer_view_;
     Microsoft::WRL::ComPtr<ID3D11Query> completion_;
     std::vector<Buffer> staging_;
+    std::size_t staging_start_ = 0, staging_bytes_ = 0;
+    unsigned snapshots_recorded_ = 0;
+    bool readback_sealed_ = false;
     std::vector<ProducerConstant> constants_;
     struct Shader { ProducerStage stage; std::vector<std::uint8_t> bytes; unsigned classes = 0; };
     std::vector<Shader> shaders_;
@@ -104,7 +124,17 @@ private:
     D3D11_PRIMITIVE_TOPOLOGY topology_ = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     std::vector<D3D11_VIEWPORT> viewports_;
     std::vector<D3D11_RECT> scissors_;
-    std::uint64_t sequence_ = 0, latest_sequence_ = 0;
+    std::uint64_t sequence_ = 0;
+    struct WriterBinding
+    {
+        std::uint64_t sequence = 0;
+        OutputKind kind = OutputKind::rtv;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        unsigned slot = 0, mip = UINT_MAX;
+        std::uintptr_t shader = 0, layout = 0;
+        producer::DrawReason draw_reason = producer::DrawReason::not_evaluated;
+        bool returned = false, layout_observed = false, draw_target_matches = false;
+    } latest_;
     struct Consumption
     {
         bool observed = false, writer_matches = false, original_returned = false;
@@ -119,7 +149,7 @@ private:
     std::uintptr_t last_overwrite_context_ = 0;
     std::size_t retained_bytes_ = 0;
     DXGI_FORMAT view_format_ = DXGI_FORMAT_UNKNOWN;
-    unsigned view_dimension_ = 0, mip_ = 0, first_slice_ = 0, slices_ = 0, output_slot_ = 0;
+    unsigned view_dimension_ = 0, slices_ = 0, output_slot_ = 0;
     bool compute_ = false, unordered_output_ = false, complete_ = true;
     HRESULT failure_ = S_OK;
 };

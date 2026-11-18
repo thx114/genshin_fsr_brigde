@@ -354,12 +354,14 @@ bool BeforeSrProducerCapture::capture_constants(ProducerStage stage)
         Buffer staging;
         if (bytes)
         {
+            if (source.ByteWidth > max_constant_bytes - staging_bytes_) return false;
             D3D11_BUFFER_DESC desc {};
             desc.ByteWidth = source.ByteWidth;
             desc.Usage = D3D11_USAGE_STAGING;
             desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             failure_ = device_->CreateBuffer(&desc, nullptr, staging.GetAddressOf());
             if (FAILED(failure_)) return false;
+            staging_bytes_ += source.ByteWidth;
             // 先冻结完整 buffer，退休后再按绑定范围截取，避免部分 CB 复制的限制。
             context_->CopyResource(staging.Get(), buffers[slot].Get());
         }
@@ -370,8 +372,28 @@ bool BeforeSrProducerCapture::capture_constants(ProducerStage stage)
     return true;
 }
 
+void BeforeSrProducerCapture::observe_writer_binding(ID3D11DeviceContext &context, std::uint64_t sequence,
+    OutputKind kind, DXGI_FORMAT format, unsigned slot, unsigned mip)
+{
+    if (latest_.sequence == sequence && (latest_.mip == 0 || mip != 0)) return;
+    latest_ = {sequence, kind, format, slot, mip};
+    // 2026-11-18：只在已武装的目标上保存最后一次绑定候选。PID 30160 的首笔快照与消费不一致。
+    if (kind == OutputKind::cs_uav)
+    {
+        ComPtr<ID3D11ComputeShader> shader;
+        context.CSGetShader(shader.GetAddressOf(), nullptr, nullptr);
+        latest_.shader = reinterpret_cast<std::uintptr_t>(shader.Get());
+    }
+    else
+    {
+        ComPtr<ID3D11PixelShader> shader;
+        context.PSGetShader(shader.GetAddressOf(), nullptr, nullptr);
+        latest_.shader = reinterpret_cast<std::uintptr_t>(shader.Get());
+    }
+}
+
 void BeforeSrProducerCapture::observe_unordered_writer(ID3D11DeviceContext &context,
-    std::uint64_t sequence, bool compute, unsigned first_slot)
+    std::uint64_t sequence, bool compute, CandidateOutput &output, unsigned first_slot)
 {
     std::array<ComPtr<ID3D11UnorderedAccessView>, D3D11_1_UAV_SLOT_COUNT> views;
     std::array<ID3D11UnorderedAccessView *, D3D11_1_UAV_SLOT_COUNT> raw {};
@@ -389,17 +411,15 @@ void BeforeSrProducerCapture::observe_unordered_writer(ID3D11DeviceContext &cont
         ComPtr<ID3D11Resource> resource;
         if (views[i]) views[i]->GetResource(resource.GetAddressOf());
         if (resource.Get() != color_.Get()) continue;
-        latest_sequence_ = sequence;
-        if (state_ != CaptureState::armed) return;
-        if (writer_view_) return;
         D3D11_UNORDERED_ACCESS_VIEW_DESC desc {};
         views[i]->GetDesc(&desc);
+        const bool plane = desc.ViewDimension == D3D11_UAV_DIMENSION_TEXTURE2D;
+        observe_writer_binding(context, sequence, compute ? OutputKind::cs_uav : OutputKind::om_uav,
+            desc.Format, i, plane ? desc.Texture2D.MipSlice : UINT_MAX);
+        if (output.found) return;
         // 2026-11-16：不同 mip 可合法同时写入；不让不支持的候选盖掉 mip0 或遮住后续槽。
-        if (desc.ViewDimension != D3D11_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.MipSlice != 0) continue;
-        writer_view_ = views[i];
-        unordered_output_ = true;
-        view_format_ = desc.Format; view_dimension_ = desc.ViewDimension;
-        mip_ = desc.Texture2D.MipSlice; slices_ = 1; output_slot_ = i;
+        if (!plane || desc.Texture2D.MipSlice != 0) continue;
+        output = {desc.Format, D3D11_UAV_DIMENSION_TEXTURE2D, i, true, true};
         return;
     }
 }
@@ -408,14 +428,10 @@ bool BeforeSrProducerCapture::record_writer(ID3D11DeviceContext &context, std::u
 {
     if ((state_ != CaptureState::armed && state_ != CaptureState::pending && state_ != CaptureState::ready) ||
         &context != context_.Get() || !sequence || consumption_.observed) return false;
-    if (state_ == CaptureState::armed)
-    {
-        writer_view_.Reset();
-        unordered_output_ = false;
-    }
+    CandidateOutput output;
     // 2026-11-16：直接读取本 context 的真实输出，不借全局 DispatchState 的其他设备绑定。
     if (compute)
-        observe_unordered_writer(context, sequence, true);
+        observe_unordered_writer(context, sequence, true, output);
     else
     {
         std::array<ComPtr<ID3D11RenderTargetView>, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> views;
@@ -432,26 +448,26 @@ bool BeforeSrProducerCapture::record_writer(ID3D11DeviceContext &context, std::u
             ComPtr<ID3D11Resource> resource;
             if (views[i]) views[i]->GetResource(resource.GetAddressOf());
             if (resource.Get() != color_.Get()) continue;
-            latest_sequence_ = sequence;
-            if (state_ != CaptureState::armed) return false;
             D3D11_RENDER_TARGET_VIEW_DESC desc {};
             views[i]->GetDesc(&desc);
+            const bool plane = desc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D;
+            observe_writer_binding(context, sequence, OutputKind::rtv, desc.Format, i,
+                plane ? desc.Texture2D.MipSlice : UINT_MAX);
             if (desc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || desc.Texture2D.MipSlice != 0) continue;
-            writer_view_ = views[i];
-            view_format_ = desc.Format; view_dimension_ = desc.ViewDimension;
-            mip_ = desc.Texture2D.MipSlice; slices_ = 1; output_slot_ = i;
+            output = {desc.Format, D3D11_RTV_DIMENSION_TEXTURE2D, i, true, false};
             break;
         }
         // 2026-11-16：Draw 也能经像素着色器写 OM UAV；只看 RTV 会漏掉覆盖，误配旧常量。
-        // pending 的 writer_view_ 是旧快照，仍须观察本次实际 UAV 以更新 latest_sequence_。
-        observe_unordered_writer(context, sequence, false, unordered_start);
+        if (!output.found) observe_unordered_writer(context, sequence, false, output, unordered_start);
     }
-    if (state_ != CaptureState::armed || !writer_view_ || mip_ != 0) return false;
-    sequence_ = sequence;
-    compute_ = compute;
-    D3D11_QUERY_DESC query {D3D11_QUERY_EVENT, 0};
-    failure_ = device_->CreateQuery(&query, completion_.GetAddressOf());
-    if (FAILED(failure_)) { state_ = CaptureState::failed; return false; }
+    if (!output.found || readback_sealed_ || sequence == sequence_) return false;
+    if (!completion_)
+    {
+        D3D11_QUERY_DESC query {D3D11_QUERY_EVENT, 0};
+        failure_ = device_->CreateQuery(&query, completion_.GetAddressOf());
+        if (FAILED(failure_)) { state_ = CaptureState::failed; return false; }
+    }
+    begin_snapshot(sequence, compute, output);
     if (compute)
     {
         ComPtr<ID3D11ComputeShader> shader;
@@ -481,20 +497,69 @@ bool BeforeSrProducerCapture::record_writer(ID3D11DeviceContext &context, std::u
         capture_inputs(ProducerStage::vertex);
         capture_graphics_state();
     }
-    // End 只标记常量快照复制的退休；既不证明随后的 Draw 成功，也不认证像素编码。
-    context.End(completion_.Get());
     state_ = CaptureState::pending;
+    if (selection_ == WriterSelection::first_observed || snapshots_recorded_ == max_writer_snapshots)
+        seal_readback(context);
     return true;
+}
+
+void BeforeSrProducerCapture::begin_snapshot(std::uint64_t sequence, bool compute, const CandidateOutput &output)
+{
+    // 2026-11-18：54996 的首笔 Draw 不是消费前候选。覆盖 CPU 元数据时，
+    // 旧 staging 仍在同一 context 上在途，统一等窗口末尾的 EVENT 再释放。
+    staging_start_ = staging_.size();
+    retained_bytes_ = 0;
+    shaders_.clear();
+    constants_.clear();
+    resources_.clear();
+    samplers_.clear();
+    blend_ = {};
+    rasterizer_ = {};
+    depth_stencil_ = {};
+    graphics_state_ = false;
+    original_returned_ = false;
+    runtime_draw_observed_ = false;
+    runtime_draw_ = {};
+    complete_ = true;
+    compute_ = compute;
+    unordered_output_ = output.unordered;
+    view_format_ = output.format;
+    view_dimension_ = output.dimension;
+    output_slot_ = output.slot;
+    slices_ = 1;
+    sequence_ = sequence;
+    ++snapshots_recorded_;
+}
+
+void BeforeSrProducerCapture::seal_readback(ID3D11DeviceContext &context)
+{
+    if (readback_sealed_) return;
+    // EVENT 只负责常量复制退休。原 Draw 返回和 SDK 消费都不能替代它。
+    context.End(completion_.Get());
+    readback_sealed_ = true;
 }
 
 void BeforeSrProducerCapture::observe_return(ID3D11DeviceContext &context, std::uint64_t sequence,
     const producer::DrawEvidence *evidence)
 {
+    if (&context != context_.Get() || !sequence || consumption_.observed) return;
+    const bool same_context = evidence && evidence->context == reinterpret_cast<std::uintptr_t>(&context);
+    if (sequence == latest_.sequence)
+    {
+        latest_.returned = true;
+        if (same_context)
+        {
+            latest_.draw_reason = evidence->reason;
+            latest_.layout = evidence->layout;
+            latest_.layout_observed = evidence->layout_observed;
+            latest_.draw_target_matches = evidence->target_resource == reinterpret_cast<std::uintptr_t>(color_.Get());
+        }
+    }
     // 2026-11-16：只认刚捕获的实际命令返回，不把下一笔 Draw 或另一 context 当作此笔执行。
-    if (&context == context_.Get() && sequence && sequence == sequence_ && !consumption_.observed)
+    if (sequence == sequence_)
     {
         original_returned_ = true;
-        if (!runtime_draw_observed_ && evidence && evidence->context == reinterpret_cast<std::uintptr_t>(&context))
+        if (!runtime_draw_observed_ && same_context)
         { runtime_draw_ = *evidence; runtime_draw_observed_ = true; }
     }
 }
@@ -517,19 +582,20 @@ void BeforeSrProducerCapture::observe_gap()
 
 CaptureState BeforeSrProducerCapture::poll(ID3D11DeviceContext &context)
 {
-    if (state_ != CaptureState::pending || context_.Get() != &context) return state_;
+    if (state_ != CaptureState::pending || context_.Get() != &context || !readback_sealed_) return state_;
     BOOL done = FALSE;
     failure_ = context.GetData(completion_.Get(), &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
     if (failure_ == S_FALSE || (failure_ == S_OK && !done)) return state_;
     // 失败不当作 GPU 完成；保持持有实际 staging/query/context，不在此回收未知工作。
     if (FAILED(failure_)) { state_ = CaptureState::failed; return state_; }
-    for (std::size_t i = 0; i < staging_.size(); ++i)
+    for (std::size_t i = 0; i < constants_.size(); ++i)
     {
-        if (!staging_[i]) continue;
+        const auto &buffer = staging_[staging_start_ + i];
+        if (!buffer) continue;
         D3D11_BUFFER_DESC desc {};
-        staging_[i]->GetDesc(&desc);
+        buffer->GetDesc(&desc);
         D3D11_MAPPED_SUBRESOURCE mapped {};
-        failure_ = context.Map(staging_[i].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        failure_ = context.Map(buffer.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
         if (failure_ == DXGI_ERROR_WAS_STILL_DRAWING) return state_;
         if (FAILED(failure_)) { state_ = CaptureState::failed; return state_; }
         if (mapped.pData)
@@ -545,7 +611,7 @@ CaptureState BeforeSrProducerCapture::poll(ID3D11DeviceContext &context)
             }
         }
         else complete_ = false;
-        context.Unmap(staging_[i].Get(), 0);
+        context.Unmap(buffer.Get(), 0);
     }
     staging_.clear();
     completion_.Reset();
@@ -561,11 +627,12 @@ void BeforeSrProducerCapture::observe_sdk(ID3D11DeviceContext &context, ID3D11Re
     // 2026-11-16：SDK 输入属于此刻的 writer；异步 Map 完成时可能已是下一源帧。
     // 后续 writer 同样读取实际输出，不能借旧全局状态中可能漏记 OM UAV 的历史认证。
     // 这里只固定来源关系，不把 SDK/CPU 事件当作 GPU 快照退休。
-    consumption_ = {true, sequence_ == latest_sequence_ && !overwrite_count_ && supported_events_complete_,
-        original_returned_, latest_sequence_, instance, frame};
+    consumption_ = {true, sequence_ == latest_.sequence && !overwrite_count_ && supported_events_complete_,
+        original_returned_, latest_.sequence, instance, frame};
     if (evidence && evidence->context == reinterpret_cast<std::uintptr_t>(&context) &&
         evidence->source_resource == reinterpret_cast<std::uintptr_t>(&color))
     { runtime_consume_ = *evidence; runtime_consume_observed_ = true; }
+    if (state_ == CaptureState::pending) seal_readback(context);
 }
 
 void BeforeSrProducerCapture::write_json(std::ostream &out) const
@@ -573,12 +640,21 @@ void BeforeSrProducerCapture::write_json(std::ostream &out) const
     out << "{\"state\":" << static_cast<unsigned>(state_) << ",\"sequence\":" << sequence_
         << ",\"context\":" << reinterpret_cast<std::uintptr_t>(context_.Get())
         << ",\"color\":" << reinterpret_cast<std::uintptr_t>(color_.Get())
+        << ",\"snapshots_recorded\":" << snapshots_recorded_
         << ",\"binding_bytes_complete\":" << (complete_ && state_ == CaptureState::ready ? "true" : "false")
         << ",\"sdk_observed\":" << (consumption_.observed ? "true" : "false")
         << ",\"latest_writer_matches\":" <<
             (consumption_.writer_matches && supported_events_complete_ ? "true" : "false")
         << ",\"sdk_instance\":" << consumption_.instance << ",\"sdk_frame\":" << consumption_.frame
         << ",\"sdk_latest_writer\":" << consumption_.latest_writer
+        << ",\"sdk_latest_candidate\":{\"kind\":\"" << (!latest_.sequence ? "none" : latest_.kind == OutputKind::rtv ?
+            "rtv" : latest_.kind == OutputKind::om_uav ? "om-uav" : "cs-uav")
+        << "\",\"slot\":" << latest_.slot << ",\"format\":" << latest_.format << ",\"mip\":" << latest_.mip
+        << ",\"shader\":" << latest_.shader << ",\"layout\":" << latest_.layout
+        << ",\"layout_observed\":" << (latest_.layout_observed ? "true" : "false")
+        << ",\"returned\":" << (latest_.returned ? "true" : "false")
+        << ",\"draw_target_matches\":" << (latest_.draw_target_matches ? "true" : "false")
+        << ",\"draw_reason\":\"" << producer::reason_name(latest_.draw_reason) << "\"}"
         << ",\"original_call_returned\":" <<
             ((consumption_.observed ? consumption_.original_returned : original_returned_) ? "true" : "false")
         << ",\"supported_events_complete\":" << (supported_events_complete_ ? "true" : "false")
@@ -592,7 +668,7 @@ void BeforeSrProducerCapture::write_json(std::ostream &out) const
     out << ",\"transfer\":\"unknown\",\"writer_execution\":\"not-proven\",\"compute\":" << compute_
         << ",\"output\":{\"kind\":\"" << (unordered_output_ ? "uav" : "rtv")
         << "\",\"format\":" << view_format_ << ",\"dimension\":" << view_dimension_
-        << ",\"mip\":" << mip_ << ",\"first_slice\":" << first_slice_ << ",\"slices\":" << slices_
+        << ",\"mip\":0,\"first_slice\":0,\"slices\":" << slices_
         << ",\"slot\":" << output_slot_ << "},\"constant_bytes\":" << retained_bytes_
         << ",\"hr\":" << static_cast<unsigned>(failure_) << ",\"shaders\":[";
     for (std::size_t i = 0; i < shaders_.size(); ++i)
