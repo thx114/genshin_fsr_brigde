@@ -200,13 +200,20 @@ ComPtr<Contents> view_contents(ID3D11View *view, Target *target = nullptr) noexc
     return add_private<Contents>(*resource.Get(), k_contents);
 }
 
-bool program_matches(const void *data, std::size_t size, bool vertex = false) noexcept
+enum class DxbcIdentity { pixel_program, vertex_program, vertex_input_signature };
+
+bool dxbc_matches(const void *data, std::size_t size, DxbcIdentity identity) noexcept
 {
     // 2026-11-16：39776/44888实际PS的SHEX程序已逐条审计。只忽略容器调试/反射块，
     // 不以文件名、shader对象地址、大小或含几个gamma常数就宣称语义相同。
     // 程序中max(1.055*pow(c,1/2.4)-.055,0)与Unity PostProcessing Colors.hlsl
     // LinearToSRGB/USE_FAST_SRGB同式；cb0[20].y额外gamma和[25].x叠色须每次判定。
     if (!data || size < 36 || size > 1024 * 1024) return false;
+    const bool input_signature = identity == DxbcIdentity::vertex_input_signature;
+    const bool vertex = identity == DxbcIdentity::vertex_program;
+    const auto expected_length = input_signature ? 76u : vertex ? 240u : 3384u;
+    const auto expected_hash = input_signature ? 0x0EBBCECB92727E74ull :
+        vertex ? 0xBD2E7C93E9449541ull : 0xABAF2B478C198672ull;
     const auto *bytes = static_cast<const std::uint8_t *>(data);
     const auto word = [&](std::size_t offset) { std::uint32_t v; std::memcpy(&v, bytes + offset, 4); return v; };
     if (word(0) != 0x43425844 || word(24) != size) return false;
@@ -219,12 +226,15 @@ bool program_matches(const void *data, std::size_t size, bool vertex = false) no
         if (offset > size - 8) return false;
         const auto length = word(offset + 4);
         if (length > size - offset - 8) return false;
-        if (word(offset) != 0x58454853 && word(offset) != 0x52444853) continue;
-        if (found || length != (vertex ? 240u : 3384u)) return false;
+        const auto tag = word(offset);
+        const bool matches_tag = input_signature ? tag == 0x4E475349 :
+            tag == 0x58454853 || tag == 0x52444853;
+        if (!matches_tag) continue;
+        if (found || length != expected_length) return false;
         std::uint64_t hash = 14695981039346656037ull;
         for (std::size_t j = offset + 8; j < offset + 8 + length; ++j)
             hash = (hash ^ bytes[j]) * 1099511628211ull;
-        if (hash != (vertex ? 0xBD2E7C93E9449541ull : 0xABAF2B478C198672ull)) return false;
+        if (hash != expected_hash) return false;
         found = true;
     }
     return found;
@@ -580,8 +590,10 @@ HRESULT STDMETHODCALLTYPE create_layout(ID3D11Device *device, const D3D11_INPUT_
     const void *bytecode, SIZE_T bytes, ID3D11InputLayout **out)
 {
     const auto result = LayoutRoute {}(device, elements, count, bytecode, bytes, out);
-    if (FAILED(result) || !out || !*out || !program_matches(bytecode, bytes, true)) return result;
-    // 只在匹配VS的冷路径保存有界数值元数据；不保存SemanticName借用指针。
+    if (FAILED(result) || !out || !*out || !dxbc_matches(bytecode, bytes, DxbcIdentity::vertex_input_signature))
+        return result;
+    // 2026-11-18：D3D11 布局可从仅含签名的 blob 创建，也可在同签名 VS 间共享。
+    // 这里证明 POSITION 寄存器映射；实际 VS 的程序仍在 Draw 时独立验证。
     LayoutEvidence metadata;
     metadata.count = count;
     for (UINT i = 0; i < count && i < metadata.elements.size(); ++i)
@@ -634,7 +646,7 @@ bool enabled() noexcept { return g_enabled.load(std::memory_order_acquire); }
 void remember_shader(ID3D11PixelShader &shader, const void *bytes, std::size_t size) noexcept
 {
     if (!enabled()) return;
-    if (!program_matches(bytes, size))
+    if (!dxbc_matches(bytes, size, DxbcIdentity::pixel_program))
     {
         shader.SetPrivateData(k_program, 0, nullptr);
         return;
@@ -675,7 +687,8 @@ void remember_buffer(ID3D11Buffer &buffer, const D3D11_BUFFER_DESC &desc,
 
 void remember_vertex(ID3D11VertexShader &shader, const void *bytes, std::size_t size) noexcept
 {
-    if (!enabled() || !program_matches(bytes, size, true)) return;
+    if (!enabled() || !dxbc_matches(bytes, size, DxbcIdentity::vertex_program) ||
+        !dxbc_matches(bytes, size, DxbcIdentity::vertex_input_signature)) return;
     constexpr UINT recognized = 1;
     shader.SetPrivateData(k_vertex, sizeof(recognized), &recognized);
 }

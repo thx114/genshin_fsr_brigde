@@ -293,6 +293,31 @@ int main()
         !(last_draw.checked & static_cast<unsigned>(DrawGate::geometry)), "gamma rejected before unchecked geometry");
     controls.gamma = 1;
     expect(controls, ColorTransfer::srgb, "same resource gamma recovered");
+    const D3D11_INPUT_ELEMENT_DESC elements[] {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    ComPtr<ID3DBlob> signature;
+    check(SUCCEEDED(D3DGetInputSignatureBlob(producer_fixture::k_vertex_bytecode,
+        sizeof(producer_fixture::k_vertex_bytecode), &signature)), "actual D3D11 input-signature blob");
+    ComPtr<ID3D11InputLayout> signature_layout;
+    check(SUCCEEDED(device->CreateInputLayout(elements, 2, signature->GetBufferPointer(),
+        signature->GetBufferSize(), &signature_layout)), "real input layout created without a shader program");
+    controls.before_draw = [&](auto &ctx) { ctx.IASetInputLayout(signature_layout.Get()); };
+    expect(controls, ColorTransfer::srgb, "compatible signature-only layout with the actual producer VS");
+
+    const char different_registers[] = "float4 main(float2 uv:TEXCOORD0,float3 xyz:POSITION0):SV_Position"
+        "{return float4(xyz.xy+uv,0,1);}";
+    ComPtr<ID3DBlob> mismatched;
+    check(SUCCEEDED(D3DCompile(different_registers, sizeof(different_registers)-1, nullptr, nullptr, nullptr,
+        "main", "vs_5_0", 0, 0, &mismatched, nullptr)), "create real layout signature with a different register mapping");
+    ComPtr<ID3D11InputLayout> wrong_layout;
+    check(SUCCEEDED(device->CreateInputLayout(elements, 2, mismatched->GetBufferPointer(),
+        mismatched->GetBufferSize(), &wrong_layout)), "different shader has a valid layout of its own");
+    controls.before_draw = [&](auto &ctx) { ctx.IASetInputLayout(wrong_layout.Get()); };
+    expect(controls, ColorTransfer::unknown, "incompatible input signature cannot certify the bound producer VS");
+    check(last_draw.reason == DrawReason::layout_untracked, "incompatible layout rejected at the layout gate");
+    controls.before_draw = {};
     controls.overlay = 1;
     expect(controls, ColorTransfer::unknown, "overlay cannot inherit encoding");
     controls.overlay = 0;
