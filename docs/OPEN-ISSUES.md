@@ -5,12 +5,32 @@
 > **改动历史不在这里**：某段代码为什么是现在这样，用 `git log` / `git blame` 查。
 > 条目关闭后直接删除；要留结论就移入文末「已解决」，并注明解决它的提交。
 
-最后更新：2026-11-17
+最后更新：2026-11-19
 
 ---
 
 ## Neo：待验收
 
+- **2026-11-18：超分前颜色来源的布局记录**。区域：`runtime/ProducerTransfer.cpp` 的
+  `create_layout`、`remember_vertex` 与 `tests/ProducerTransferTest.cpp`。原神 PID 51308、30160 的
+  样本在通过实际 VS 检查后拒绝 `layout_untracked`；旧版要求布局创建时传入完整目标 VS，
+  D3D11 也允许仅传入输入签名。现仅按输入签名证明布局映射，绘制时仍独立验证实际 VS、全屏
+  几何和本次最新写入。预期：真实签名布局能通过；映射不符和后续未认证写入仍拒绝；同局最新
+  writer 判据和原神实机效果另验证。结果：417 项颜色认证检查通过，真实输入签名布局经 Neo→F6→
+  Launchpad/MXAO→DLSS 的硬件像素回读成功；旧桥在同签名用例没有颜色准入。原神新局待验收。
+- **2026-11-18：区分原始快照和消费前最新写入候选**。区域：`BeforeSrProducerCapture` 与
+  `record_color_source_call`。原神两局都锁存到同资源后续写入，原先只记录序号，无法判断后续调用的
+  视图和认证拒绝原因。目标：在现有有界诊断窗口记录最新槽、格式、mip、shader 和 Draw 判据。
+  预期：后续候选可与原始快照区分，未观测或未证明写入不能借用旧证书。结果：诊断构建 128/128，
+  快照用例 529 项通过。首次失败的夹具新增 Draw 未设图元拓扑，WARP 返回 `DXGI_ERROR_DEVICE_REMOVED`；
+  补 `TRIANGLELIST` 后恢复，未改变生产快照退休或颜色认证条件。实机消费诊断待新局。
+- **2026-11-18：为实际颜色消费保留最后一笔绑定快照**。区域为 `BeforeSrProducerCapture`
+  与 `maybe_dump_sdk_input_chains`。原神 PID 54996 的首笔 9284 有着色器、常量和视图，
+  实际 SDK 第 1 帧消费前还有 9288，后者只留下对象地址和 `pixel_program`。
+  在现有诊断开关下让自动 producer 快照跟随有界窗口内的写入，匹配的 SDK 调用锁定候选。
+  最后一次复制后的 EVENT 退休后才能读常量，超预算或观察缺口仍报告缺证。诊断构建 128/128，
+  覆盖后续 Draw、OM UAV、其他实例消费和超过快照上限。原神 PID 54648 记录了两个快照，最后一笔
+  与 SDK 消费时观察到的写入匹配；颜色认证仍是 `uncertified`，没有证明该颜色可用于 MXAO 或 HUDless。
 - **DLSS FG 的 HUDless 来源尚未闭合**：桥已有 `HudlessV1` 显式提供方注册与当帧 F6 参数传递，
   尚无已认证的最终无 HUD 图像。普通 SR 输出及 `final_scene_snapshot` 的全屏 backbuffer
   候选都不能证明 HUD 边界、曝光或最终后处理一致。需要同帧 GPU 捕获和独立画面确认，
