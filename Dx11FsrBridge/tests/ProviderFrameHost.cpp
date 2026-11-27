@@ -6,6 +6,7 @@
 #include "TestImport.h"
 #include "NgxInputMapFixture.h"
 #include "NgxMultiSceneFixture.h"
+#include "NgxProviderFaultFixture.h"
 #include "../game/AnchorPatterns.h"
 #include "../ngx/F6EvalReceiptV1.h"
 #include "../interop/BeforeSrV1.h"
@@ -609,12 +610,19 @@ HRESULT WINAPI unexpected_record(const BeforeSrFrameV1 *, ID3D11Texture2D **) no
 
 int wmain(int argc, wchar_t **argv)
 {
+    using neo::tests::NgxParameterCalls;
+    using Fault = neo::tests::NgxProviderFault;
+    using ConfigureFault = void (*)(Fault);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const std::wstring_view mode = argc > 1 ? argv[1] : L"";
     const bool prewarm_retry = mode == L"ngx-prewarm-retry";
     const bool hudless = mode == L"ngx-hudless";
-    const unsigned provider_fault = mode == L"ngx-fault-init" ? 1 : mode == L"ngx-fault-create" ? 2 :
-        mode == L"ngx-fault-eval" ? 3 : mode == L"ngx-fault-release" ? 4 : 0;
+    const Fault fault = mode == L"ngx-fault-init" ? Fault::init :
+        mode == L"ngx-fault-create" ? Fault::create : mode == L"ngx-fault-eval" ? Fault::evaluate :
+        mode == L"ngx-fault-release" ? Fault::release : mode == L"ngx-fault-main-caps" ? Fault::main_caps :
+        mode == L"ngx-fault-query-caps" ? Fault::query_caps :
+        mode == L"ngx-fault-destroy-query" ? Fault::destroy_query : Fault::none;
+    const bool provider_fault = fault != Fault::none;
     const bool prewarm = mode == L"ngx-prewarm" || prewarm_retry;
     const bool check_prewarm = prewarm || mode == L"ngx-prewarm-off";
     const bool receipt = check_prewarm || mode == L"ngx-receipt" || mode == L"ngx-receipt-dlaa";
@@ -757,12 +765,12 @@ int wmain(int argc, wchar_t **argv)
         const bool expect_receipt = hudless || receipt || input_map || real_receipt || ao_v1 || multi_scene;
         std::fprintf(observations.get(), "provider export: v1=%d expected=%d\n", has_receipt, expect_receipt);
         if (has_receipt != expect_receipt) return 3;
-        if (provider_fault && provider_fault != 4)
+        if (provider_fault && fault != Fault::release)
         {
-            const auto configure = reinterpret_cast<void (*)(unsigned)>(
+            const auto configure = reinterpret_cast<ConfigureFault>(
                 GetProcAddress(provider_module, "ConfigureProviderFault"));
             if (!configure) return 3;
-            configure(provider_fault);
+            configure(fault);
         }
         if (receipt && same_size)
         {
@@ -871,31 +879,62 @@ int wmain(int argc, wchar_t **argv)
     }
     if (provider_fault)
     {
-        const auto configure = reinterpret_cast<void (*)(unsigned)>(
+        const auto configure = reinterpret_cast<ConfigureFault>(
             GetProcAddress(provider_module, "ConfigureProviderFault"));
         const auto calls = reinterpret_cast<unsigned (*)()>(GetProcAddress(provider_module, "ProviderFaultCalls"));
-        if (!configure || !calls) return 3;
+        const auto parameters = reinterpret_cast<void (*)(NgxParameterCalls *)>(
+            GetProcAddress(provider_module, "ProviderParameterCalls"));
+        if (!configure || !calls || !parameters) return 3;
         RenderFixture instance;
-        const auto run = [&](unsigned width, bool delivered)
+        const auto run = [&](ID3D11Device *target, ID3D11DeviceContext *immediate, unsigned width, bool delivered)
         {
             const CaptureExtent extent {width, 256};
             CaptureFrame frame {extent, extent, [&] { instance.publish(extent, extent, 0.f, 0.f); }, delivered};
-            // 2026-11-17（释放异常夹具）：先用源像素证明 Evaluate 成功，再在同实例换尺寸触发退休。
+            // 2026-11-17（释放异常夹具）：逐帧改变源像素，区分本次 Evaluate 和上次写回。
             frame.color_source_view = DXGI_FORMAT_R8G8B8A8_UNORM;
+            frame.alternate_scene_pixel += (instance.frame + 1) * 0x00030705u;
             frame.exact_provider_pixel = frame.alternate_scene_pixel;
             frame.typeless_depth = true;
-            return capture(CaptureEntry::draw, frame);
+            return draw_capture(target, immediate, CaptureEntry::draw, frame, observations.get());
         };
-        if (provider_fault == 4)
+        const auto current_device = [&](unsigned width, bool delivered)
         {
-            if (!run(512, true)) return 1;
-            configure(4);
-            if (!run(384, false)) return 1;
+            return run(device.Get(), context.Get(), width, delivered);
+        };
+        if (fault == Fault::destroy_query)
+        {
+            Microsoft::WRL::ComPtr<ID3D11Device> next_device;
+            Microsoft::WRL::ComPtr<ID3D11DeviceContext> next_context;
+            if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+                next_device.GetAddressOf(), nullptr, next_context.GetAddressOf())) || next_device.Get() == device.Get())
+                return 3;
+            // 2026-11-28：真实设备切换触发清理；切回旧设备验证后续共享表不会再被归还。
+            if (!current_device(512, true) || calls() != 0 ||
+                !run(next_device.Get(), next_context.Get(), 512, true) || calls() != 1 ||
+                !current_device(512, true) || calls() != 1) return 1;
         }
-        else if (!run(512, false)) return 1;
-        if (calls() != 1 || !run(512, false)) return 1;
-        if (calls() != (provider_fault == 3 ? 2u : 1u)) return 1;
-        std::printf("Actual bridge provider SEH: boundary=%u faults=%u native output preserved\n", provider_fault, calls());
+        else
+        {
+            if (fault == Fault::release)
+            {
+                if (!current_device(512, true)) return 1;
+                configure(fault);
+                if (!current_device(384, false)) return 1;
+            }
+            else if (!current_device(512, fault == Fault::query_caps)) return 1;
+            if (calls() != 1 || !current_device(512, fault == Fault::query_caps)) return 1;
+            if (calls() != (fault == Fault::evaluate ? 2u : 1u)) return 1;
+        }
+        NgxParameterCalls proof {};
+        parameters(&proof);
+        std::fprintf(observations.get(), "provider SEH: boundary=%u faults=%u get_caps=%u destroy=%u "
+            "wrong_destroy=%u shutdown=%u\n", static_cast<unsigned>(fault), calls(), proof.get_caps,
+            proof.destroy, proof.wrong_destroy, proof.shutdown);
+        if (proof.wrong_destroy != 0 || proof.shutdown != 0 ||
+            proof.destroy != (fault == Fault::destroy_query ? 1u : 0u)) return 1;
+        if (fault == Fault::main_caps && proof.get_caps != 1) return 1;
+        if (fault == Fault::query_caps && proof.get_caps != 2) return 1;
+        if (fault == Fault::destroy_query && proof.get_caps != 6) return 1;
         return 0;
     }
     if (multi_scene)

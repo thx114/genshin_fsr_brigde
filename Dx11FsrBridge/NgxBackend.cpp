@@ -1360,8 +1360,12 @@ static bool ensure_init(ID3D11Device *dev, bool prewarming = false)
         return prewarming ? false : fail_init(L"init", static_cast<unsigned>(init_rc));
 
     // ---- 第 7 步：GetCapabilityParameters（全局一份，**不调 Reset()**）----
+    // 2026-11-28（上游 fdfa7d4）：厂商可能写入指针后再抛异常；只在正常返回成功时采用主表。
     NVSDK_NGX_Parameter *params = nullptr;
-    const NVSDK_NGX_Result caps_rc = g_provider.get_caps(&params);
+    unsigned long caps_exception = 0;
+    const NVSDK_NGX_Result caps_rc = neo::ngx::call_provider(caps_exception, g_provider.get_caps, &params);
+    if (caps_exception)
+        return fail_init(L"get_caps_crash", caps_exception);
     if (caps_rc != NVSDK_NGX_Result_Success || params == nullptr)
         return fail_init(L"no_params", static_cast<unsigned>(caps_rc));
     g_params = params;
@@ -1425,7 +1429,7 @@ static bool ensure_init(ID3D11Device *dev, bool prewarming = false)
     //      CreateFeature 之前那一瞬间（那里已经是尺寸刚变、正要重建的时刻）。
     //   ② 失败无害：建不出来只是选档回退到比例表，**不影响可用性**（§4 明文要求）。
     //      ⇒ 这里只记日志，不返回失败、不置任何锁存。
-    // ★ 失败原因写进行内（no_entry / no_params / shared_singleton），便于按 §4 判据验收时
+    // ★ 失败原因写进行内，便于按 §4 判据验收时
     //   区分"查询不可用所以走的比例表"与"区间查了但都不包含"。
     {
         const char *why = "ok";
@@ -1820,7 +1824,7 @@ bool g_query_params_owned = false;
 //   变成了每帧一次 NGX 入口调用 —— AGENTS.md §二.5 的形态。
 //   ⇒ 失败一次即记下原因、永不再试，直到 shutdown_all 把整套状态清掉（换设备/换 provider
 //     是唯一值得重试的时机）。
-const char *g_query_params_fail = nullptr;   // "no_entry" / "no_params" / "shared_singleton"
+const char *g_query_params_fail = nullptr;
 
 // 六档区间的缓存。key 只用 display 宽高：查询输入 = (Width=display, Height=display, 档位)，
 // 与 render 尺寸无关（render 只决定"选哪档"）。尺寸变化才重查。
@@ -1867,15 +1871,22 @@ static_assert(static_cast<int>(ngx_param_map::PerfQuality::Dlaa)
 // 归还独立查询对象。幂等。
 static void release_query_params()
 {
-    // ★ 顺序：先判 owned 再 Destroy，最后清标志。任何一条路径漏清标志都会导致
-    //   下一次 shutdown_all 对已释放的指针再 Destroy 一次。
-    if (g_query_params != nullptr && g_query_params_owned && g_provider.destroy != nullptr)
-        (void)g_provider.destroy(g_query_params);
+    // 2026-11-28（上游 fdfa7d4）：Destroy 异常时无法判断对象是否已释放，必须先退出所有权，
+    // 防止下一次 shutdown_all 把同一份表再交还给 provider。
+    NVSDK_NGX_Parameter *owned = g_query_params_owned ? g_query_params : nullptr;
     g_query_params = nullptr;
     g_query_params_owned = false;
     // ★ 粘滞失败原因也一并清：本函数只在 shutdown_all 里调用（设备级关停），
     //   而换设备/换 provider 正是唯一值得重新尝试建立查询对象的时机。
     g_query_params_fail = nullptr;
+    if (!owned || !g_provider.destroy)
+        return;
+    unsigned long exception = 0;
+    const auto rc = neo::ngx::call_provider(exception, g_provider.destroy, owned);
+    if (exception)
+        log_ngx_error(L"ngx_core pq_query_params destroy_exception=0x%08lX retry=0", exception);
+    else if (rc != NVSDK_NGX_Result_Success)
+        log_ngx_error(L"ngx_core pq_query_params destroy_failed rc=0x%08X retry=0", static_cast<unsigned>(rc));
 }
 
 // 确保独立查询对象就绪。返回 false ⇒ 本次选档走回退路径（**不降级可用性**）。
@@ -1899,10 +1910,14 @@ static bool ensure_query_params(const char **why)
     }
 
     NVSDK_NGX_Parameter *qs = nullptr;
-    const NVSDK_NGX_Result rc = g_provider.get_caps(&qs);
-    if (rc != NVSDK_NGX_Result_Success || qs == nullptr)
+    unsigned long exception = 0;
+    const NVSDK_NGX_Result rc = neo::ngx::call_provider(exception, g_provider.get_caps, &qs);
+    if (exception || rc != NVSDK_NGX_Result_Success || qs == nullptr)
     {
-        g_query_params_fail = "no_params";
+        // 2026-11-28（上游 fdfa7d4）：选档取不到独立表时锁存失败，主表仍可用于 SR。
+        g_query_params_fail = exception ? "get_caps_crash" : "no_params";
+        if (exception)
+            log_ngx_error(L"ngx_core pq_query_params get_caps_exception=0x%08lX", exception);
         if (why) *why = g_query_params_fail;
         return false;
     }
@@ -2844,8 +2859,7 @@ static bool g_diag_first_eval_done = false;
 //       十个函数指针（指向已加载 DLL 的导出，DLL 与进程同寿，§6-13）
 //
 // ★ 幂等：未初始化时调用安全；连调多次安全（全部动作要么判空、要么是幂等的 Reset）。
-// ★ 不调 NVSDK_NGX_D3D11_Shutdown（§6-13 明确不做）；不调 DestroyParameters（§3.9.5：
-//   g_params 由 NGX 内部分配，v1 不释放，由进程回收）。
+// ★ 不调 NVSDK_NGX_D3D11_Shutdown（§6-13 明确不做）；只归还独立查询表，g_params 由进程回收。
 // ============================================================================
 bool shutdown_all()
 {

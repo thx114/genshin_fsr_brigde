@@ -5,6 +5,7 @@
 #include "../third_party/ngx/nvsdk_ngx_params.h"
 #include "../Il2CppCallSiteHook.h"
 #include "../runtime/FrameTimeline.h"
+#include "NgxProviderFaultFixture.h"
 
 #include <cstdio>
 #include <cstring>
@@ -26,6 +27,9 @@ struct NVSDK_NGX_Handle { unsigned id; };
 
 namespace
 {
+using neo::tests::NgxParameterCalls;
+using neo::tests::NgxProviderFault;
+
 class Parameters final : public NVSDK_NGX_Parameter
 {
 public:
@@ -72,10 +76,13 @@ struct FixtureFeature
 std::array<FixtureFeature, il2cpp_callsite::k_render_instance_capacity> g_features {};
 unsigned g_feature_id = 16;
 unsigned g_feature_releases = 0;
-unsigned g_fault = 0, g_fault_calls = 0;
-extern "C" __declspec(dllexport) void ConfigureProviderFault(unsigned fault) { g_fault = fault; }
+NgxProviderFault g_fault {};
+NgxParameterCalls g_parameter_calls {};
+unsigned g_fault_calls = 0;
+extern "C" __declspec(dllexport) void ConfigureProviderFault(NgxProviderFault fault) { g_fault = fault; }
 extern "C" __declspec(dllexport) unsigned ProviderFaultCalls() { return g_fault_calls; }
-void provider_fault(unsigned boundary)
+extern "C" __declspec(dllexport) void ProviderParameterCalls(NgxParameterCalls *calls) { *calls = g_parameter_calls; }
+void provider_fault(NgxProviderFault boundary)
 {
     if (g_fault != boundary) return;
     ++g_fault_calls;
@@ -89,7 +96,6 @@ bool active_feature(const NVSDK_NGX_Handle *handle)
         if (feature.active && &feature.handle == handle) return true;
     return false;
 }
-unsigned g_params_issued = 0;
 unsigned g_ao_frames = 0;
 bool g_ao_fixture = false;
 bool g_scene_depth_fixture = false;
@@ -140,22 +146,41 @@ EXPORT NVSDK_NGX_D3D11_Init_Ext(unsigned long long, const wchar_t *, ID3D11Devic
     NVSDK_NGX_Version, const NVSDK_NGX_FeatureCommonInfo *)
 {
     ++g_init_calls;
-    provider_fault(1);
+    provider_fault(NgxProviderFault::init);
     if (g_refuse_first_init.exchange(false)) return NVSDK_NGX_Result_Fail;
     return NVSDK_NGX_Result_Success;
 }
 
 EXPORT NVSDK_NGX_D3D11_GetCapabilityParameters(NVSDK_NGX_Parameter **p)
 {
-    auto &params = g_params_issued++ == 0 ? g_main : g_query;
+    const bool first = g_parameter_calls.get_caps++ == 0;
+    // 2026-11-28（上游 fdfa7d4）：后续设备只拿到共享表，以便检出旧查询表被再次归还。
+    const bool shared = g_fault == NgxProviderFault::destroy_query && g_parameter_calls.destroy != 0;
+    auto &params = first || shared ? g_main : g_query;
     params.Set(NVSDK_NGX_Parameter_SuperSampling_Available, 1);
     *p = &params;
+    // 2026-11-28：先写出有效指针再触发异常，防止桥把部分返回当作成功。
+    provider_fault(first ? NgxProviderFault::main_caps : NgxProviderFault::query_caps);
     return NVSDK_NGX_Result_Success;
 }
 
 EXPORT NVSDK_NGX_D3D11_AllocateParameters(NVSDK_NGX_Parameter **p) { return NVSDK_NGX_D3D11_GetCapabilityParameters(p); }
-EXPORT NVSDK_NGX_D3D11_DestroyParameters(NVSDK_NGX_Parameter *) { return NVSDK_NGX_Result_Success; }
-EXPORT NVSDK_NGX_D3D11_Shutdown1(ID3D11Device *) { return NVSDK_NGX_Result_Success; }
+EXPORT NVSDK_NGX_D3D11_DestroyParameters(NVSDK_NGX_Parameter *p)
+{
+    ++g_parameter_calls.destroy;
+    if (p != &g_query)
+    {
+        ++g_parameter_calls.wrong_destroy;
+        return NVSDK_NGX_Result_Fail;
+    }
+    provider_fault(NgxProviderFault::destroy_query);
+    return NVSDK_NGX_Result_Success;
+}
+EXPORT NVSDK_NGX_D3D11_Shutdown1(ID3D11Device *)
+{
+    ++g_parameter_calls.shutdown;
+    return NVSDK_NGX_Result_Success;
+}
 EXPORT NVSDK_NGX_D3D11_GetScratchBufferSize(NVSDK_NGX_Feature, const NVSDK_NGX_Parameter *, size_t *bytes)
 {
     *bytes = 0;
@@ -171,7 +196,7 @@ EXPORT NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext *, NVSDK_NGX_Feature ki
     [[maybe_unused]] NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
     if (!out || kind != NVSDK_NGX_Feature_SuperSampling) return NVSDK_NGX_Result_Fail;
-    provider_fault(2);
+    provider_fault(NgxProviderFault::create);
 #if !defined(BEFORE_SR_LEGACY_FIXTURE)
     if (g_input_map.enabled)
     {
@@ -192,7 +217,7 @@ EXPORT NVSDK_NGX_D3D11_CreateFeature(ID3D11DeviceContext *, NVSDK_NGX_Feature ki
 }
 EXPORT NVSDK_NGX_D3D11_ReleaseFeature(NVSDK_NGX_Handle *handle)
 {
-    provider_fault(4);
+    provider_fault(NgxProviderFault::release);
     for (auto &feature : g_features)
         if (feature.active && handle == &feature.handle)
         {
@@ -273,7 +298,7 @@ static NVSDK_NGX_Result copy_eval_color(ID3D11DeviceContext *context, const NVSD
 EXPORT NVSDK_NGX_D3D11_EvaluateFeature(ID3D11DeviceContext *context, const NVSDK_NGX_Handle *handle,
     const NVSDK_NGX_Parameter *p, PFN_NVSDK_NGX_ProgressCallback)
 {
-    provider_fault(3);
+    provider_fault(NgxProviderFault::evaluate);
     return copy_eval_color(context, handle, p);
 }
 #else
@@ -455,8 +480,8 @@ EXPORT F6_NGX_D3D11_EvaluateFeatureV1(ID3D11DeviceContext *context, const NVSDK_
     {
         if (g_hudless_result == 3)
         {
-            g_fault = 5;
-            provider_fault(5);
+            g_fault = NgxProviderFault::hudless_evaluate;
+            provider_fault(NgxProviderFault::hudless_evaluate);
         }
         ID3D11Resource *color = nullptr, *output = nullptr;
         unsigned flip = 9;

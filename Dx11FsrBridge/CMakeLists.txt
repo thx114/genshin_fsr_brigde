@@ -513,7 +513,7 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
                 "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
             set_tests_properties(NgxDepthScale-${scale} PROPERTIES TIMEOUT 45)
         endforeach()
-        foreach(boundary IN ITEMS init create eval release)
+        foreach(boundary IN ITEMS init create eval release main-caps query-caps destroy-query)
             add_test(NAME NgxProviderFault-${boundary} COMMAND ProviderFrameHost "ngx-fault-${boundary}"
                 "$<TARGET_FILE:Dx11FsrBridge>" "$<TARGET_FILE:BeforeSrProvider>")
             set_tests_properties(NgxProviderFault-${boundary} PROPERTIES TIMEOUT 45)
