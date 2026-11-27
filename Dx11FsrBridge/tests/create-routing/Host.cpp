@@ -511,8 +511,9 @@ int wmain(int argc, wchar_t **argv)
     const bool real_combined = mode.find(L"combined") != std::wstring::npos;
     const bool real_device = mode.starts_with(L"warp") || mode.starts_with(L"hardware");
     const bool resize_routing = mode == L"resize-routing" || mode == L"resize-routing-reversed";
-    const bool hdr_swapchain = mode == L"swapchain4" || resize_routing;
-    const bool swapchain_mode = mode == L"swapchain" || hdr_swapchain;
+    const bool forwarded_swapchain = mode == L"swapchain-forwarded3" || mode == L"swapchain-forwarded4";
+    const bool hdr_swapchain = mode == L"swapchain4" || mode == L"swapchain-forwarded4" || resize_routing;
+    const bool swapchain_mode = mode == L"swapchain" || hdr_swapchain || forwarded_swapchain;
     const bool creation_boundary = mode == L"wrapping-boundary" || mode == L"wrapping-boundary-combined" ||
         mode == L"wrapping-boundary-retry";
     const bool nested = mode == L"nested" || mode == L"nested-success" || creation_boundary;
@@ -564,6 +565,8 @@ int wmain(int argc, wchar_t **argv)
             reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetExtended"))(nested);
             reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetSwapchain"))(swapchain_mode);
             reinterpret_cast<void(WINAPI *)(BOOL)>(GetProcAddress(provider, "SetHdrSwapchain"))(hdr_swapchain);
+            if (forwarded_swapchain)
+                reinterpret_cast<void(WINAPI *)()>(GetProcAddress(provider, "ForwardSwapchainExtensions"))();
             // 错配专项也运行旧 DLL 负控，保留旧版本所读的额外 backing 槽。
             // 精确页边界继续由其余成功路径用例独立覆盖。
             if (!resize_routing)
@@ -893,8 +896,29 @@ int wmain(int argc, wchar_t **argv)
                     reinterpret_cast<void **>(&chain3))) && chain3, "guarded SwapChain3 returned");
                 if (!chain3)
                     return 10;
-                expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chain3))[13]) == k_ngx_swapchain_hooks,
-                    "SwapChain3 hook presence matches the compiled backend");
+                if (forwarded_swapchain)
+                {
+                    expect(static_cast<IDXGISwapChain *>(chain3) != chain &&
+                        static_cast<IDXGISwapChain *>(hwnd_chain) == chain, "factory returns the outer swapchain");
+                    void **outer = *reinterpret_cast<void ***>(chain);
+                    void **inner = *reinterpret_cast<void ***>(chain3);
+                    expect(belongs_to(bridge, outer[8]) && belongs_to(bridge, outer[22]),
+                        "Present and Present1 stay on the outer swapchain");
+                    expect(belongs_to(bridge, outer[14]) == k_ngx_swapchain_hooks,
+                        "resize control stays on the outer swapchain");
+                    expect(!belongs_to(bridge, inner[8]) && !belongs_to(bridge, inner[13]) &&
+                        !belongs_to(bridge, inner[22]) && !belongs_to(bridge, inner[37]) &&
+                        !belongs_to(bridge, inner[38]), "forwarded interface gets no bridge hooks");
+                    DXGI_MODE_DESC target {};
+                    target.Width = 640;
+                    target.Height = 360;
+                    expect(chain->ResizeTarget(&target) == expected, "outer resize uses its own receiver and original");
+                }
+                else
+                {
+                    expect(belongs_to(bridge, (*reinterpret_cast<void ***>(chain3))[13]) == k_ngx_swapchain_hooks,
+                        "SwapChain3 hook presence matches the compiled backend");
+                }
                 expect(chain3->ResizeBuffers1(2, 640, 360, DXGI_FORMAT_R8G8B8A8_UNORM, 0,
                     nullptr, nullptr) == expected, "SwapChain3 final slot39 retains exact provider routing");
                 if (hdr_swapchain)
@@ -906,7 +930,7 @@ int wmain(int argc, wchar_t **argv)
                         return 11;
                     void **methods = *reinterpret_cast<void ***>(chain4);
                     expect(!belongs_to(bridge, methods[39]) &&
-                        belongs_to(bridge, methods[40]) == k_ngx_swapchain_hooks,
+                        belongs_to(bridge, methods[40]) == (k_ngx_swapchain_hooks && !forwarded_swapchain),
                         "SwapChain4 HDR slot40 matches backend and preserves ResizeBuffers1 slot39");
                     expect(chain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr) == expected,
                         "HDR metadata retains matching provider and exact receiver");

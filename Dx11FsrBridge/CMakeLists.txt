@@ -616,6 +616,7 @@ if(DX11FSRBRIDGE_BUILD_TESTS)
     add_test(NAME SystemD3D11FactoriesTest COMMAND SystemD3D11FactoriesTest)
     set_tests_properties(SystemD3D11FactoriesTest PROPERTIES TIMEOUT 20)
     foreach(mode IN ITEMS independent nested success nested-success swapchain swapchain4
+        swapchain-forwarded3 swapchain-forwarded4
         resize-routing resize-routing-reversed warp hardware warp-device-only hardware-device-only
         warp-context-only hardware-context-only warp-combined-device-only hardware-combined-device-only
         warp-cached-factory hardware-cached-factory warp-cached-factory-device-only hardware-cached-factory-device-only

@@ -13195,46 +13195,31 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
             " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)));
         return;
     }
+
+    // 2026-11-28（上游 160d41d）：高版本 QI 可能由内层代答。槽数只认原地址，
+    // 否则会把游戏实际调用的外层 Present/Resize 钩到另一个对象上。
+    const std::size_t hook_method_count = interface_layout::swapchain(swapchain);
+    const bool install_color_hooks = should_hook_color && hook_method_count > k_idx_set_color_space1;
+    const bool supports_hdr_metadata = hook_method_count > k_idx_set_hdr_metadata;
+    if (should_hook_color && !install_color_hooks)
+    {
+        LOG_DEBUG(blog::cat::hook, "dxgi_color_hooks_unavailable swapchain=" +
+            hex64(reinterpret_cast<std::uintptr_t>(swapchain)) + " reason=no_same_address_IDXGISwapChain3");
+        if (!should_hook_present && !should_hook_swapchain_controls)
+            return;
+    }
     LOG_DEBUG(blog::cat::hook, "swapchain_hook_decision install=1"
         " present=" + std::to_string(should_hook_present ? 1 : 0) +
         " controls=" + std::to_string(should_hook_swapchain_controls ? 1 : 0) +
         " native_ldr_resize=" + std::to_string(should_hook_native_ldr_resize ? 1 : 0) +
-        " color=" + std::to_string(should_hook_color ? 1 : 0) +
+        " color=" + std::to_string(install_color_hooks ? 1 : 0) +
         " swapchain=" + hex64(reinterpret_cast<std::uintptr_t>(swapchain)));
 
-    void *hook_instance = swapchain;
-    std::size_t hook_method_count = interface_layout::swapchain(swapchain);
-    IDXGISwapChain4 *swapchain4 = nullptr;
-    IDXGISwapChain3 *swapchain3 = nullptr;
-    bool supports_hdr_metadata = false;
-    if (should_hook_color)
-    {
-        if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain4), reinterpret_cast<void **>(&swapchain4))) && swapchain4 != nullptr)
-        {
-            hook_instance = swapchain4;
-            hook_method_count = interface_layout::swapchain(swapchain4);
-            supports_hdr_metadata = true;
-        }
-        else if (SUCCEEDED(swapchain->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&swapchain3))) && swapchain3 != nullptr)
-        {
-            hook_instance = swapchain3;
-            hook_method_count = interface_layout::swapchain(swapchain3);
-        }
-        else
-        {
-            LOG_DEBUG(blog::cat::hook, "dxgi_color_hooks_unavailable swapchain=" +
-                hex64(reinterpret_cast<std::uintptr_t>(swapchain)) + " reason=no_IDXGISwapChain3");
-            if (!should_hook_present && !should_hook_swapchain_controls)
-                return;
-        }
-    }
-
-    const bool has_color_interface = swapchain4 != nullptr || swapchain3 != nullptr;
     std::vector<com_vtable::MethodPatch> patches;
     if (should_hook_present)
     {
         patches.push_back(route_slot(g_original_present));
-        if (hook_method_count >= 29)
+        if (hook_method_count > k_idx_present1)
             patches.push_back(route_slot(g_original_present1));
     }
     if (should_hook_general_swapchain_controls)
@@ -13248,7 +13233,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
     {
         patches.push_back(route_slot(g_original_resize_buffers));
     }
-    if (should_hook_color && has_color_interface)
+    if (install_color_hooks)
     {
         patches.push_back(route_slot(g_original_check_color_space_support));
         patches.push_back(route_slot(g_original_set_color_space1));
@@ -13259,7 +13244,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
         if (SUCCEEDED(swapchain->GetDesc(&desc)))
         {
             LOG_DEBUG(blog::cat::hook, "dxgi_color_hooks_active swapchain=" +
-                hex64(reinterpret_cast<std::uintptr_t>(hook_instance)) +
+                hex64(reinterpret_cast<std::uintptr_t>(swapchain)) +
                 " format=" + describe_dxgi_format(desc.BufferDesc.Format) +
                 " size=" + std::to_string(desc.BufferDesc.Width) + "x" + std::to_string(desc.BufferDesc.Height) +
                 " swapchain4=" + std::to_string(supports_hdr_metadata ? 1 : 0));
@@ -13279,11 +13264,7 @@ void install_swapchain_hooks(IDXGISwapChain *swapchain)
 #endif
         }
     }
-    com_vtable::patch(hook_instance, hook_method_count, patches);
-    if (swapchain4 != nullptr)
-        swapchain4->Release();
-    if (swapchain3 != nullptr)
-        swapchain3->Release();
+    com_vtable::patch(swapchain, hook_method_count, patches);
 }
 
 void set_output_size(UINT width, UINT height, const char *source)

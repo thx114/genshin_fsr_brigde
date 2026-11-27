@@ -14,6 +14,7 @@ bool extended_context = false;
 bool successful_swapchain = false;
 bool hdr_swapchain = false;
 bool return_wrapper_chain = false;
+bool forward_swapchain_extensions = false;
 bool combined_uses_device = false;
 std::atomic<unsigned> early_observation {};
 struct Device
@@ -78,10 +79,15 @@ HRESULT STDMETHODCALLTYPE query_interface(void *object, REFIID iid, void **outpu
         *output = &factory_object;
         return S_OK;
     }
+    if (object == &wrapper_object && forward_swapchain_extensions && output && iid == __uuidof(IDXGISwapChain1))
+    {
+        *output = object;
+        return S_OK;
+    }
     if (is_swapchain(object) && output &&
         (iid == __uuidof(IDXGISwapChain3) || (iid == __uuidof(IDXGISwapChain4) && hdr_swapchain)))
     {
-        *output = object;
+        *output = object == &wrapper_object && forward_swapchain_extensions ? &swapchain_object : object;
         return S_OK;
     }
     if (object == &context_object && output)
@@ -260,6 +266,12 @@ extern "C" __declspec(dllexport) void WINAPI SetHdrSwapchain(BOOL enabled)
     hdr_swapchain = enabled != FALSE;
 }
 
+extern "C" __declspec(dllexport) void WINAPI ForwardSwapchainExtensions()
+{
+    return_wrapper_chain = true;
+    forward_swapchain_extensions = true;
+}
+
 extern "C" __declspec(dllexport) void WINAPI SetExtended(BOOL enabled)
 {
     extended_context = enabled != FALSE;
@@ -285,7 +297,9 @@ extern "C" __declspec(dllexport) void WINAPI GuardTables()
     context_object.vtable = guarded_table(context_methods, extended_context ? 149 : 115);
     factory_object.vtable = guarded_table(factory_methods, 25);
     swapchain_object.vtable = guarded_table(swapchain_methods, hdr_swapchain ? 41 : 40);
-    wrapper_object.vtable = guarded_table(wrapper_methods, hdr_swapchain ? 41 : 40);
+    // 2026-11-28（上游 160d41d）：扩展 QI 由内层回答时，外层表实际止于 SwapChain1。
+    wrapper_object.vtable = guarded_table(wrapper_methods,
+        forward_swapchain_extensions ? 29 : hdr_swapchain ? 41 : 40);
 }
 
 extern "C" __declspec(dllexport) unsigned WINAPI GetWrongThis() { return wrong_this.load(); }
